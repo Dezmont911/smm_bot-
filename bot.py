@@ -1299,6 +1299,137 @@ async def publish_post(bot, post: dict) -> bool:
 
 
 # ============================================================
+# Управление расписанием (/schedule)
+# ============================================================
+
+async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /schedule — просмотр и изменение расписания публикаций.
+
+    Использование:
+      /schedule                        — расписание всех каналов
+      /schedule @channel               — расписание конкретного канала
+      /schedule @channel 09 12 16 20   — установить часы (МСК)
+      /schedule @channel off           — только РСЯ (без таймера)
+      /schedule @channel on            — вернуть расписание
+    """
+    if not is_admin(update):
+        return
+
+    args = context.args or []
+    channels = load_all_channels()
+
+    def utc_to_msk(hours: list) -> list:
+        return sorted([(h + 3) % 24 for h in hours])
+
+    def msk_to_utc(hours: list) -> list:
+        return sorted([(h - 3) % 24 for h in hours])
+
+    DEFAULT_UTC = [6, 9, 13, 17]  # 09, 12, 16, 20 МСК
+
+    # --- Без аргументов: расписание всех каналов ---
+    if not args:
+        if not channels:
+            await update.message.reply_text("Нет добавленных каналов.")
+            return
+        lines = ["📅 <b>Расписание публикаций</b>\n"]
+        for ch in channels:
+            cid = ch["channel_id"]
+            if ch.get("schedule_disabled", False):
+                lines.append(f"• {cid} — <b>⏸ только РСЯ</b>")
+            else:
+                msk = utc_to_msk(ch.get("post_times_utc", DEFAULT_UTC))
+                lines.append(f"• {cid} — {', '.join(f'{h:02d}:00' for h in msk)} МСК")
+        lines.append("\n<i>/schedule @channel 09 12 16 20 — изменить</i>")
+        lines.append("<i>/schedule @channel off — только РСЯ</i>")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        return
+
+    # --- Первый аргумент — канал ---
+    handle = args[0] if args[0].startswith("@") else "@" + args[0]
+    channel = next((ch for ch in channels if ch["channel_id"] == handle), None)
+    if channel is None:
+        await update.message.reply_text(
+            f"❌ Канал <code>{handle}</code> не найден. Список: /list",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # --- Только канал без параметров: показать текущее ---
+    if len(args) == 1:
+        if channel.get("schedule_disabled", False):
+            text = (
+                f"📅 <b>{handle}</b>\n"
+                f"Режим: ⏸ только РСЯ\n\n"
+                f"<i>Включить расписание: /schedule {handle} on</i>"
+            )
+        else:
+            msk = utc_to_msk(channel.get("post_times_utc", DEFAULT_UTC))
+            times = ", ".join(f"{h:02d}:00" for h in msk)
+            text = (
+                f"📅 <b>{handle}</b>\n"
+                f"Расписание: {times} МСК\n\n"
+                f"<i>Изменить: /schedule {handle} 09 12 16 20</i>\n"
+                f"<i>Отключить: /schedule {handle} off</i>"
+            )
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+        return
+
+    action = args[1].lower()
+
+    # --- Включить расписание ---
+    if action == "on":
+        channel.pop("schedule_disabled", None)
+        save_channel_card(channel)
+        msk = utc_to_msk(channel.get("post_times_utc", DEFAULT_UTC))
+        times = ", ".join(f"{h:02d}:00" for h in msk)
+        await update.message.reply_text(
+            f"✅ Расписание включено для <b>{handle}</b>\n"
+            f"Публикации в: {times} МСК",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # --- Отключить расписание (только РСЯ) ---
+    if action == "off":
+        channel["schedule_disabled"] = True
+        save_channel_card(channel)
+        await update.message.reply_text(
+            f"⏸ Расписание отключено для <b>{handle}</b>\n"
+            f"Бот публикует только при обнаружении рекламы РСЯ.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # --- Установить часы публикаций (МСК) ---
+    try:
+        hours_msk = []
+        for arg in args[1:]:
+            h = int(arg)
+            if not 0 <= h <= 23:
+                raise ValueError(f"Час вне диапазона: {h}")
+            hours_msk.append(h)
+        hours_msk = sorted(set(hours_msk))
+        channel["post_times_utc"] = msk_to_utc(hours_msk)
+        channel.pop("schedule_disabled", None)
+        save_channel_card(channel)
+        times = ", ".join(f"{h:02d}:00" for h in hours_msk)
+        await update.message.reply_text(
+            f"✅ Расписание обновлено для <b>{handle}</b>\n"
+            f"Публикации в: <b>{times} МСК</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    except ValueError as e:
+        await update.message.reply_text(
+            f"❌ Ошибка: {e}\n\n"
+            f"Примеры:\n"
+            f"  /schedule {handle} 09 12 16 20\n"
+            f"  /schedule {handle} off\n"
+            f"  /schedule {handle} on",
+        )
+
+
+# ============================================================
 # Алерты (отправка сообщений администратору)
 # ============================================================
 
@@ -1371,6 +1502,7 @@ def main():
     app.add_handler(CommandHandler("review", cmd_review))
     app.add_handler(CommandHandler("preview", cmd_preview))
     app.add_handler(CommandHandler("post_now", cmd_post_now))
+    app.add_handler(CommandHandler("schedule", cmd_schedule))
 
     # --- Кнопки: редактирование постов ---
     app.add_handler(CallbackQueryHandler(handle_post_actions, pattern="^(delete|image|regen|done):"))

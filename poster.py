@@ -75,6 +75,10 @@ class Poster:
         """
         channel_id = channel["channel_id"]
 
+        # Если расписание отключено — постим только через детектор РСЯ
+        if channel.get("schedule_disabled", False):
+            return
+
         # Проверяем: пришло ли время для этого канала?
         post_hours = channel.get("post_times_utc", self.DEFAULT_POST_HOURS_UTC)
         if current_hour not in post_hours:
