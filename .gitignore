@@ -1,0 +1,50 @@
+# ============================================================
+# .gitignore — Content Factory Bot
+# ============================================================
+
+# --- Секреты (НИКОГДА не коммитить!) ---
+.env
+*.pem
+*.key
+
+# --- База данных ---
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Виртуальное окружение ---
+venv/
+.venv/
+env/
+ENV/
+
+# --- Логи ---
+logs/
+*.log
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# --- Тестовые файлы (временные) ---
+test_dedup.py
+test_full_cycle.py
+test_rss.py
+
+# --- Кэш Crawl4AI ---
+.crawl4ai/
