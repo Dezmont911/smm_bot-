@@ -35,6 +35,7 @@ from buffer_manager import buffer
 from database import db
 from image_fetcher import fetch_image_url
 from rss_parser import rss
+from web_scraper import scraper as web_scraper
 from config import cfg
 
 
@@ -302,7 +303,22 @@ class ContentGenerator:
         except Exception as e:
             logger.warning(f"RSS недоступен [{channel['channel_id']}]: {e}")
 
-        # --- Источник 2: Вечнозелёные темы (если RSS не хватило) ---
+        # --- Источник 2: Web-скрапинг (если RSS дал мало тем) ---
+        # Запускается когда RSS пустой или дал меньше половины нужного
+        rss_count = len(topics)
+        if rss_count < max(2, count // 2):
+            try:
+                web_articles = await web_scraper.scrape_for_channel(
+                    channel, limit=count - rss_count
+                )
+                if web_articles:
+                    topics.extend(web_articles)
+                    sources_used.append("web")
+                    logger.debug(f"Тем из web_scraper: {len(web_articles)}")
+            except Exception as e:
+                logger.warning(f"web_scraper недоступен [{channel['channel_id']}]: {e}")
+
+        # --- Источник 3: Вечнозелёные темы (последний резерв) ---
         while len(topics) < count:
             eg_topic = buffer.get_evergreen_topic(channel["channel_id"])
             if not eg_topic:
@@ -318,6 +334,7 @@ class ContentGenerator:
         logger.debug(
             f"Тем собрано: {len(topics)} "
             f"(RSS: {sum(1 for t in topics if t['source']=='rss')}, "
+            f"web: {sum(1 for t in topics if t['source']=='web')}, "
             f"вечнозелёных: {sum(1 for t in topics if t['source']=='evergreen')})"
         )
 
