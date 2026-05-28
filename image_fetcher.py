@@ -98,57 +98,86 @@ async def fetch_image_url(
 
 async def _build_english_query(topic: str, channel_topic: str = "") -> str:
     """
-    Извлекает 2-3 ключевых слова из темы и переводит их на английский.
+    Строит английский поисковый запрос из темы поста и тематики канала.
 
-    Сначала пробует перевести через Claude (точно).
-    Если Claude недоступен — возвращает транслитерацию/фолбэк.
+    Логика:
+    - Определяет контекст канала (gaming, finance, etc.)
+    - Если тема на английском — фильтрует стоп-слова, берёт 1-2 ключевых слова
+    - Если тема на русском — переводит через Claude
+    - Всегда добавляет контекст канала к запросу
     """
-    # Извлекаем ключевые слова из темы
-    clean = re.sub(r"[^\w\s]", " ", topic.lower())
-    words = clean.split()
-    keywords = [w for w in words if w not in _RU_STOP and len(w) > 2]
-    ru_query = " ".join(keywords[:3])
+    # Словарь тематик каналов → английские ключевые слова
+    CHANNEL_MAP = {
+        "майнкрафт": "minecraft", "minecraft": "minecraft",
+        "игр": "gaming", "игры": "gaming", "steam": "gaming pc",
+        "финансы": "finance money", "инвестиц": "investing",
+        "здоровье": "health wellness", "спорт": "sport fitness",
+        "технологи": "technology", "бизнес": "business",
+        "маркетинг": "marketing", "авто": "cars automotive",
+        "путешеств": "travel", "кулинар": "food cooking",
+        "красот": "beauty", "мода": "fashion style",
+        "криптовалют": "cryptocurrency", "программирован": "programming",
+    }
 
-    if not ru_query and channel_topic:
-        ru_query = channel_topic.split(",")[0].strip()
+    # Английские стоп-слова для фильтрации
+    EN_STOP = {
+        "the", "a", "an", "is", "are", "was", "were", "be", "been",
+        "have", "has", "had", "do", "does", "did", "will", "would",
+        "could", "should", "may", "might", "can", "this", "that",
+        "these", "those", "it", "its", "for", "on", "in", "at", "to",
+        "of", "and", "or", "but", "with", "from", "by", "as", "all",
+        "out", "up", "how", "what", "when", "here", "there", "their",
+        "you", "your", "our", "we", "they", "them", "now", "just",
+        "get", "got", "new", "big", "top", "best", "more", "about",
+    }
 
-    if not ru_query:
-        return "lifestyle technology"
+    # Определяем контекст канала
+    channel_context = ""
+    for ru_key, en_val in CHANNEL_MAP.items():
+        if ru_key in channel_topic.lower():
+            channel_context = en_val
+            break
+    # Если канал уже на английском
+    if not channel_context and channel_topic:
+        ch_first = channel_topic.split(",")[0].strip()
+        if re.match(r"^[a-zA-Z0-9\s]+$", ch_first):
+            channel_context = ch_first.lower().split()[0]
 
-    # Если запрос уже на латинице — не переводим
-    if re.match(r"^[a-zA-Z0-9 ]+$", ru_query):
-        return ru_query
+    # Берём только заголовок (до первой точки)
+    title = topic.split(".")[0].strip()[:120]
 
-    # Переводим через Claude
-    try:
-        translated = await _translate_with_claude(ru_query)
-        if translated:
-            return translated
-    except Exception as e:
-        logger.debug(f"Claude перевод не удался: {e}")
+    # Определяем язык заголовка
+    latin_ratio = len(re.findall(r"[a-zA-Z]", title)) / max(len(title), 1)
+    is_english = latin_ratio > 0.6
 
-    # Фолбэк: возвращаем латинскую транслитерацию темы канала
-    if channel_topic:
-        channel_en = channel_topic.split(",")[0].strip()
-        # Простые замены для самых частых тем
-        fallbacks = {
-            "майнкрафт": "minecraft gaming",
-            "minecraft": "minecraft gaming",
-            "финансы": "personal finance",
-            "инвестиции": "investing money",
-            "автомобил": "cars automotive",
-            "авто": "cars automotive",
-            "здоровье": "health fitness",
-            "спорт": "sport fitness",
-            "технологии": "technology",
-            "бизнес": "business",
-            "маркетинг": "marketing",
-        }
-        for ru, en in fallbacks.items():
-            if ru in channel_topic.lower():
-                return en
+    if is_english:
+        # Заголовок на английском — фильтруем стоп-слова
+        words = re.findall(r"[a-zA-Z]+", title.lower())
+        keywords = [w for w in words if w not in EN_STOP and len(w) > 3]
+        title_part = " ".join(keywords[:2])
+        if channel_context and title_part:
+            return f"{channel_context} {title_part}"
+        return title_part or channel_context or "gaming"
+    else:
+        # Заголовок на русском — переводим через Claude
+        clean = re.sub(r"[^\w\s]", " ", title.lower())
+        words = clean.split()
+        keywords = [w for w in words if w not in _RU_STOP and len(w) > 2]
+        ru_query = " ".join(keywords[:3]) or channel_topic.split(",")[0].strip()
 
-    return "lifestyle"
+        if not ru_query:
+            return channel_context or "lifestyle"
+
+        try:
+            translated = await _translate_with_claude(ru_query)
+            if translated:
+                if channel_context and channel_context not in translated:
+                    return f"{channel_context} {translated}"
+                return translated
+        except Exception as e:
+            logger.debug(f"Claude перевод не удался: {e}")
+
+        return channel_context or "lifestyle technology"
 
 
 async def _translate_with_claude(ru_text: str) -> str | None:

@@ -616,19 +616,37 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📭 Очередь {tip} пуста.\n\n"
             f"Запусти /generate чтобы создать посты."
         )
+        context.user_data.pop("review_offset", None)
+        context.user_data.pop("review_filter", None)
         return
 
     total = len(posts)
-    preview_count = min(5, total)  # показываем не больше 5 за раз
+    PAGE = 5
+
+    # Сбрасываем offset если сменился фильтр канала
+    prev_filter = context.user_data.get("review_filter")
+    if prev_filter != channel_filter:
+        context.user_data["review_offset"] = 0
+        context.user_data["review_filter"] = channel_filter
+
+    offset = context.user_data.get("review_offset", 0)
+
+    # Если дошли до конца — начинаем сначала
+    if offset >= total:
+        offset = 0
+        context.user_data["review_offset"] = 0
+
+    page_posts = posts[offset:offset + PAGE]
+    shown_end = offset + len(page_posts)
 
     await update.message.reply_text(
         f"📋 <b>Постов в очереди: {total}</b>\n"
-        f"Показываю первые {preview_count}. Редактируй если нужно — "
+        f"Показываю {offset + 1}–{shown_end}. Редактируй если нужно — "
         f"или просто оставь, постер опубликует по расписанию.",
         parse_mode=ParseMode.HTML,
     )
 
-    for i, post in enumerate(posts[:preview_count], start=1):
+    for i, post in enumerate(page_posts, start=offset + 1):
         msg_text = format_post_message(post, index=i, total=total)
         keyboard = review_keyboard(post["id"])
 
@@ -651,11 +669,20 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=keyboard,
         )
 
-    if total > preview_count:
-        await update.message.reply_text(
-            f"👆 Показано {preview_count} из {total}.\n"
-            f"Вызови /review ещё раз чтобы увидеть следующие."
-        )
+    # Обновляем offset для следующего вызова
+    context.user_data["review_offset"] = shown_end if shown_end < total else 0
+
+    if total > PAGE:
+        remaining = total - shown_end
+        if remaining > 0:
+            await update.message.reply_text(
+                f"👆 Показано {offset + 1}–{shown_end} из {total}.\n"
+                f"Вызови /review ещё раз чтобы увидеть следующие {min(PAGE, remaining)}."
+            )
+        else:
+            await update.message.reply_text(
+                f"✅ Показаны все {total} постов. /review снова — с начала."
+            )
 
 
 async def cmd_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
