@@ -1,72 +1,100 @@
-# Content Factory Bot
+# SMM Bot — Content Factory
 
 Telegram-бот для автоматической генерации и публикации постов в каналах через Anthropic Claude API.
+Поддерживает информационные каналы (RSS) и маркетплейс-каналы (Wildberries).
 
-## Что делает
-
-1. **Генерирует посты** — Claude пишет тексты по теме канала, используя свежие новости из RSS и вечнозелёные темы
-2. **Ведёт буфер** — хранит готовые посты в очереди (минимум 8 на канал)
-3. **Публикует по расписанию** — постер берёт следующий пост из очереди и отправляет в канал (09:00, 12:00, 16:00, 20:00 МСК по умолчанию; настраивается через `/schedule`)
-4. **Перекрывает рекламу РСЯ** — детектирует рекламные посты Яндекс РСЯ и публикует свой пост через 5–15 минут
-5. **Не повторяет темы** — дедупликация: последние 20 опубликованных тем передаются в Claude
-6. **Ищет картинки** — автоматически подбирает фото через Pexels API по теме поста
-7. **Управляется через бота** — добавление каналов, просмотр очереди, ручная публикация, превью
+> **Последнее обновление README:** 2026-05-28
+> **Статус:** Работает на VPS `77.233.215.77` (Amsterdam)
+> **Python:** 3.12, venv в `/opt/smm_bot/venv`
 
 ---
 
-## Статус проекта
+## Оглавление
 
-### ✅ Готово и работает на VPS
+- [Что делает](#что-делает)
+- [Архитектура](#архитектура)
+- [Файлы проекта](#файлы-проекта)
+- [Команды бота](#команды-бота)
+- [Маркетплейс-каналы (WB)](#маркетплейс-каналы-wb)
+- [Деплой на VPS](#деплой-на-vps)
+- [Переменные окружения](#переменные-окружения)
+- [Карточка канала](#карточка-канала)
+- [Буфер постов](#буфер-постов)
+- [Публикация постов](#публикация-постов)
+- [Известные технические детали](#известные-технические-детали)
 
-| Файл | Что делает |
-|------|-----------|
-| `config.py` | Загрузка переменных из `.env` |
-| `database.py` | SQLite БД: channels, posts, processed_ads, evergreen_topics, error_log |
-| `ai_client.py` | Генерация постов через Claude API (claude-haiku-4-5-20251001), ротация форматов, дедупликация тем |
-| `buffer_manager.py` | Очередь постов: add / get_next / mark_published / mark_skipped, уровни OK/Low/Emergency/Critical |
-| `rss_parser.py` | Парсинг RSS-лент, извлечение картинок из HTML, scoring по свежести и релевантности |
-| `content_generator.py` | Дирижёр: RSS → темы → Claude → буфер; утренняя и экстренная генерация; дедупликация; поиск картинок |
-| `image_fetcher.py` | Поиск картинок через Pexels API (приоритет) и Unsplash (резерв); перевод RU→EN через Claude; urllib (Cloudflare bypass) |
-| `web_scraper.py` | Автоподбор Reddit/Medium RSS-лент через Claude когда основной RSS пуст; проверка и сохранение |
-| `poster.py` | Публикация по расписанию, Markdown→plain fallback, 4 попытки (с картинкой и без) |
-| `bot.py` | Telegram бот администратора — все команды, ConversationHandler для /add и редактирования |
+---
 
-### 🔲 Следующие шаги / известные проблемы
+## Что делает
 
-- [ ] Посты сгенерированные до fix image_url (от старых запусков) не имеют картинок — удалить через `/delete_posts` и перегенерировать
-- [ ] Переход с SQLite на PostgreSQL если нагрузка вырастет
-- [ ] Добавить web-скрапинг для сайтов без RSS (Crawl4AI)
+1. **Генерирует посты** через Claude по теме канала — из RSS-новостей, вечнозелёных тем или товаров WB
+2. **Ведёт буфер** — хранит готовые посты в очереди (минимум 8 на канал)
+3. **Публикует по расписанию** — постер берёт следующий пост из очереди (09:00, 12:00, 16:00, 20:00 МСК; настраивается)
+4. **Перекрывает рекламу РСЯ** — детектирует рекламные посты Яндекс и публикует свой пост через 5–15 мин
+5. **Не повторяет темы** — дедупликация через последние 20 опубликованных тем
+6. **Ищет картинки** — Pexels API и Unsplash по теме поста
+7. **Управляется через Telegram** — добавление каналов, очередь, ручная публикация, превью
 
 ---
 
 ## Архитектура
 
 ```
-RSS-ленты
-    ↓
-rss_parser.py  →  content_generator.py  ←  ai_client.py (Claude)
-                        ↓                        ↑
-                  _get_used_topics()      used_topics (дедупликация)
-                        ↓
-                  image_fetcher.py  →  Pexels / Unsplash
-                        ↓
-                  buffer_manager.py  →  SQLite (posts: status=ready)
-                        ↓
-                  poster.py  →  Telegram каналы
-                        ↑
-                  bot.py  (управление: /generate, /review, /preview, /post_now, /schedule)
-                        ↑
-                  channel_post handler  →  детектор рекламы РСЯ
+RSS-ленты / WB API
+       |
+ rss_parser.py            wb_parser.py
+ web_scraper.py           wb_partner_parser.py
+       |                        |
+       +------ content_generator.py <--- ai_client.py (Claude)
+                    |                       ^
+              image_fetcher.py       used_topics (дедупликация)
+              Pexels / Unsplash
+                    |
+              buffer_manager.py --> SQLite (posts: status=ready)
+                    |
+              poster.py --> Telegram каналы
+                    ^
+              bot.py (управление: /add, /generate, /review, /schedule ...)
+                    ^
+              channel_post handler --> детектор рекламы РСЯ
 ```
 
-**Поток данных:**
+**Поток данных (информационный канал):**
 1. `content_generator` собирает темы из RSS + вечнозелёных тем
-2. Загружает последние 20 тем из БД → передаёт в Claude для дедупликации
-3. Для каждой темы ищет картинку через `image_fetcher` (Pexels → Unsplash)
-4. Генерирует посты через Claude → кладёт в БД со статусом `ready` + `image_url`
+2. Загружает последние 20 тем из БД — передаёт в Claude для дедупликации
+3. Для каждой темы ищет картинку через `image_fetcher`
+4. Генерирует посты через Claude — кладёт в БД со статусом `ready`
 5. `poster` каждый час проверяет расписание и публикует следующий `ready` пост
-6. Если буфер опустел — алерт администратору + экстренная генерация
-7. При обнаружении рекламы РСЯ — через 5–15 минут публикует пост из буфера
+
+**Поток данных (маркетплейс-канал WB):**
+1. Артикулы берутся из кеша `cards/wb_ids_cache.json`
+2. Запрос к `card.wb.ru/cards/v4/detail` батчами по 20 артикулов
+3. Из ответа формируется пост: бренд, название, цена, скидка, рейтинг, ссылка
+4. Картинка — с CDN `wbbasket.ru` по вычисленному номеру корзины
+5. Пост поступает в буфер — публикуется по расписанию
+
+---
+
+## Файлы проекта
+
+| Файл | Назначение |
+|------|-----------|
+| `config.py` | Загрузка всех переменных из `.env`; доступ через `cfg.FIELD` |
+| `database.py` | SQLite БД: channels, posts, processed_ads, evergreen_topics, error_log |
+| `ai_client.py` | Генерация постов через Claude API; ротация форматов; дедупликация |
+| `buffer_manager.py` | Очередь постов: add / get_next / mark_published; уровни OK/Low/Emergency/Critical |
+| `rss_parser.py` | Парсинг RSS, извлечение картинок из HTML, scoring по свежести/релевантности |
+| `content_generator.py` | Дирижёр: RSS → темы → Claude → буфер; утренняя и экстренная генерация |
+| `image_fetcher.py` | Поиск картинок Pexels → Unsplash; перевод RU→EN через Claude |
+| `web_scraper.py` | Автоподбор Reddit/Medium RSS через Claude, если основной RSS пуст |
+| `wb_parser.py` | Парсер товаров WB: кеш артикулов → card.wb.ru v4 API → CDN картинки |
+| `wb_partner_parser.py` | Парсер через WB Seller API (собственные товары продавца) |
+| `channel_analyzer.py` | Анализ экспорта канала через Claude для автонастройки параметров |
+| `poster.py` | Публикация по расписанию; 4 попытки (markdown/plain × с картинкой/без) |
+| `bot.py` | Telegram бот администратора; все команды; ConversationHandler для /add |
+| `ssh_test.py` | Утилита SSH-диагностики VPS через paramiko; тесты API, CDN, деплой |
+| `cards/wb_ids_cache.json` | Кеш артикулов WB по категориям (280 шт., обновлять раз в 1–2 нед.) |
+| `channels/*.json` | Карточки каналов (создаются через /add) |
 
 ---
 
@@ -76,115 +104,126 @@ rss_parser.py  →  content_generator.py  ←  ai_client.py (Claude)
 |---------|-----------|
 | `/start` | Приветствие и список команд |
 | `/list` | Все каналы с состоянием буфера и кнопками управления |
-| `/add` | Добавить новый канал (пошаговый диалог) |
+| `/add` | Добавить новый канал (пошаговый диалог или импорт JSON) |
 | `/status` | Уровень буфера по всем каналам |
-| `/generate` | Запустить генерацию постов вручную (поверх буфера) |
-| `/review` | Посмотреть посты в очереди, отредактировать или удалить; пагинация по 5 штук |
-| `/preview` | Сгенерировать пост с кнопками: в очередь / опубликовать сейчас |
+| `/generate` | Запустить генерацию постов вручную |
+| `/review` | Посмотреть очередь; редактировать текст/картинку; удалять; пагинация по 5 |
+| `/preview` | Сгенерировать пост с кнопками: в очередь / опубликовать сейчас / перегенерировать |
 | `/post_now` | Опубликовать следующий пост из буфера немедленно |
-| `/schedule` | Управление расписанием постов (см. ниже) |
-| `/delete_posts` | Удалить все готовые посты из буфера (с подтверждением) |
+| `/schedule` | Управление расписанием |
+| `/delete_posts` | Удалить все ready-посты канала (с подтверждением) |
+| `/wb_refresh` | Инструкция по обновлению кеша артикулов WB |
 | `/cancel` | Отменить текущий диалог |
 
-### Как работает `/review`
-
-Посты генерируются и сразу попадают в очередь (`ready`) — бот публикует их автоматически.
-`/review` — это **опциональный просмотр**: можно зайти, проверить что сгенерировал Claude, и при необходимости:
-
-- **✏️ Изменить текст** — показывает текущий текст, принимает новый
-- **🖼 Картинку** — прикрепить фото (отправить прямо в бот) или прямой URL .jpg/.png
-- **🔄 Перегенерировать** — удаляет пост, генерирует ровно 1 новый для этого канала
-- **🗑 Удалить** — убрать пост из очереди
-
-Если ничего не делать — пост опубликуется в своё время.
-
-Пагинация: по 5 постов, вызови `/review` ещё раз чтобы перейти к следующим.
-Фильтр: `/review @channel` — только посты конкретного канала.
-
-### Как работает `/schedule`
+### /schedule подробно
 
 ```
-/schedule                        — расписание всех каналов
-/schedule @channel               — расписание конкретного канала
-/schedule @channel 09 12 16 20   — установить часы публикаций (МСК)
-/schedule @channel off           — режим "только РСЯ" (без таймера)
-/schedule @channel on            — вернуть расписание
+/schedule                        -- расписание всех каналов
+/schedule @channel               -- расписание конкретного канала
+/schedule @channel 09 12 16 20   -- установить часы публикаций (МСК)
+/schedule @channel off           -- режим "только РСЯ" (без таймера)
+/schedule @channel on            -- вернуть расписание
 ```
 
-Часы хранятся в карточке канала (`post_times_utc`). Изменения вступают в силу сразу — перезапуск не нужен.
+---
 
-**Режим "только РСЯ"** (`off`): постер не публикует по расписанию, бот ждёт рекламный пост Яндекс РСЯ и перекрывает его. Полезно если не хочешь фиксированных часов публикаций.
+## Маркетплейс-каналы (WB)
 
-### Как работает `/delete_posts`
+### Как работает wb_parser.py
+
+1. Артикулы берутся из кеша `cards/wb_ids_cache.json` (7 категорий × 40 артикулов = 280 шт.)
+2. По артикулам запрашивается `card.wb.ru/cards/v4/detail` батчами по 20
+3. Из ответа формируется пост с ценой, скидкой, рейтингом, ссылкой
+4. URL картинки строится по формуле CDN корзины
+5. При задании `wb_categories` в карточке — выбираются нужные категории из кеша
+
+### Кеш артикулов — как обновить
+
+Раз в 1–2 недели заходим на wildberries.ru, открываем категорию, в DevTools Console (F12):
+
+```javascript
+// Собрать артикулы с текущей страницы (40 шт.)
+[...document.querySelectorAll('[data-nm-id]')]
+  .map(el => parseInt(el.dataset.nmId))
+  .filter(Boolean)
+```
+
+Вставить полученные ID в нужную категорию в `cards/wb_ids_cache.json`.
+
+### Категории в кеше
+
+`кроссовки`, `косметика`, `наушники беспроводные`, `сумка женская`, `термокружка`, `платье женское`, `настольные игры`
+
+### WB API — критические технические детали
+
+**Endpoint:**
+- УСТАРЕЛ: `/cards/v2/detail` — возвращает 404 с ~2025 года
+- АКТУАЛЕН: `/cards/v4/detail` (проверено 2026-05)
+- Структура ответа v4: `{"products": [...]}` (в v2 было `{"data": {"products": [...]}}`)
+
+**CDN корзины (basket) — формула:**
 
 ```
-/delete_posts              — удалить все ready-посты со всех каналов
-/delete_posts @channel     — удалить все ready-посты конкретного канала
+vol = article_id // 100000
+part = article_id // 1000
+URL = https://basket-{basket:02d}.wbbasket.ru/vol{vol}/part{part}/{article}/images/big/1.webp
+
+Baskets 1-19: фиксированная таблица (см. wb_parser.py)
+Baskets 20+: кусочно-линейная формула, проверено 2026-05:
+  - (vol=4622, basket=26), (vol=7620, basket=35), (vol=7901, basket=36)
+  - (vol=9017, basket=39), (vol=10243, basket=41)
+
+if   vol <= 4622:  basket = 20 + (vol - 3270) // 225
+elif vol <= 7620:  basket = 26 + (vol - 4622) // 333
+elif vol <  7901:  basket = 35
+elif vol <= 9017:  basket = 36 + (vol - 7901) // 372
+elif vol <= 10243: basket = 39 + (vol - 9017) // 613
+else:              basket = 41 + (vol - 10243) // 613
 ```
 
-Показывает количество постов к удалению и кнопки **✅ Да, удалить** / **❌ Отмена**.
-После удаления рекомендует запустить `/generate` чтобы заполнить буфер заново.
+Таблица может устареть — проверять раз в несколько месяцев.
 
-### Как работает `/preview`
-
-```
-/preview              — превью для первого канала
-/preview @channel     — превью для конкретного канала
-```
-
-Генерирует пост (не сохраняет), показывает с кнопками:
-- **📥 В очередь** — добавить в конец буфера
-- **📤 Опубликовать сейчас** — опубликовать немедленно
-- **🔄 Перегенерировать** — сгенерировать другой
-- **🗑 Выбросить** — просто закрыть без сохранения
+**Прокси:**
+- С VPS Amsterdam (77.233.215.77) карточный API доступен без прокси
+- `search.wb.ru` заблокирован с дата-центровых IP — не использовать
+- Webshare резидентные прокси: `ryryrvfb` / `95xgdgxzev5d` (10 штук, настроены в .env)
 
 ---
 
 ## Деплой на VPS
 
-### Требования к серверу
+### Текущий сервер
 
-- Ubuntu 22.04
-- **Регион: НЕ Россия** — Anthropic API блокирует запросы с российских IP. Подходят: Нидерланды, Германия, Чехия, любой EU/US дата-центр.
-- Минимум 1 vCPU, 512 MB RAM (SQLite + Python бот — очень лёгкие)
-
-### Пошаговый деплой
-
-```bash
-# На сервере (SSH root@ip)
-
-# 1. Клонируем проект
-git clone https://github.com/ТВОЙ_USERNAME/smm_bot.git /opt/smm_bot
-cd /opt/smm_bot
-
-# 2. Создаём виртуальное окружение (обязательно в /opt/smm_bot)
-python3 -m venv venv
-source venv/bin/activate
-
-# 3. Устанавливаем зависимости
-pip install -r requirements.txt
-
-# 4. Создаём .env
-nano .env
-# (вставляем все ключи — см. раздел .env ниже)
-
-# 5. Тестируем запуск
-python bot.py
-# Ctrl+C если всё ок
-
-# 6. Настраиваем systemd
-nano /etc/systemd/system/smm_bot.service
-# (вставляем содержимое из раздела systemd ниже)
-
-sudo systemctl daemon-reload
-sudo systemctl enable smm_bot
-sudo systemctl start smm_bot
-sudo systemctl status smm_bot
+```
+IP:      77.233.215.77
+Регион:  Amsterdam, Netherlands
+SSH:     ssh -i C:\Users\Admin\.ssh\smm_bot root@77.233.215.77
+Проект:  /opt/smm_bot
+Venv:    /opt/smm_bot/venv/bin/python
+Сервис:  smm_bot.service
 ```
 
-### systemd сервис
+### Требования
 
-```ini
+- Ubuntu 22.04+
+- **Регион НЕ Россия** — Anthropic API блокирует российские IP (HTTP 403)
+- Минимум 1 vCPU, 512 MB RAM
+
+### Первоначальный деплой (новый сервер)
+
+```bash
+git clone https://github.com/Dezmont911/smm_bot-.git /opt/smm_bot
+cd /opt/smm_bot
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env && nano .env
+
+# Тест
+python bot.py   # Ctrl+C если ок
+
+# systemd
+cat > /etc/systemd/system/smm_bot.service << 'EOF'
 [Unit]
 Description=SMM Bot
 After=network.target
@@ -201,41 +240,49 @@ StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload && systemctl enable smm_bot && systemctl start smm_bot
 ```
 
-### Полезные команды на сервере
+### Обновление кода
 
 ```bash
-# Статус
+# Windows: git add . && git commit -F msg.txt && git push
+# Сервер:
+cd /opt/smm_bot && git pull origin main && systemctl restart smm_bot
+```
+
+### Управление сервисом
+
+```bash
 systemctl status smm_bot
-
-# Логи (последние 50 строк)
-journalctl -u smm_bot -n 50 -f
-
-# Перезапуск после обновления кода
-systemctl restart smm_bot
-
-# Обновление кода (на Windows: git push, затем на сервере:)
-cd /opt/smm_bot && git pull && systemctl restart smm_bot
+journalctl -u smm_bot -n 50 -f        # логи в реальном времени
+/opt/smm_bot/venv/bin/python wb_parser.py   # тест WB парсера
 ```
 
-### SSH без пароля (удобнее для работы)
+### SSH через Python (ssh_test.py)
 
-```bash
-# На Windows (PowerShell)
-ssh-keygen -t ed25519 -C "smm_bot"
-Get-Content ~/.ssh/id_ed25519.pub | ssh root@SERVER_IP "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"
+Файл `ssh_test.py` использует `paramiko` — надёжнее чем `ssh.exe` в Windows:
 
-# Добавить в ~/.ssh/config:
-Host smm_bot
-    HostName SERVER_IP
-    User root
-    IdentityFile ~/.ssh/id_ed25519
-    ServerAliveInterval 60
+```python
+import paramiko, sys
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
-# Теперь можно подключаться просто:
-ssh smm_bot
+client = paramiko.SSHClient()
+client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+client.connect("77.233.215.77", port=22, username="root",
+               key_filename=r"C:\Users\Admin\.ssh\smm_bot", timeout=15)
+
+def run(client, cmd, timeout=60):
+    stdin, stdout, stderr = client.exec_command(f"bash -lc '{cmd}'", timeout=timeout)
+    return stdout.read().decode("utf-8", errors="replace") + stderr.read().decode("utf-8", errors="replace")
+
+print(run(client, "systemctl status smm_bot | head -5"))
+client.close()
 ```
+
+Запуск: `py ssh_test.py` (в cmd, не PowerShell).
 
 ---
 
@@ -252,150 +299,131 @@ ANTHROPIC_API_KEY=sk-ant-...
 ### Опциональные
 
 ```env
-# Модель (по умолчанию claude-haiku-4-5-20251001)
+# Модель Claude (по умолчанию claude-haiku-4-5-20251001)
 CLAUDE_MODEL=claude-haiku-4-5-20251001
 
-# Картинки — хотя бы один ключ для изображений к постам
-PEXELS_API_KEY=...        # https://www.pexels.com/api/ (200 запросов/час, работает из РФ)
-UNSPLASH_ACCESS_KEY=...   # https://unsplash.com/developers (50 запросов/час)
+# Картинки
+PEXELS_API_KEY=...            # https://www.pexels.com/api/
+UNSPLASH_ACCESS_KEY=...       # https://unsplash.com/developers
 
-# Прокси (если нужен)
-PROXY_URL=socks5://user:pass@host:port
+# WB Seller API (для своих товаров)
+WB_API_KEY=...
+WB_API_MODE=auto              # "seller" | "search" | "auto"
+
+# Прокси для WB парсера (если нужны)
+WB_PROXY_URL=http://user:pass@host:port
+WB_PROXY_URLS=http://u1:p@1.2.3.4:80,http://u2:p@5.6.7.8:80
+
+# Буфер
+BUFFER_MIN=8
+BUFFER_EMERGENCY=4
+BUFFER_CRITICAL=2
+
+# Задержка публикации (сек)
+POST_DELAY_MIN=300
+POST_DELAY_MAX=900
+
+# Генерация (UTC)
+GENERATION_HOUR=3
+GENERATION_MINUTE=0
+
+# Debug
+DEBUG=True
 ```
-
-> **Важно:** Anthropic API блокирует российские IP-адреса (код 403). Используй VPS в Нидерландах, Германии или другом EU/US регионе.
 
 ---
 
-## Структура карточки канала
+## Карточка канала
 
-Каждый канал описывается JSON-файлом в папке `channels/`. Создаётся автоматически через `/add`.
+### Информационный канал
 
 ```json
 {
   "channel_id": "@mychannel",
-  "name": "Название канала",
+  "name": "Мой канал",
   "topic": "личные финансы, инвестиции",
   "audience": "широкая аудитория",
   "tone": "дружелюбный эксперт, без снобизма",
-  "post_length": "100–200 слов",
+  "post_length": "100-200 слов",
   "use_emoji": true,
-  "forbidden_topics": ["политика", "криптовалюта"],
-  "post_formats": ["совет дня", "факт/статистика", "вопрос аудитории", "мини-разбор", "инфоповод"],
+  "forbidden_topics": ["политика"],
+  "post_formats": ["совет дня", "факт/статистика", "вопрос аудитории"],
   "rss_sources": ["https://banki.ru/xml/news.rss"],
-  "evergreen_topics": ["Как составить личный бюджет", "..."],
+  "evergreen_topics": ["Как составить личный бюджет"],
   "daily_posts_count": 10,
   "post_times_utc": [6, 9, 13, 17],
   "active": true
 }
 ```
 
-Поле `schedule_disabled: true` добавляется автоматически командой `/schedule @channel off`.
+### Маркетплейс-канал (WB)
+
+```json
+{
+  "channel_id": "@wbchannel",
+  "name": "WB Кроссовки",
+  "topic": "кроссовки, спортивная обувь",
+  "source_type": "wb_parser",
+  "wb_categories": ["кроссовки"],
+  "post_times_utc": [6, 9, 13, 17],
+  "active": true
+}
+```
 
 ---
 
 ## Буфер постов
 
-Золотое правило: буфер **никогда не должен опустеть**.
-
 | Уровень | Постов | Действие |
 |---------|--------|---------|
 | OK | ≥ 8 | Всё хорошо |
-| Low | 4–7 | Скоро нужна генерация |
-| Emergency | 2–3 | Запускается автогенерация в фоне |
-| Critical | 0–1 | Алерт администратору + экстренная генерация |
+| Low | 4-7 | Скоро нужна генерация |
+| Emergency | 2-3 | Автогенерация в фоне |
+| Critical | 0-1 | Алерт + экстренная генерация |
 
 ---
 
 ## Публикация постов
 
-`poster.py` запускается через APScheduler каждый час и проверяет расписание каждого канала.
+`poster.py` — APScheduler каждый час. Расписание по умолчанию: 09:00, 12:00, 16:00, 20:00 МСК.
 
-**Расписание по умолчанию:** 09:00, 12:00, 16:00, 20:00 МСК (06:00, 09:00, 13:00, 17:00 UTC)
-
-**Порядок попыток при публикации (4 шага):**
+**4 попытки при публикации:**
 1. Markdown + картинка
 2. Plain text + картинка
-3. Markdown без картинки (если URL картинки недоступен или таймаут)
+3. Markdown без картинки
 4. Plain text без картинки
 
 ---
 
-## Картинки к постам
+## Известные технические детали
 
-`image_fetcher.py` автоматически ищет картинку для каждого сгенерированного поста.
+### WB API
 
-**Как работает:**
-1. Берёт тему поста (например: "ЦБ сохранил ставку 21%")
-2. Определяет контекст канала ("финансы" → "finance money")
-3. Переводит ключевые слова через Claude (только русские слова)
-4. Ищет в Pexels → если ничего нет, ищет в Unsplash
-5. Сохраняет URL картинки в поле `image_url` записи поста
+- `/cards/v2/detail` устарел с ~2025 — используем `/cards/v4/detail`
+- JSON v4: `{"products": [...]}` вместо `{"data": {"products": [...]}}`
+- Basket таблица — кусочно-линейная формула (в коде `_get_basket`), проверена 2026-05
+- Проверять актуальность basket таблицы раз в несколько месяцев
 
-**Ключи:**
-- Pexels: 200 запросов/час, бесплатно, работает из РФ → `PEXELS_API_KEY`
-- Unsplash: 50 запросов/час, бесплатно → `UNSPLASH_ACCESS_KEY`
+### SSH из Windows
 
-Если ключей нет — посты публикуются без картинки.
+- `ssh.exe` (OpenSSH Windows) через PowerShell/CMD — бывают проблемы с ключами (exit 255 без вывода)
+- Решение: использовать Python `paramiko` — работает надёжно
+- Запускать скрипты: `py script.py` в cmd (не PowerShell)
+- SSH ключ: `C:\Users\Admin\.ssh\smm_bot`
 
----
+### Git на сервере
 
-## Дедупликация тем
+- Если сервер имеет локальные изменения: `git checkout HEAD -- <file>` восстанавливает из коммита
+- Для коммита с пробелами в сообщении использовать файл: `echo msg > msg.txt && git commit -F msg.txt`
 
-Чтобы Claude не повторял уже опубликованные темы, в каждый запрос генерации передаётся история:
+### Anthropic API
 
-```python
-# content_generator.py
-used_topics = self._get_used_topics(channel_id, limit=20)
-post = await generate_post(channel, topic, format_name, used_topics=used_topics)
+- Блокирует запросы с российских IP (HTTP 403)
+- VPS должен быть в EU/US — Amsterdam 77.233.215.77 работает
 
-# ai_client.py — системный промпт
-УЖЕ ИСПОЛЬЗОВАННЫЕ ТЕМЫ (не повторяй их и не пиши похожее):
-- Как построить автоматические фермы ресурсов
-- Лучшие моды для выживания
-- ...
-```
+### Webshare прокси
 
-Метод `_get_used_topics` берёт из БД последние 20 тем со статусом `published` или `ready`.
-
----
-
-## Детектор рекламы РСЯ
-
-Бот подписан на `channel_post` — каждый пост в канале проходит через обработчик.
-
-Признаки рекламного поста РСЯ: `ya.cc`, `yabs.yandex.ru`, `yandex.ru/adv`, `erid:` в тексте или entity.
-
-При обнаружении: через 5–15 минут (случайная задержка) публикует следующий пост из буфера.
-
----
-
-## Автоподбор источников (web_scraper)
-
-Когда RSS-ленты канала дают меньше половины нужных тем, `web_scraper` автоматически находит дополнительные источники.
-
-**Как работает:**
-1. Claude получает тему канала и предлагает 3-5 Reddit-сабреддитов и Medium-тегов
-2. Каждый URL проверяется через feedparser — остаются только рабочие
-3. Рабочие ленты сохраняются в карточку канала как `web_sources` (один раз)
-4. При следующих генерациях используются уже сохранённые ленты
-
-**Порядок источников в content_generator:**
-```
-1. RSS-ленты из карточки канала    (приоритет)
-2. web_scraper (Reddit/Medium)     (если RSS < 50% нужного)
-3. Вечнозелёные темы из БД         (последний резерв)
-```
-
----
-
-## Стек
-
-- **Python 3.12**
-- **python-telegram-bot 20.7** — бот администратора + публикация в каналы
-- **anthropic** — генерация текстов через Claude (claude-haiku-4-5-20251001)
-- **APScheduler 3.10** — планировщик постера и утренней генерации
-- **feedparser + BeautifulSoup4** — RSS парсер
-- **aiohttp** — HTTP-клиент (Unsplash)
-- **SQLite** — база данных (лёгкая, не требует отдельного сервера)
-- **loguru** — логирование
+- Аккаунт: `ryryrvfb`, пароль: `95xgdgxzev5d`
+- 10 резидентных прокси в GB, CA, DE и других странах
+- Для WB card API с Amsterdam VPS прокси не нужны — доступен напрямую
+- Формат: `http://ryryrvfb-{country}-{N}:{password}@{ip}:80`
