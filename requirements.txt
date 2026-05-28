@@ -17,8 +17,10 @@ feedparser==6.0.11         # Парсинг RSS-лент для инфопово
 beautifulsoup4==4.12.3     # Извлечение картинок из HTML описания статей
 lxml==5.2.2                # Быстрый HTML/XML парсер (используется BeautifulSoup)
 
-# --- HTTP клиент (для image_fetcher) ---
+# --- HTTP клиент (для image_fetcher и WB-парсера) ---
 aiohttp==3.9.5             # Асинхронные запросы к Unsplash и Pexels API
+aiohttp-socks==0.8.4       # SOCKS5-прокси поддержка для aiohttp
+curl_cffi>=0.7.0           # Chrome TLS fingerprint — обход PoW-защиты WB
 
 # --- Утилиты ---
 python-dotenv==1.0.1       # Загрузка .env файла

@@ -80,18 +80,31 @@ class WBParser:
     """Генерирует посты из случайных категорий Wildberries."""
 
     SEARCH_URL = "https://search.wb.ru/exactmatch/ru/common/v7/search"
-    HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Origin": "https://www.wildberries.ru",
-        "Referer": "https://www.wildberries.ru/catalog/0/search.aspx",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "cross-site",
-        "Connection": "keep-alive",
-    }
+
+    # Несколько реальных UA для ротации — снижает шанс rate-limit
+    USER_AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    ]
+
+    @property
+    def HEADERS(self) -> dict:
+        """Заголовки со случайным User-Agent при каждом обращении."""
+        return {
+            "User-Agent": random.choice(self.USER_AGENTS),
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Origin": "https://www.wildberries.ru",
+            "Referer": "https://www.wildberries.ru/catalog/0/search.aspx",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "cross-site",
+            "Connection": "keep-alive",
+        }
 
     async def generate_posts(self, channel: dict, count: int = 10) -> list[dict]:
         """
@@ -134,17 +147,23 @@ class WBParser:
         proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else None
 
         async with CurlSession(impersonate="chrome124") as session:
-            # Прогреваем сессию — получаем cookies с главной страницы WB
+            # Прогреваем сессию — получаем cookies с главной страницы WB.
+            # При SOCKS5 warmup может упасть с TLS ошибкой — это не критично,
+            # search запросы всё равно пойдут (у них другой TLS handshake).
             try:
+                warmup_proxies = proxies
+                # Для SOCKS5 — пробуем warmup без прокси (главная WB доступна без него)
+                if proxy_url and proxy_url.startswith("socks"):
+                    warmup_proxies = None
                 await session.get(
                     "https://www.wildberries.ru/",
-                    proxies=proxies,
+                    proxies=warmup_proxies,
                     timeout=10,
                 )
                 await asyncio.sleep(random.uniform(1.0, 2.0))
                 logger.debug("WB-парсер (curl): сессия прогрета")
             except Exception as e:
-                logger.warning(f"WB-парсер (curl): не удалось прогреть сессию: {e}")
+                logger.warning(f"WB-парсер (curl): warmup пропущен ({type(e).__name__}), продолжаем")
 
             posts = []
             for cat in selected_cats:
