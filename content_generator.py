@@ -146,10 +146,11 @@ class ContentGenerator:
                 if topic_data.get("image_url"):
                     post["image_url"] = topic_data["image_url"]
                     post["has_image"] = True
-                elif cfg.UNSPLASH_ACCESS_KEY or cfg.PEXELS_API_KEY:
+                elif cfg.UNSPLASH_ACCESS_KEY or cfg.PEXELS_API_KEY or channel.get("reddit_image_subreddits"):
                     image_url = await fetch_image_url(
                         topic=topic_data["topic"],
                         channel_topic=channel.get("topic", ""),
+                        subreddits=channel.get("reddit_image_subreddits"),
                     )
                     if image_url:
                         post["image_url"] = image_url

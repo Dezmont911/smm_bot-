@@ -55,20 +55,30 @@ _RU_STOP = {
 async def fetch_image_url(
     topic: str,
     channel_topic: str = "",
+    subreddits: list[str] | None = None,
 ) -> str | None:
     """
     Ищет подходящую картинку для поста.
 
-    Переводит русскую тему в английские ключевые слова через Claude,
-    затем ищет в Pexels (приоритет), потом в Unsplash.
+    Порядок приоритетов:
+      1. Reddit (если указаны subreddits в карточке канала) — реальные скриншоты
+      2. Pexels — стоковые фото
+      3. Unsplash — резервный
 
     Args:
         topic        — тема/инфоповод конкретного поста
-        channel_topic — общая тема канала (помогает при коротких темах)
+        channel_topic — общая тема канала
+        subreddits   — список сабреддитов из карточки канала (например ["Minecraft", "feedthebeast"])
 
     Returns:
         Прямой URL картинки (пригоден для Telegram send_photo) или None
     """
+    # Reddit — первый приоритет для нишевых каналов
+    if subreddits:
+        url = await _fetch_reddit_image(subreddits)
+        if url:
+            return url
+
     if not cfg.PEXELS_API_KEY and not cfg.UNSPLASH_ACCESS_KEY:
         logger.debug("Нет ключей Pexels/Unsplash — пост без картинки")
         return None
@@ -90,6 +100,86 @@ async def fetch_image_url(
             return url
 
     return None
+
+
+# ============================================================
+# Reddit — реальные скриншоты из сообщества
+# ============================================================
+
+async def _fetch_reddit_image(subreddits: list[str]) -> str | None:
+    """
+    Берёт случайное изображение из топ-постов указанных сабреддитов за неделю.
+
+    Reddit отдаёт публичный JSON без API-ключа.
+    Фильтруем только посты с прямыми ссылками на картинки.
+    """
+    import random
+
+    # Перемешиваем сабреддиты — каждый раз разный источник
+    shuffled = subreddits[:]
+    random.shuffle(shuffled)
+
+    for subreddit in shuffled:
+        url = await _reddit_top_image(subreddit)
+        if url:
+            return url
+
+    return None
+
+
+async def _reddit_top_image(subreddit: str) -> str | None:
+    """Запрашивает топ-посты за неделю из сабреддита и возвращает URL картинки."""
+    import random
+
+    api_url = f"https://www.reddit.com/r/{subreddit}/top.json?t=week&limit=50"
+    headers = {
+        "User-Agent": "smm_bot/1.0 (Telegram SMM automation)",
+        "Accept": "application/json",
+    }
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, headers=headers, timeout=timeout) as resp:
+                if resp.status != 200:
+                    logger.debug(f"Reddit r/{subreddit}: статус {resp.status}")
+                    return None
+
+                data = await resp.json()
+                posts = data.get("data", {}).get("children", [])
+
+                # Фильтруем только посты с прямыми ссылками на изображения
+                image_urls = []
+                for post in posts:
+                    pd = post.get("data", {})
+                    # Пропускаем NSFW и удалённые посты
+                    if pd.get("over_18") or pd.get("removed_by_category"):
+                        continue
+                    post_url = pd.get("url", "")
+                    # Прямые ссылки на картинки
+                    if any(post_url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp")):
+                        image_urls.append(post_url)
+                    # Reddit-hosted images (i.redd.it)
+                    elif "i.redd.it" in post_url:
+                        image_urls.append(post_url)
+                    # Reddit gallery — берём первую картинку
+                    elif pd.get("post_hint") == "image" and pd.get("url"):
+                        image_urls.append(pd["url"])
+
+                if not image_urls:
+                    logger.debug(f"Reddit r/{subreddit}: нет подходящих картинок")
+                    return None
+
+                chosen = random.choice(image_urls)
+                logger.info(f"Reddit r/{subreddit} OK | {chosen[:70]}...")
+                return chosen
+
+    except aiohttp.ClientError as e:
+        logger.warning(f"Reddit r/{subreddit} сетевая ошибка: {e}")
+        return None
+    except Exception as e:
+        logger.warning(f"Reddit r/{subreddit} ошибка: {type(e).__name__}: {e}")
+        return None
 
 
 # ============================================================
