@@ -307,16 +307,26 @@ class ContentGenerator:
             posts = await _parser.generate_posts(channel, count=target_count)
         except Exception as e:
             logger.error(f"WB-pipeline [{channel_id}]: ошибка парсера: {e}")
-            return {
-                "channel_id": channel_id,
-                "generated": 0,
-                "skipped": 0,
-                "buffer_level": buffer.get_level(channel_id),
-                "sources_used": [],
-            }
+            posts = []
+
+        # Фоллбек: если wb_partner_parser не дал результатов — пробуем публичный wb_parser
+        if not posts and parser_name == "wb_partner":
+            logger.warning(
+                f"WB-pipeline [{channel_id}]: wb_partner вернул 0 постов — "
+                f"переключаюсь на публичный wb_parser"
+            )
+            try:
+                from wb_parser import wb_parser as _fallback_parser
+                posts = await _fallback_parser.generate_posts(channel, count=target_count)
+                if posts:
+                    parser_name = "wb_parser (fallback)"
+                    logger.info(f"WB-pipeline [{channel_id}]: публичный wb_parser дал {len(posts)} постов")
+            except Exception as e:
+                logger.error(f"WB-pipeline [{channel_id}]: фоллбек wb_parser тоже упал: {e}")
+                posts = []
 
         if not posts:
-            logger.warning(f"WB-pipeline [{channel_id}]: парсер не вернул ни одного товара")
+            logger.warning(f"WB-pipeline [{channel_id}]: все парсеры вернули 0 товаров")
             return {
                 "channel_id": channel_id,
                 "generated": 0,

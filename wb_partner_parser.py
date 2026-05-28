@@ -356,15 +356,19 @@ class WBPartnerParser:
     # Режим 2: Search API с авторизацией
     # --------------------------------------------------------
 
+    # Категории по умолчанию (если не заданы в карточке канала)
+    DEFAULT_CATEGORIES = [
+        "кроссовки", "косметика", "наушники беспроводные",
+        "сумка женская", "термокружка", "платье женское", "настольные игры"
+    ]
+
     async def _fetch_search_posts(self, channel: dict, count: int) -> list[dict]:
         """
         Получает товары через поисковый API WB с авторизацией.
         Авторизация обходит PoW-блокировку для VPS.
         """
-        from wb_parser import WB_CATEGORIES, _categories_count
-
-        categories = channel.get("wb_categories", WB_CATEGORIES)
-        n_cats = _categories_count(count)
+        categories = channel.get("wb_categories", self.DEFAULT_CATEGORIES)
+        n_cats = max(1, min(count, 3))  # не больше 3 категорий за раз
         selected_cats = random.sample(categories, min(len(categories), n_cats))
         per_cat = max(1, (count + n_cats - 1) // n_cats)
 

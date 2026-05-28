@@ -920,84 +920,126 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Показывает посты в очереди на публикацию.
-    Посты уже готовы (статус ready) — просмотр опциональный.
-    Можно изменить текст, добавить картинку или удалить пост.
 
     Использование:
-        /review          — первые 5 постов всех каналов
-        /review @channel — посты конкретного канала
+        /review          — выбор канала через inline-кнопки
+        /review @channel — посты конкретного канала сразу
     """
     if not is_admin(update.effective_user.id):
         return
 
-    # Проверяем аргументы — конкретный канал или все
-    args = context.args
-    channel_filter = None
+    args = context.args or []
+
     if args:
-        channel_filter = args[0] if args[0].startswith("@") else f"@{args[0]}"
+        # Прямой переход к постам конкретного канала
+        channel_id = args[0] if args[0].startswith("@") else f"@{args[0]}"
+        await _send_review_page(update.message, channel_id, offset=0)
+    else:
+        # Показываем выбор канала через inline-кнопки
+        channels = load_all_channels()
+        if not channels:
+            await update.message.reply_text("Нет активных каналов. Добавь через /add")
+            return
 
-    # Берём ready посты из БД
-    with db.connect() as conn:
-        if channel_filter:
-            rows = conn.execute(
-                """SELECT * FROM posts
-                   WHERE channel_id = ? AND status = 'ready'
-                   ORDER BY generated_at ASC""",
-                (channel_filter,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """SELECT * FROM posts
-                   WHERE status = 'ready'
-                   ORDER BY channel_id, generated_at ASC"""
-            ).fetchall()
+        buttons = []
+        row = []
+        for ch in channels:
+            count = buffer.get_ready_count(ch["channel_id"])
+            icon = "📭" if count == 0 else "📋"
+            label = f"{icon} {ch['channel_id']} · {count}"
+            row.append(InlineKeyboardButton(label, callback_data=f"review_ch:{ch['channel_id']}"))
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
 
-    posts = [dict(r) for r in rows]
-
-    if not posts:
-        tip = f"канала {channel_filter}" if channel_filter else "всех каналов"
         await update.message.reply_text(
-            f"📭 Очередь {tip} пуста.\n\n"
-            f"Запусти /generate чтобы создать посты."
+            "📋 <b>Очередь постов</b>\n\nВыбери канал для просмотра:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
         )
-        context.user_data.pop("review_offset", None)
-        context.user_data.pop("review_filter", None)
+
+
+async def handle_review_channel_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопки выбора канала из /review (review_ch:@channel)."""
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
         return
 
-    total = len(posts)
+    channel_id = query.data.split(":", 1)[1]
+    await query.edit_message_reply_markup(reply_markup=None)  # убираем клавиатуру выбора
+    await _send_review_page(query.message, channel_id, offset=0)
+
+
+async def handle_review_next_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопки пагинации «Следующие N →» / «← Сначала»."""
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    # format: review_page:@channel:offset
+    parts = query.data.split(":", 2)
+    channel_id = parts[1]
+    offset = int(parts[2])
+
+    # Убираем кнопку пагинации у предыдущей страницы
+    await query.edit_message_reply_markup(reply_markup=None)
+    await _send_review_page(query.message, channel_id, offset=offset)
+
+
+async def _send_review_page(message, channel_id: str, offset: int):
+    """
+    Вспомогательная функция: показывает страницу постов канала.
+    Работает как с message (из команды), так и с query.message (из кнопки).
+    """
     PAGE = 5
 
-    # Сбрасываем offset если сменился фильтр канала
-    prev_filter = context.user_data.get("review_filter")
-    if prev_filter != channel_filter:
-        context.user_data["review_offset"] = 0
-        context.user_data["review_filter"] = channel_filter
+    with db.connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM posts
+               WHERE channel_id = ? AND status = 'ready'
+               ORDER BY generated_at ASC""",
+            (channel_id,),
+        ).fetchall()
 
-    offset = context.user_data.get("review_offset", 0)
+    posts = [dict(r) for r in rows]
+    total = len(posts)
 
-    # Если дошли до конца — начинаем сначала
-    if offset >= total:
-        offset = 0
-        context.user_data["review_offset"] = 0
+    if total == 0:
+        await message.reply_text(
+            f"📭 Очередь <b>{channel_id}</b> пуста.\n\n"
+            f"Запусти /generate {channel_id} чтобы создать посты.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
 
+    offset = min(offset, total - 1)  # защита от выхода за границы
     page_posts = posts[offset:offset + PAGE]
     shown_end = offset + len(page_posts)
+    page_num = (offset // PAGE) + 1
+    total_pages = (total + PAGE - 1) // PAGE
 
-    await update.message.reply_text(
-        f"📋 <b>Постов в очереди: {total}</b>\n"
-        f"Показываю {offset + 1}–{shown_end}. Редактируй если нужно — "
-        f"или просто оставь, постер опубликует по расписанию.",
+    # Заголовок страницы
+    await message.reply_text(
+        f"📋 <b>{channel_id}</b> · {total} постов\n"
+        f"Страница {page_num}/{total_pages} · показываю {offset + 1}–{shown_end}.\n"
+        f"Редактируй или оставь — постер опубликует по расписанию.",
         parse_mode=ParseMode.HTML,
     )
 
+    # Показываем посты страницы
     for i, post in enumerate(page_posts, start=offset + 1):
         msg_text = format_post_message(post, index=i, total=total)
         keyboard = review_keyboard(post["id"])
 
-        # Если у поста есть картинка — показываем с ней
         if post.get("image_url"):
             try:
-                await update.message.reply_photo(
+                await message.reply_photo(
                     photo=post["image_url"],
                     caption=msg_text,
                     parse_mode=ParseMode.HTML,
@@ -1007,26 +1049,35 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass  # картинка битая — покажем без неё
 
-        await update.message.reply_text(
+        await message.reply_text(
             msg_text,
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
         )
 
-    # Обновляем offset для следующего вызова
-    context.user_data["review_offset"] = shown_end if shown_end < total else 0
+    # Кнопки навигации
+    nav_buttons = []
 
-    if total > PAGE:
+    if offset > 0:
+        nav_buttons.append(
+            InlineKeyboardButton("← Сначала", callback_data=f"review_page:{channel_id}:0")
+        )
+
+    if shown_end < total:
         remaining = total - shown_end
-        if remaining > 0:
-            await update.message.reply_text(
-                f"👆 Показано {offset + 1}–{shown_end} из {total}.\n"
-                f"Вызови /review ещё раз чтобы увидеть следующие {min(PAGE, remaining)}."
-            )
-        else:
-            await update.message.reply_text(
-                f"✅ Показаны все {total} постов. /review снова — с начала."
-            )
+        next_label = f"Следующие {min(PAGE, remaining)} →"
+        nav_buttons.append(
+            InlineKeyboardButton(next_label, callback_data=f"review_page:{channel_id}:{shown_end}")
+        )
+
+    if nav_buttons:
+        await message.reply_text(
+            f"👆 {offset + 1}–{shown_end} из {total}",
+            reply_markup=InlineKeyboardMarkup([nav_buttons]),
+        )
+    elif total > PAGE:
+        # Последняя страница — без кнопок
+        await message.reply_text(f"✅ Все посты показаны ({total} шт.)")
 
 
 async def handle_gen_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2191,6 +2242,10 @@ def main():
         handle_gen_channel,
         pattern="^gen_channel:",
     ))
+
+    # --- Кнопки: /review — выбор канала и пагинация ---
+    app.add_handler(CallbackQueryHandler(handle_review_channel_select, pattern="^review_ch:"))
+    app.add_handler(CallbackQueryHandler(handle_review_next_page, pattern="^review_page:"))
 
     # --- Кнопки: редактирование постов ---
     app.add_handler(CallbackQueryHandler(handle_post_actions, pattern="^(delete|image|regen|done|postnow):"))
