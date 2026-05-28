@@ -108,18 +108,33 @@ class WBParser:
         )
 
         # Прокси (если задан WB_PROXY_URL в .env — обходит PoW блокировку VPS)
-        proxy = cfg.WB_PROXY_URL or None
-        if proxy:
-            logger.debug(f"WB-парсер: используем прокси {proxy.split('@')[-1]}")
+        proxy_url = cfg.WB_PROXY_URL or None
+        # HTTP-прокси передаётся как параметр запроса, SOCKS5 — через коннектор
+        http_proxy = None  # для aiohttp proxy= параметра
+        if proxy_url:
+            logger.debug(f"WB-парсер: используем прокси {proxy_url.split('@')[-1]}")
+            if proxy_url.startswith("socks"):
+                # SOCKS4/SOCKS5 — используем aiohttp-socks ProxyConnector
+                try:
+                    from aiohttp_socks import ProxyConnector
+                    connector = ProxyConnector.from_url(proxy_url, ssl=False)
+                except ImportError:
+                    logger.error("Для SOCKS5 прокси установите: pip install aiohttp-socks")
+                    connector = aiohttp.TCPConnector(ssl=False)
+            else:
+                # HTTP/HTTPS прокси — стандартный коннектор + proxy= в запросах
+                connector = aiohttp.TCPConnector(ssl=False)
+                http_proxy = proxy_url
+        else:
+            connector = aiohttp.TCPConnector(ssl=False)
 
         # Создаём одну сессию на всё — WB видит цепочку запросов с cookies
-        connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(headers=self.HEADERS, connector=connector) as session:
             # Прогреваем сессию — получаем cookies с главной страницы
             try:
                 await session.get(
                     "https://www.wildberries.ru/",
-                    proxy=proxy,
+                    proxy=http_proxy,
                     timeout=aiohttp.ClientTimeout(total=10),
                 )
                 await asyncio.sleep(random.uniform(1.0, 2.0))
@@ -131,7 +146,7 @@ class WBParser:
             posts = []
             for cat in selected_cats:
                 try:
-                    cat_posts = await self._fetch_category_posts(cat, per_cat + 1, session, proxy)
+                    cat_posts = await self._fetch_category_posts(cat, per_cat + 1, session, http_proxy)
                     posts.extend(cat_posts)
                 except Exception as e:
                     logger.error(f"WB-парсер: ошибка для категории '{cat}': {e}")
