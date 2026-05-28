@@ -71,10 +71,16 @@ class WBParser:
 
     SEARCH_URL = "https://search.wb.ru/exactmatch/ru/common/v7/search"
     HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept-Language": "ru-RU,ru;q=0.9",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
         "Origin": "https://www.wildberries.ru",
-        "Referer": "https://www.wildberries.ru/",
+        "Referer": "https://www.wildberries.ru/catalog/0/search.aspx",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "cross-site",
+        "Connection": "keep-alive",
     }
 
     async def generate_posts(self, channel: dict, count: int = 10) -> list[dict]:
@@ -99,14 +105,28 @@ class WBParser:
             f"запрос {count} постов из {n_cats} категорий: {selected_cats}"
         )
 
-        # Запрашиваем категории последовательно — WB блокирует параллельные запросы
-        posts = []
-        for cat in selected_cats:
+        # Создаём одну сессию на всё — WB видит цепочку запросов с cookies
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(headers=self.HEADERS, connector=connector) as session:
+            # Прогреваем сессию — получаем cookies с главной страницы
             try:
-                cat_posts = await self._fetch_category_posts(cat, per_cat + 1)
-                posts.extend(cat_posts)
+                await session.get(
+                    "https://www.wildberries.ru/",
+                    timeout=aiohttp.ClientTimeout(total=10),
+                )
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+                logger.debug("WB-парсер: сессия прогрета (cookies получены)")
             except Exception as e:
-                logger.error(f"WB-парсер: ошибка для категории '{cat}': {e}")
+                logger.warning(f"WB-парсер: не удалось прогреть сессию: {e}")
+
+            # Запрашиваем категории последовательно
+            posts = []
+            for cat in selected_cats:
+                try:
+                    cat_posts = await self._fetch_category_posts(cat, per_cat + 1, session)
+                    posts.extend(cat_posts)
+                except Exception as e:
+                    logger.error(f"WB-парсер: ошибка для категории '{cat}': {e}")
 
         # Перемешиваем и обрезаем до нужного количества
         random.shuffle(posts)
@@ -115,7 +135,9 @@ class WBParser:
         logger.info(f"WB-парсер: собрано {len(final)} постов из {count} запрошенных")
         return final
 
-    async def _fetch_category_posts(self, category: str, limit: int) -> list[dict]:
+    async def _fetch_category_posts(
+        self, category: str, limit: int, session: "aiohttp.ClientSession"
+    ) -> list[dict]:
         """Берёт товары по поисковому запросу WB. Ретрай при 429."""
         params = {
             "appType": "1",
@@ -128,24 +150,23 @@ class WBParser:
             "page": str(random.randint(1, 3)),
         }
 
-        # Пауза перед запросом — WB агрессивно режет без задержки
-        await asyncio.sleep(random.uniform(1.5, 3.0))
+        # Пауза между запросами к разным категориям
+        await asyncio.sleep(random.uniform(2.0, 4.0))
 
-        for attempt in range(3):  # до 3 попыток
+        for attempt in range(3):
             try:
-                async with aiohttp.ClientSession(headers=self.HEADERS) as session:
-                    async with session.get(
-                        self.SEARCH_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)
-                    ) as resp:
-                        if resp.status == 429:
-                            wait = 5 * (attempt + 1)  # 5с, 10с, 15с
-                            logger.warning(f"WB search '{category}' → 429, жду {wait}с (попытка {attempt+1}/3)")
-                            await asyncio.sleep(wait)
-                            continue
-                        if resp.status != 200:
-                            logger.warning(f"WB search '{category}' → HTTP {resp.status}")
-                            return []
-                        data = await resp.json(content_type=None)
+                async with session.get(
+                    self.SEARCH_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp:
+                    if resp.status == 429:
+                        wait = 8 * (attempt + 1)  # 8с, 16с, 24с
+                        logger.warning(f"WB search '{category}' → 429, жду {wait}с (попытка {attempt+1}/3)")
+                        await asyncio.sleep(wait)
+                        continue
+                    if resp.status != 200:
+                        logger.warning(f"WB search '{category}' → HTTP {resp.status}")
+                        return []
+                    data = await resp.json(content_type=None)
 
                 products = data.get("data", {}).get("products", [])
                 if not products:
@@ -161,11 +182,12 @@ class WBParser:
                     if post:
                         posts.append(post)
 
+                logger.debug(f"WB search '{category}': найдено {len(posts)} товаров")
                 return posts
 
             except asyncio.TimeoutError:
                 logger.warning(f"WB search '{category}': таймаут (попытка {attempt+1}/3)")
-                await asyncio.sleep(3)
+                await asyncio.sleep(5)
                 continue
             except Exception as e:
                 logger.error(f"WB search '{category}': {e}")
