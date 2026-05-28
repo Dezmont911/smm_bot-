@@ -1,352 +1,237 @@
 """
 wb_parser.py — Парсер товаров Wildberries для marketplace-каналов
 
-Как работает:
-  1. При запросе N постов — выбирает несколько случайных категорий
-  2. Из каждой категории берёт 2-3 случайных популярных товара
-  3. Форматирует в красивый пост: фото + название + цена + рейтинг + ссылка
-  4. Картинка берётся напрямую с WB CDN (без API-ключей)
+Стратегия (v2, без 429):
+  1. Артикулы берутся из кеша cards/wb_ids_cache.json
+     (собираются через браузер, обновлять раз в 1-2 недели)
+  2. По каждому артикулу запрашиваем card.wb.ru/cards/v2/detail
+     → этот эндпоинт не блокируется с VPS (нет PoW, нет 429)
+  3. Картинки — с CDN wbbasket.ru (тоже не блокируется)
 
-Подключение канала: добавить в cards/channel.json поле "channel_type": "marketplace"
-Можно уточнить категории полем "wb_categories": ["косметика", "украшения"]
+Чтобы обновить кеш артикулов: команда /wb_refresh в боте
+(бот откроет инструкцию по обновлению через Chrome)
 """
 
 import asyncio
+import json
 import random
+from pathlib import Path
 from loguru import logger
+
+import aiohttp
 
 from config import cfg
 
-try:
-    from curl_cffi.requests import AsyncSession as CurlSession
-    CURL_CFFI_AVAILABLE = True
-except ImportError:
-    CURL_CFFI_AVAILABLE = False
-
-try:
-    import aiohttp
-    AIOHTTP_AVAILABLE = True
-except ImportError:
-    AIOHTTP_AVAILABLE = False
-
-if not CURL_CFFI_AVAILABLE and not AIOHTTP_AVAILABLE:
-    logger.warning("Установите curl_cffi: pip install curl_cffi")
-
 
 # ============================================================
-# КАТЕГОРИИ ТОВАРОВ (без 18+ / адалт)
+# ПУТЬ К КЕШУ АРТИКУЛОВ
 # ============================================================
+CACHE_PATH = Path(__file__).parent / "cards" / "wb_ids_cache.json"
 
-WB_CATEGORIES = [
-    # Красота и здоровье
-    "косметика", "парфюм", "уход за лицом", "шампунь", "маска для волос",
-    # Украшения и аксессуары
-    "бижутерия", "серьги", "кольца", "браслеты", "часы женские",
-    # Дом и интерьер
-    "для дома", "подушка декоративная", "ваза", "свеча ароматическая", "органайзер",
-    # Кухня
-    "посуда", "термокружка", "форма для выпечки", "нож кухонный", "сковорода",
-    # Одежда и обувь (без интима)
-    "футболка", "худи", "кроссовки", "сумка женская", "рюкзак",
-    # Спорт
-    "фитнес", "коврик для йоги", "гантели", "бутылка для воды", "спортивная одежда",
-    # Автотовары
-    "автомобильный органайзер", "ароматизатор для авто", "автозарядка",
-    # Детские товары
-    "игрушки для детей", "развивающие игрушки", "конструктор", "пластилин",
-    # Книги и хобби
-    "книги", "пазлы", "настольные игры", "раскраски антистресс",
-    # Электроника (бытовая)
-    "наушники беспроводные", "power bank", "умная колонка", "led лента",
-    # Животные
-    "товары для кошек", "товары для собак", "аквариум",
-    # Текстиль
-    "постельное бельё", "полотенце", "плед",
-]
-
-# Сколько категорий выбирать в зависимости от количества постов
-def _categories_count(n: int) -> int:
-    if n <= 3:  return 2
-    if n <= 6:  return 3
-    if n <= 10: return 4
-    return 5
+# Маппинг ключевых слов категорий канала → ключи в кеше
+CATEGORY_MAP = {
+    "кроссовки": "кроссовки",
+    "обувь": "кроссовки",
+    "косметика": "косметика",
+    "красота": "косметика",
+    "уход": "косметика",
+    "наушники": "наушники беспроводные",
+    "электроника": "наушники беспроводные",
+    "сумка": "сумка женская",
+    "аксессуары": "сумка женская",
+    "кружка": "термокружка",
+    "посуда": "термокружка",
+    "кухня": "термокружка",
+    "платье": "платье женское",
+    "одежда": "платье женское",
+    "игры": "настольные игры",
+    "игрушки": "настольные игры",
+}
 
 
-# ============================================================
-# ОСНОВНОЙ КЛАСС
-# ============================================================
+def _load_cache() -> dict[str, list[int]]:
+    """Загружает кеш артикулов из JSON файла."""
+    if not CACHE_PATH.exists():
+        logger.warning(f"WB кеш не найден: {CACHE_PATH}")
+        return {}
+    try:
+        data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+        categories = data.get("categories", {})
+        total = sum(len(v) for v in categories.values())
+        logger.debug(f"WB кеш загружен: {len(categories)} категорий, {total} артикулов")
+        return categories
+    except Exception as e:
+        logger.error(f"WB кеш: ошибка чтения: {e}")
+        return {}
+
 
 class WBParser:
-    """Генерирует посты из случайных категорий Wildberries."""
+    """
+    Генерирует посты из товаров Wildberries.
+    Данные: кеш артикулов + card.wb.ru API (без 429).
+    """
 
-    SEARCH_URL = "https://search.wb.ru/exactmatch/ru/common/v7/search"
+    CARD_API = "https://card.wb.ru/cards/v2/detail"
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+        "Origin": "https://www.wildberries.ru",
+        "Referer": "https://www.wildberries.ru/",
+    }
 
-    # Несколько реальных UA для ротации — снижает шанс rate-limit
-    USER_AGENTS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    ]
+    def __init__(self):
+        self._cache: dict[str, list[int]] = {}
+        self._cache_loaded = False
 
-    @property
-    def HEADERS(self) -> dict:
-        """Заголовки со случайным User-Agent при каждом обращении."""
-        return {
-            "User-Agent": random.choice(self.USER_AGENTS),
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Origin": "https://www.wildberries.ru",
-            "Referer": "https://www.wildberries.ru/catalog/0/search.aspx",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "cross-site",
-            "Connection": "keep-alive",
-        }
+    def _ensure_cache(self):
+        """Ленивая загрузка кеша при первом обращении."""
+        if not self._cache_loaded:
+            self._cache = _load_cache()
+            self._cache_loaded = True
+
+    def _pick_articles(self, channel: dict, count: int) -> list[int]:
+        """
+        Выбирает нужное количество случайных артикулов из кеша.
+        Учитывает wb_categories канала, если заданы.
+        """
+        self._ensure_cache()
+        if not self._cache:
+            return []
+
+        # Определяем какие категории кеша подходят для канала
+        channel_cats = channel.get("wb_categories", [])
+        matching_cache_keys = set()
+
+        if channel_cats:
+            for cat in channel_cats:
+                cat_lower = cat.lower()
+                # Прямое совпадение с ключом кеша
+                if cat_lower in self._cache:
+                    matching_cache_keys.add(cat_lower)
+                    continue
+                # Поиск через маппинг
+                for keyword, cache_key in CATEGORY_MAP.items():
+                    if keyword in cat_lower:
+                        matching_cache_keys.add(cache_key)
+                        break
+
+        # Если ничего не нашли по теме — берём из всех категорий
+        if not matching_cache_keys:
+            matching_cache_keys = set(self._cache.keys())
+
+        # Собираем пул артикулов из подходящих категорий
+        pool: list[int] = []
+        for key in matching_cache_keys:
+            pool.extend(self._cache.get(key, []))
+
+        if not pool:
+            pool = [art for ids in self._cache.values() for art in ids]
+
+        # Перемешиваем и берём нужное количество (с запасом ×2 для фильтрации)
+        random.shuffle(pool)
+        return pool[:min(count * 2, len(pool))]
 
     async def generate_posts(self, channel: dict, count: int = 10) -> list[dict]:
         """
-        Главный метод. Генерирует count постов из разных категорий.
-        Использует curl_cffi (Chrome TLS fingerprint) если установлен,
-        иначе падает на aiohttp.
+        Главный метод. Генерирует count постов.
+        Использует кеш артикулов + card.wb.ru (без 429).
         """
-        if not CURL_CFFI_AVAILABLE and not AIOHTTP_AVAILABLE:
-            logger.error("WB-парсер: установите curl_cffi: pip install curl_cffi")
+        article_ids = self._pick_articles(channel, count)
+
+        if not article_ids:
+            logger.error("WB-парсер: кеш пустой. Обнови cards/wb_ids_cache.json")
             return []
-
-        categories = channel.get("wb_categories", WB_CATEGORIES)
-        n_cats = _categories_count(count)
-        selected_cats = random.sample(categories, min(len(categories), n_cats))
-        per_cat = max(1, (count + n_cats - 1) // n_cats)
-
-        proxy_url = cfg.WB_PROXY_URL or None
-        if proxy_url:
-            logger.debug(f"WB-парсер: прокси {proxy_url.split('@')[-1]}")
 
         logger.info(
             f"WB-парсер [{channel.get('channel_id', '?')}]: "
-            f"запрос {count} постов, движок={'curl_cffi' if CURL_CFFI_AVAILABLE else 'aiohttp'}"
+            f"запрос {count} постов из {len(article_ids)} артикулов"
         )
 
-        if CURL_CFFI_AVAILABLE:
-            posts = await self._generate_curl(selected_cats, per_cat, proxy_url)
-        else:
-            posts = await self._generate_aiohttp(selected_cats, per_cat, proxy_url)
-
+        posts = await self._fetch_posts(article_ids, count)
         random.shuffle(posts)
         final = posts[:count]
         logger.info(f"WB-парсер: собрано {len(final)} из {count} запрошенных")
         return final
 
-    async def _generate_curl(
-        self, selected_cats: list, per_cat: int, proxy_url: str | None
-    ) -> list[dict]:
-        """Генерация через curl_cffi — имитирует TLS fingerprint Chrome."""
-        proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else None
+    async def _fetch_posts(self, article_ids: list[int], need: int) -> list[dict]:
+        """
+        Запрашивает данные по артикулам через card.wb.ru.
+        Батчами по 20 штук — WB отдаёт до 20 за раз.
+        """
+        posts = []
+        batch_size = 20
 
-        async with CurlSession(impersonate="chrome124") as session:
-            # Прогреваем сессию — получаем cookies с главной страницы WB.
-            # При SOCKS5 warmup может упасть с TLS ошибкой — это не критично,
-            # search запросы всё равно пойдут (у них другой TLS handshake).
-            try:
-                warmup_proxies = proxies
-                # Для SOCKS5 — пробуем warmup без прокси (главная WB доступна без него)
-                if proxy_url and proxy_url.startswith("socks"):
-                    warmup_proxies = None
-                await session.get(
-                    "https://www.wildberries.ru/",
-                    proxies=warmup_proxies,
-                    timeout=10,
-                )
-                await asyncio.sleep(random.uniform(1.0, 2.0))
-                logger.debug("WB-парсер (curl): сессия прогрета")
-            except Exception as e:
-                logger.warning(f"WB-парсер (curl): warmup пропущен ({type(e).__name__}), продолжаем")
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(
+            headers=self.HEADERS,
+            connector=connector
+        ) as session:
+            for i in range(0, len(article_ids), batch_size):
+                if len(posts) >= need:
+                    break
 
-            posts = []
-            for cat in selected_cats:
-                try:
-                    cat_posts = await self._fetch_curl(cat, per_cat + 1, session, proxies)
-                    posts.extend(cat_posts)
-                except Exception as e:
-                    logger.error(f"WB-парсер (curl): ошибка '{cat}': {e}")
+                batch = article_ids[i:i + batch_size]
+                batch_posts = await self._fetch_batch(session, batch)
+                posts.extend(batch_posts)
+
+                if i + batch_size < len(article_ids):
+                    await asyncio.sleep(random.uniform(1.0, 2.0))
+
         return posts
 
-    async def _fetch_curl(
+    async def _fetch_batch(
         self,
-        category: str,
-        limit: int,
-        session: "CurlSession",
-        proxies: dict | None,
+        session: aiohttp.ClientSession,
+        article_ids: list[int],
     ) -> list[dict]:
-        """Запрос к WB search через curl_cffi с ретраем при 429."""
+        """Запрашивает данные по пачке артикулов через card.wb.ru."""
+        nm_param = ";".join(str(a) for a in article_ids)
         params = {
             "appType": "1",
             "curr": "rub",
             "dest": "-1257786",
-            "query": category,
-            "resultset": "catalog",
-            "sort": "popular",
-            "spp": "30",
-            "page": str(random.randint(1, 3)),
+            "nm": nm_param,
         }
-
-        await asyncio.sleep(random.uniform(2.0, 4.0))
-
-        for attempt in range(3):
-            try:
-                resp = await session.get(
-                    self.SEARCH_URL,
-                    params=params,
-                    proxies=proxies,
-                    timeout=15,
-                )
-                if resp.status_code == 429:
-                    # Читаем Retry-After если WB его отдаёт
-                    retry_after = int(resp.headers.get("Retry-After", 8 * (attempt + 1)))
-                    wait = max(retry_after, 8 * (attempt + 1))
-                    logger.warning(f"WB (curl) '{category}' → 429, жду {wait}с (попытка {attempt+1}/3)")
-                    await asyncio.sleep(wait)
-                    continue
-                if resp.status_code != 200:
-                    logger.warning(f"WB (curl) '{category}' → HTTP {resp.status_code}")
-                    return []
-
-                data = resp.json()
-                products = data.get("data", {}).get("products", [])
-                if not products:
-                    logger.warning(f"WB (curl) '{category}': нет результатов")
-                    return []
-
-                pool = random.sample(products, min(limit * 3, len(products)))
-                posts = []
-                for product in pool:
-                    if len(posts) >= limit:
-                        break
-                    post = self._format_post(product, category)
-                    if post:
-                        posts.append(post)
-
-                logger.debug(f"WB (curl) '{category}': {len(posts)} товаров")
-                return posts
-
-            except asyncio.TimeoutError:
-                logger.warning(f"WB (curl) '{category}': таймаут (попытка {attempt+1}/3)")
-                await asyncio.sleep(5)
-            except Exception as e:
-                logger.error(f"WB (curl) '{category}': {e}")
-                return []
-
-        logger.error(f"WB (curl) '{category}': все попытки исчерпаны")
-        return []
-
-    async def _generate_aiohttp(
-        self, selected_cats: list, per_cat: int, proxy_url: str | None
-    ) -> list[dict]:
-        """Fallback генерация через aiohttp (без Chrome TLS fingerprint)."""
-        http_proxy = None
-        if proxy_url:
-            if proxy_url.startswith("socks"):
-                try:
-                    from aiohttp_socks import ProxyConnector
-                    connector = ProxyConnector.from_url(proxy_url, ssl=False)
-                except ImportError:
-                    logger.error("pip install aiohttp-socks")
-                    connector = aiohttp.TCPConnector(ssl=False)
-            else:
-                connector = aiohttp.TCPConnector(ssl=False)
-                http_proxy = proxy_url
-        else:
-            connector = aiohttp.TCPConnector(ssl=False)
-
-        async with aiohttp.ClientSession(headers=self.HEADERS, connector=connector) as session:
-            try:
-                await session.get(
-                    "https://www.wildberries.ru/",
-                    proxy=http_proxy,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                )
-                await asyncio.sleep(random.uniform(1.0, 2.0))
-                logger.debug("WB-парсер (aiohttp): сессия прогрета")
-            except Exception as e:
-                logger.warning(f"WB-парсер (aiohttp): не удалось прогреть: {e}")
-
-            posts = []
-            for cat in selected_cats:
-                try:
-                    cat_posts = await self._fetch_category_posts(cat, per_cat + 1, session, http_proxy)
-                    posts.extend(cat_posts)
-                except Exception as e:
-                    logger.error(f"WB-парсер (aiohttp): ошибка '{cat}': {e}")
-        return posts
-
-    async def _fetch_category_posts(
-        self, category: str, limit: int, session: "aiohttp.ClientSession",
-        proxy: str | None = None,
-    ) -> list[dict]:
-        """Берёт товары по поисковому запросу WB. Ретрай при 429."""
-        params = {
-            "appType": "1",
-            "curr": "rub",
-            "dest": "-1257786",
-            "query": category,
-            "resultset": "catalog",
-            "sort": "popular",
-            "spp": "30",
-            "page": str(random.randint(1, 3)),
-        }
-
-        # Пауза между запросами к разным категориям
-        await asyncio.sleep(random.uniform(2.0, 4.0))
 
         for attempt in range(3):
             try:
                 async with session.get(
-                    self.SEARCH_URL, params=params,
-                    proxy=proxy,
-                    timeout=aiohttp.ClientTimeout(total=15)
+                    self.CARD_API,
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
                     if resp.status == 429:
-                        wait = 8 * (attempt + 1)  # 8с, 16с, 24с
-                        logger.warning(f"WB search '{category}' → 429, жду {wait}с (попытка {attempt+1}/3)")
+                        wait = 10 * (attempt + 1)
+                        logger.warning(f"WB card API 429, жду {wait}с")
                         await asyncio.sleep(wait)
                         continue
                     if resp.status != 200:
-                        logger.warning(f"WB search '{category}' → HTTP {resp.status}")
+                        logger.warning(f"WB card API → HTTP {resp.status}")
                         return []
+
                     data = await resp.json(content_type=None)
 
                 products = data.get("data", {}).get("products", [])
-                if not products:
-                    logger.warning(f"WB search '{category}': нет результатов")
-                    return []
-
-                pool = random.sample(products, min(limit * 3, len(products)))
                 posts = []
-                for product in pool:
-                    if len(posts) >= limit:
-                        break
-                    post = self._format_post(product, category)
+                for product in products:
+                    post = self._format_post(product)
                     if post:
                         posts.append(post)
 
-                logger.debug(f"WB search '{category}': найдено {len(posts)} товаров")
+                logger.debug(f"WB card API: батч {len(article_ids)} → {len(posts)} постов")
                 return posts
 
             except asyncio.TimeoutError:
-                logger.warning(f"WB search '{category}': таймаут (попытка {attempt+1}/3)")
-                await asyncio.sleep(5)
-                continue
+                logger.warning(f"WB card API: таймаут (попытка {attempt+1}/3)")
+                await asyncio.sleep(3)
             except Exception as e:
-                logger.error(f"WB search '{category}': {e}")
+                logger.error(f"WB card API: {e}")
                 return []
 
-        logger.error(f"WB search '{category}': все попытки исчерпаны")
         return []
 
-    def _format_post(self, product: dict, category: str) -> dict | None:
+    def _format_post(self, product: dict) -> dict | None:
         """Форматирует данные товара в пост для Telegram."""
         try:
             article = product.get("id")
@@ -358,8 +243,7 @@ class WBParser:
             rating = product.get("reviewRating", 0.0)
             feedbacks = product.get("feedbacks", 0)
 
-            # ---- Цена ----
-            # WB возвращает цену в копейках
+            # ---- Цена (в копейках) ----
             sizes = product.get("sizes", [])
             price = 0
             original_price = 0
@@ -373,13 +257,13 @@ class WBParser:
                     break
 
             if price == 0:
-                return None  # товар без цены — пропускаем
+                return None
 
             # ---- Скидка ----
             discount_line = ""
             if original_price > price and original_price > 0:
                 pct = round((1 - price / original_price) * 100)
-                if pct >= 15:  # показываем только значимые скидки
+                if pct >= 15:
                     discount_line = f"🔥 <b>Скидка {pct}%</b> (было {original_price:,} ₽)\n".replace(",", " ")
 
             # ---- Рейтинг ----
@@ -390,10 +274,7 @@ class WBParser:
                 rating_line = f"{stars} {rating:.1f} · {reviews_text} отзывов\n"
 
             # ---- Заголовок ----
-            if brand:
-                title = f"🛍 <b>{brand} — {name}</b>"
-            else:
-                title = f"🛍 <b>{name}</b>"
+            title = f"🛍 <b>{brand} — {name}</b>" if brand else f"🛍 <b>{name}</b>"
 
             # ---- Ссылка ----
             wb_link = f"https://www.wildberries.ru/catalog/{article}/detail.aspx"
@@ -408,27 +289,20 @@ class WBParser:
                 f'🔗 <a href="{wb_link}">Смотреть на Wildberries</a>'
             )
 
-            # ---- Картинка ----
-            image_url = self._get_image_url(int(article))
-
             return {
                 "content": text,
-                "image_url": image_url,
+                "image_url": self._get_image_url(int(article)),
                 "parse_mode": "HTML",
                 "source": "wb_parser",
                 "wb_article": str(article),
-                "wb_category": category,
             }
 
         except Exception as e:
-            logger.warning(f"WB format error: {e} | product: {product.get('id')}")
+            logger.warning(f"WB format error: {e} | id={product.get('id')}")
             return None
 
     def _get_image_url(self, article: int) -> str:
-        """
-        Строит URL первой картинки товара с WB CDN.
-        Формула: basket-{NN}.wbbasket.ru/vol{VOL}/part{PART}/{ARTICLE}/images/big/1.webp
-        """
+        """Строит URL картинки с WB CDN по артикулу."""
         vol = article // 100000
         part = article // 1000
         basket = self._get_basket(vol)
@@ -438,10 +312,7 @@ class WBParser:
         )
 
     def _get_basket(self, vol: int) -> int:
-        """
-        Определяет номер CDN-корзины по vol.
-        Таблица актуальна для WB RU (2024-2025).
-        """
+        """Номер CDN-корзины по vol (таблица актуальна 2024-2025)."""
         if   vol <=  143: return 1
         elif vol <=  287: return 2
         elif vol <=  431: return 3
@@ -464,34 +335,38 @@ class WBParser:
         else:             return 20
 
     async def fetch_single(self, article: int) -> dict | None:
-        """
-        Получает данные одного товара по артикулу.
-        Используется для команды /add_product.
-        """
-        if not AIOHTTP_AVAILABLE:
-            return None
+        """Получает данные одного товара по артикулу (для /add_product)."""
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(headers=self.HEADERS, connector=connector) as session:
+            posts = await self._fetch_batch(session, [article])
+            return posts[0] if posts else None
 
-        url = f"https://card.wb.ru/cards/v2/detail?nm={article}"
-        try:
-            async with aiohttp.ClientSession(headers=self.HEADERS) as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status != 200:
-                        return None
-                    data = await resp.json(content_type=None)
-
-            products = data.get("data", {}).get("products", [])
-            if not products:
-                return None
-
-            post = self._format_post(products[0], "manual")
-            return post
-
-        except Exception as e:
-            logger.error(f"WB fetch_single {article}: {e}")
-            return None
+    def reload_cache(self):
+        """Принудительно перечитывает кеш с диска (вызывается после обновления)."""
+        self._cache_loaded = False
+        self._ensure_cache()
+        return len(self._cache)
 
 
 # ============================================================
 # ЕДИНСТВЕННЫЙ ЭКЗЕМПЛЯР
 # ============================================================
 wb_parser = WBParser()
+
+
+# ============================================================
+# БЫСТРЫЙ ТЕСТ
+# ============================================================
+if __name__ == "__main__":
+    import asyncio
+
+    async def test():
+        channel = {"channel_id": "test", "wb_categories": ["кроссовки"]}
+        posts = await wb_parser.generate_posts(channel, count=3)
+        print(f"\nПолучено постов: {len(posts)}")
+        for i, p in enumerate(posts, 1):
+            print(f"\n--- Пост {i} ---")
+            print(p["content"][:200])
+            print(f"Картинка: {p['image_url']}")
+
+    asyncio.run(test())
