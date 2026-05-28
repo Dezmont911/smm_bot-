@@ -22,8 +22,13 @@ bot.py — Главный файл: Telegram бот администратора
 
 import asyncio
 import json
+import warnings
 from pathlib import Path
 from datetime import datetime, timezone
+
+# Заглушаем информационное предупреждение PTB про per_message=False
+# (не влияет на работу — наши ConversationHandler-ы работают корректно)
+warnings.filterwarnings("ignore", message=".*per_message=False.*")
 
 from telegram import (
     Update,
