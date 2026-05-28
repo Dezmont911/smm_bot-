@@ -1450,7 +1450,7 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
       /schedule @channel off           — только РСЯ (без таймера)
       /schedule @channel on            — вернуть расписание
     """
-    if not is_admin(update):
+    if not is_admin(update.effective_user.id):
         return
 
     args = context.args or []
