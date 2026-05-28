@@ -1053,21 +1053,47 @@ async def handle_gen_channel(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def cmd_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запускает генерацию контента в фоне — бот не зависает."""
+    """Запускает генерацию контента в фоне.
+
+    Использование:
+      /generate          — генерация для всех каналов
+      /generate @channel — генерация только для одного канала
+    """
     if not is_admin(update.effective_user.id):
         return
 
-    await update.message.reply_text(
-        "⏳ <b>Генерация запущена в фоне</b>\n\n"
-        "Это займёт 1–2 минуты (зависит от числа каналов).\n"
-        "Пришлю сообщение когда готово — можешь пока делать другие дела.",
-        parse_mode=ParseMode.HTML,
-    )
+    args = context.args or []
+    channel_id = None
 
-    # Запускаем в фоне — не блокируем бота
-    # force=True: генерируем поверх существующего буфера (ручной запуск)
+    if args:
+        # Нормализуем handle
+        raw = args[0]
+        channel_id = raw if raw.startswith("@") else f"@{raw}"
+
+        # Проверяем что канал существует
+        channels = load_all_channels()
+        if not any(c["channel_id"] == channel_id for c in channels):
+            await update.message.reply_text(
+                f"❌ Канал <code>{channel_id}</code> не найден.\n"
+                f"Используй /list чтобы увидеть все каналы.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        await update.message.reply_text(
+            f"⏳ <b>Генерация для {channel_id} запущена в фоне</b>\n\n"
+            "Пришлю результат когда готово.",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text(
+            "⏳ <b>Генерация для всех каналов запущена в фоне</b>\n\n"
+            "Это займёт 1–2 минуты. Пришлю сообщение когда готово.",
+            parse_mode=ParseMode.HTML,
+        )
+
     asyncio.create_task(
-        _run_generation_background(context.bot, update.effective_chat.id, force=True)
+        _run_generation_background(context.bot, update.effective_chat.id, force=True, channel_id=channel_id)
     )
 
 

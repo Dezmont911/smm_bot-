@@ -99,15 +99,14 @@ class WBParser:
             f"запрос {count} постов из {n_cats} категорий: {selected_cats}"
         )
 
-        tasks = [self._fetch_category_posts(cat, per_cat + 1) for cat in selected_cats]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
+        # Запрашиваем категории последовательно — WB блокирует параллельные запросы
         posts = []
-        for cat, result in zip(selected_cats, results):
-            if isinstance(result, Exception):
-                logger.error(f"WB-парсер: ошибка для категории '{cat}': {result}")
-                continue
-            posts.extend(result)
+        for cat in selected_cats:
+            try:
+                cat_posts = await self._fetch_category_posts(cat, per_cat + 1)
+                posts.extend(cat_posts)
+            except Exception as e:
+                logger.error(f"WB-парсер: ошибка для категории '{cat}': {e}")
 
         # Перемешиваем и обрезаем до нужного количества
         random.shuffle(posts)
@@ -117,7 +116,7 @@ class WBParser:
         return final
 
     async def _fetch_category_posts(self, category: str, limit: int) -> list[dict]:
-        """Берёт товары по поисковому запросу WB."""
+        """Берёт товары по поисковому запросу WB. Ретрай при 429."""
         params = {
             "appType": "1",
             "curr": "rub",
@@ -126,43 +125,54 @@ class WBParser:
             "resultset": "catalog",
             "sort": "popular",
             "spp": "30",
-            "page": str(random.randint(1, 3)),  # рандомная страница для разнообразия
+            "page": str(random.randint(1, 3)),
         }
 
-        try:
-            async with aiohttp.ClientSession(headers=self.HEADERS) as session:
-                async with session.get(
-                    self.SEARCH_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
-                    if resp.status != 200:
-                        logger.warning(f"WB search '{category}' → HTTP {resp.status}")
-                        return []
-                    data = await resp.json(content_type=None)
+        # Пауза перед запросом — WB агрессивно режет без задержки
+        await asyncio.sleep(random.uniform(1.5, 3.0))
 
-            products = data.get("data", {}).get("products", [])
-            if not products:
-                logger.warning(f"WB search '{category}': нет результатов")
+        for attempt in range(3):  # до 3 попыток
+            try:
+                async with aiohttp.ClientSession(headers=self.HEADERS) as session:
+                    async with session.get(
+                        self.SEARCH_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)
+                    ) as resp:
+                        if resp.status == 429:
+                            wait = 5 * (attempt + 1)  # 5с, 10с, 15с
+                            logger.warning(f"WB search '{category}' → 429, жду {wait}с (попытка {attempt+1}/3)")
+                            await asyncio.sleep(wait)
+                            continue
+                        if resp.status != 200:
+                            logger.warning(f"WB search '{category}' → HTTP {resp.status}")
+                            return []
+                        data = await resp.json(content_type=None)
+
+                products = data.get("data", {}).get("products", [])
+                if not products:
+                    logger.warning(f"WB search '{category}': нет результатов")
+                    return []
+
+                pool = random.sample(products, min(limit * 3, len(products)))
+                posts = []
+                for product in pool:
+                    if len(posts) >= limit:
+                        break
+                    post = self._format_post(product, category)
+                    if post:
+                        posts.append(post)
+
+                return posts
+
+            except asyncio.TimeoutError:
+                logger.warning(f"WB search '{category}': таймаут (попытка {attempt+1}/3)")
+                await asyncio.sleep(3)
+                continue
+            except Exception as e:
+                logger.error(f"WB search '{category}': {e}")
                 return []
 
-            # Случайная выборка товаров из результатов
-            pool = random.sample(products, min(limit * 3, len(products)))
-
-            posts = []
-            for product in pool:
-                if len(posts) >= limit:
-                    break
-                post = self._format_post(product, category)
-                if post:
-                    posts.append(post)
-
-            return posts
-
-        except asyncio.TimeoutError:
-            logger.warning(f"WB search '{category}': таймаут")
-            return []
-        except Exception as e:
-            logger.error(f"WB search '{category}': {e}")
-            return []
+        logger.error(f"WB search '{category}': все попытки исчерпаны")
+        return []
 
     def _format_post(self, product: dict, category: str) -> dict | None:
         """Форматирует данные товара в пост для Telegram."""
