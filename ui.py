@@ -38,6 +38,8 @@ from loguru import logger
 
 from buffer_manager import buffer
 from config import cfg
+from content_generator import generator
+from poster import poster
 
 
 # ── Постоянная ReplyKeyboard с кнопкой «Меню» ─────────────────────────────
@@ -147,12 +149,11 @@ async def screen_main(qm, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Добавить канал", callback_data="add_start")],
         [
-            InlineKeyboardButton("📋 Мои каналы",  callback_data="ui:channels"),
-            InlineKeyboardButton("📊 Статус",      callback_data="ui:status"),
+            InlineKeyboardButton("📋 Мои каналы", callback_data="ui:channels"),
+            InlineKeyboardButton("📊 Статус",     callback_data="ui:status"),
         ],
         [
-            InlineKeyboardButton("⚡ Генерация",   callback_data="ui:generate_all"),
-            InlineKeyboardButton("📝 Очередь",     callback_data="ui:queue"),
+            InlineKeyboardButton("📝 Очередь постов", callback_data="ui:queue"),
         ],
     ])
     await _answer_or_send(qm, text, kb)
@@ -433,7 +434,8 @@ async def action_generate(qm, context, handle: str):
             pass
 
     try:
-        result = await generator.run_emergency(handle)
+        from content_generator import generator as _gen
+        result = await _gen.run_emergency(handle)
         generated = result.get("generated", 0)
         text = (
             f"✅ Генерация завершена для <b>{handle}</b>\n"
@@ -458,7 +460,8 @@ async def action_postnow(qm, context, handle: str):
         await qm.answer("📤 Публикую...")
 
     try:
-        result = await poster.post_now(handle)
+        from poster import poster as _poster
+        result = await _poster.post_now(handle)
         if result["success"]:
             text = f"✅ Пост опубликован в <b>{handle}</b>!"
         else:
