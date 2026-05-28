@@ -30,7 +30,6 @@ from pathlib import Path
 
 from loguru import logger
 
-from ai_client import claude_client
 from config import cfg
 
 
