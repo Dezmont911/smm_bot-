@@ -55,6 +55,12 @@ from database import db
 from buffer_manager import buffer
 from content_generator import generator
 from poster import poster
+from ui import (
+    ui_router,
+    screen_main,
+    handle_settings_text_input,
+    MENU_KEYBOARD,
+)
 
 
 # ============================================================
@@ -192,24 +198,17 @@ def deactivate_channel(channel_id: str):
 # ============================================================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Приветствие при первом запуске."""
+    """Открывает главное меню и показывает постоянную кнопку Меню."""
     if not is_admin(update.effective_user.id):
         return
 
+    # Сначала отправляем ReplyKeyboard — она «прилипнет» внизу навсегда
     await update.message.reply_text(
-        "👋 <b>Content Factory Bot</b>\n\n"
-        "Я управляю автопостингом в твоих Telegram-каналах.\n\n"
-        "<b>Управление каналами:</b>\n"
-        "/list — список всех каналов\n"
-        "/add — добавить канал\n\n"
-        "<b>Контент:</b>\n"
-        "/status — состояние буферов\n"
-        "/generate — запустить генерацию\n"
-        "/review — посмотреть посты в очереди\n"
-        "/preview — превью поста\n"
-        "/post_now — опубликовать сейчас\n",
-        parse_mode=ParseMode.HTML,
+        "☰",
+        reply_markup=MENU_KEYBOARD,
     )
+    # Затем показываем главное меню как inline
+    await screen_main(update.message, context)
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1878,8 +1877,23 @@ async def handle_image_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Получает картинку от администратора — фото из чата или URL.
     Вызывается когда в user_data установлен 'awaiting_image_for'.
+
+    Сначала проверяет не находится ли пользователь в режиме
+    редактирования настроек канала (ui.py editing).
     """
     if not is_admin(update.effective_user.id):
+        return
+
+    # Сначала пробуем обработать как ввод настроек (ui.py)
+    if context.user_data.get("editing"):
+        handled = await handle_settings_text_input(update, context)
+        if handled:
+            return
+
+    # Проверка «Меню» — отдельный handler, но на всякий случай
+    text_msg = update.message.text or ""
+    if text_msg.strip() in ("☰ Меню", "☰Меню", "Меню"):
+        await screen_main(update.message, context)
         return
 
     post_id = context.user_data.get("awaiting_image_for")
@@ -2385,6 +2399,16 @@ def main():
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
     app.add_handler(edit_conversation)
+
+    # --- UI: главный роутер inline-меню (все callback начинающиеся с "ui:") ---
+    app.add_handler(CallbackQueryHandler(ui_router, pattern="^ui:"))
+
+    # --- UI: кнопка «Меню» и «add_start» (запуск /add из меню) ---
+    app.add_handler(MessageHandler(
+        filters.TEXT & filters.Regex(r"^☰\s*[Мм]еню?$") & filters.ChatType.PRIVATE,
+        lambda u, c: screen_main(u.message, c),
+    ))
+    app.add_handler(CallbackQueryHandler(cmd_add_start, pattern="^add_start$"))
 
     # --- Команды ---
     app.add_handler(CommandHandler("start", cmd_start))
