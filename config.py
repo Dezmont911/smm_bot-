@@ -114,6 +114,17 @@ class Config:
         default_factory=lambda: int(_optional("MONITOR_INTERVAL", "180"))
     )
 
+    # --- WB Seller API ---
+    # Ключ из seller.wildberries.ru → Настройки → Интеграции по API → Создать токен
+    # Нужные права: ✅ Контент, ✅ Цены и скидки
+    WB_API_KEY: str = field(
+        default_factory=lambda: _optional("WB_API_KEY", "")
+    )
+    # Режим WB парсера: "seller" (свои товары) | "search" (поиск по категориям) | "auto"
+    WB_API_MODE: str = field(
+        default_factory=lambda: _optional("WB_API_MODE", "auto")
+    )
+
     # --- Режим отладки ---
     DEBUG: bool = field(
         default_factory=lambda: _optional("DEBUG", "True").lower() == "true"

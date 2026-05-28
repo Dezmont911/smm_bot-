@@ -111,6 +111,7 @@ class ContentGenerator:
         if channel.get("channel_type") == "marketplace":
             return await self._run_marketplace(channel, target_count)
 
+
         # Получаем темы из источников
         topics, sources_used = await self._collect_topics(channel, target_count)
 
@@ -284,16 +285,26 @@ class ContentGenerator:
     async def _run_marketplace(self, channel: dict, target_count: int) -> dict:
         """
         Генерирует посты для маркетплейс-каналов (WB/Ozon).
-        Вместо Claude → wb_parser: берём товары из публичного API WB.
+        Использует wb_partner_parser (Seller API) если задан WB_API_KEY,
+        иначе публичный wb_parser (может блокироваться с VPS).
         """
-        from wb_parser import wb_parser
+        # Выбираем парсер в зависимости от наличия API-ключа
+        if cfg.WB_API_KEY:
+            from wb_partner_parser import wb_partner_parser as _parser
+            parser_name = "wb_partner"
+        else:
+            from wb_parser import wb_parser as _parser
+            parser_name = "wb_parser"
 
         channel_id = channel["channel_id"]
 
-        logger.info(f"WB-pipeline [{channel_id}]: запрос {target_count} постов")
+        logger.info(
+            f"WB-pipeline [{channel_id}]: запрос {target_count} постов "
+            f"(парсер: {parser_name})"
+        )
 
         try:
-            posts = await wb_parser.generate_posts(channel, count=target_count)
+            posts = await _parser.generate_posts(channel, count=target_count)
         except Exception as e:
             logger.error(f"WB-pipeline [{channel_id}]: ошибка парсера: {e}")
             return {
@@ -311,7 +322,7 @@ class ContentGenerator:
                 "generated": 0,
                 "skipped": 0,
                 "buffer_level": buffer.get_level(channel_id),
-                "sources_used": ["wb_parser"],
+                "sources_used": [parser_name],
             }
 
         generated = 0
@@ -356,7 +367,7 @@ class ContentGenerator:
             "generated": generated,
             "skipped": skipped,
             "buffer_level": new_level,
-            "sources_used": ["wb_parser"],
+            "sources_used": [parser_name],
         }
 
     def _wb_article_in_buffer(self, channel_id: str, article: str) -> bool:
