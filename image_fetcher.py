@@ -151,15 +151,39 @@ async def _build_english_query(topic: str, channel_topic: str = "") -> str:
     is_english = latin_ratio > 0.6
 
     # Для игровых каналов — не пытаемся угадать скриншот по теме поста,
-    # а ищем красивую геймерскую картинку. Pexels не знает Minecraft.
-    GAMING_CONTEXTS = {"minecraft", "gaming", "gaming pc"}
-    if channel_context in GAMING_CONTEXTS:
-        queries = {
-            "minecraft": "minecraft game blocks landscape",
-            "gaming pc": "gaming setup pc rgb",
-            "gaming":    "video game controller gamer",
-        }
-        return queries.get(channel_context, "gaming setup")
+    # Pexels не знает Minecraft. Берём случайный вариант из списка чтобы
+    # не было одной картинки на все посты.
+    import random
+    GAMING_QUERIES = {
+        "minecraft": [
+            "minecraft blocks landscape",
+            "gaming adventure exploration",
+            "video game building",
+            "game world fantasy",
+            "pixel game art",
+            "gaming controller joystick",
+            "gamer setup desk",
+            "multiplayer game fun",
+        ],
+        "gaming pc": [
+            "gaming setup rgb",
+            "gaming pc desk",
+            "esports gamer",
+            "gaming monitor keyboard",
+            "streamer setup",
+            "gaming chair rgb",
+        ],
+        "gaming": [
+            "video game controller",
+            "gamer playing console",
+            "gaming headset",
+            "esports competition",
+            "gaming joystick hands",
+            "retro game console",
+        ],
+    }
+    if channel_context in GAMING_QUERIES:
+        return random.choice(GAMING_QUERIES[channel_context])
 
     if is_english:
         # Заголовок на английском — просим Claude извлечь визуальные ключевые слова.
