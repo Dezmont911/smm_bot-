@@ -66,6 +66,8 @@ WAITING_EDITED_TEXT = 1
 ADD_HANDLE, ADD_NAME, ADD_TOPIC, ADD_TONE, ADD_FORBIDDEN, ADD_RSS_CONFIRM, ADD_POSTS_COUNT = range(10, 17)
 # Новые состояния: выбор метода + экспорт-флоу + channel_type
 ADD_CHOOSE_METHOD, ADD_WAITING_EXPORT, ADD_EXPORT_HANDLE, ADD_EXPORT_CONFIRM, ADD_CHANNEL_TYPE = range(17, 22)
+# Шаги настройки картинок и WB-категорий
+ADD_IMAGE_SOURCE, ADD_REDDIT_SUBS, ADD_WB_CATEGORIES = range(22, 25)
 
 
 # ============================================================
@@ -413,10 +415,103 @@ async def cmd_add_rss_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return ADD_RSS_CONFIRM  # остаёмся на том же шаге
 
-    # Спрашиваем сколько постов генерировать в день
+    # Спрашиваем источник картинок для постов
     await update.message.reply_text(
         "✅ RSS-источники сохранены.\n\n"
-        "Сколько постов генерировать в день для этого канала?",
+        "📸 <b>Картинки к постам</b>\n\n"
+        "Откуда брать изображения для постов?\n\n"
+        "• <b>Reddit</b> — тематические скриншоты из сабреддитов (лучше для игр, аниме, хобби)\n"
+        "• <b>Pexels/Unsplash</b> — стоковые фото по ключевым словам (хорошо для бизнеса, лайфстайл)\n"
+        "• <b>Без картинок</b> — только текст",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🎮 Reddit", callback_data="imgsource:reddit"),
+            InlineKeyboardButton("📸 Pexels/Unsplash", callback_data="imgsource:stock"),
+            InlineKeyboardButton("🚫 Без картинок", callback_data="imgsource:none"),
+        ]]),
+    )
+    return ADD_IMAGE_SOURCE
+
+
+async def handle_add_image_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает выбор источника картинок (reddit / stock / none)."""
+    query = update.callback_query
+    await query.answer()
+
+    source = query.data.split(":")[1]  # "reddit", "stock", "none"
+    ch = context.user_data["new_channel"]
+
+    if source == "none":
+        ch["use_images"] = False
+        await query.edit_message_text(
+            "🚫 Картинки отключены — посты будут только текстовые.\n\n"
+            "Сколько постов генерировать в день?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("4 поста", callback_data="postscount:4"),
+                InlineKeyboardButton("10 постов", callback_data="postscount:10"),
+                InlineKeyboardButton("20 постов", callback_data="postscount:20"),
+            ]]),
+        )
+        return ADD_POSTS_COUNT
+
+    elif source == "stock":
+        ch["use_images"] = True
+        ch["image_source"] = "stock"
+        # Ключевые слова — из темы канала
+        ch["image_keywords"] = [t.strip() for t in ch.get("topic", "").split(",")][:3]
+        await query.edit_message_text(
+            f"📸 Pexels/Unsplash выбран.\n"
+            f"Ключевые слова для поиска: <b>{', '.join(ch['image_keywords'])}</b>\n"
+            f"(можно поменять позже через карточку канала)\n\n"
+            f"Сколько постов генерировать в день?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("4 поста", callback_data="postscount:4"),
+                InlineKeyboardButton("10 постов", callback_data="postscount:10"),
+                InlineKeyboardButton("20 постов", callback_data="postscount:20"),
+            ]]),
+        )
+        return ADD_POSTS_COUNT
+
+    else:  # reddit
+        ch["use_images"] = True
+        ch["image_source"] = "reddit"
+        await query.edit_message_text(
+            "🎮 <b>Reddit-картинки</b>\n\n"
+            "Напиши сабреддиты через запятую (только название без r/).\n\n"
+            "<b>Примеры:</b>\n"
+            "• Майнкрафт: <code>Minecraft, MCPE, feedthebeast</code>\n"
+            "• КС2: <code>GlobalOffensive, csgo</code>\n"
+            "• Аниме: <code>anime, Animemes, manga</code>\n"
+            "• Общее: <code>gaming, pcgaming</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return ADD_REDDIT_SUBS
+
+
+async def handle_add_reddit_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получает список сабреддитов и переходит к выбору кол-ва постов."""
+    text = update.message.text.strip()
+    ch = context.user_data["new_channel"]
+
+    # Парсим: "Minecraft, MCPE, feedthebeast" → ["Minecraft", "MCPE", "feedthebeast"]
+    subs = [s.strip().lstrip("r/") for s in text.replace("\n", ",").split(",") if s.strip()]
+
+    if not subs:
+        await update.message.reply_text(
+            "⚠️ Не понял. Напиши названия сабреддитов через запятую.\n"
+            "Например: <code>Minecraft, MCPE</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return ADD_REDDIT_SUBS
+
+    ch["reddit_image_subreddits"] = subs
+
+    subs_str = ", ".join(f"r/{s}" for s in subs)
+    await update.message.reply_text(
+        f"✅ Сабреддиты сохранены: <b>{subs_str}</b>\n\n"
+        f"Сколько постов генерировать в день?",
+        parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("4 поста", callback_data="postscount:4"),
             InlineKeyboardButton("10 постов", callback_data="postscount:10"),
@@ -438,24 +533,33 @@ async def cmd_add_posts_count(update: Update, context: ContextTypes.DEFAULT_TYPE
     channel_type = ch.get("channel_type", "content")
 
     # Финальная сборка карточки
+    # Примечание: use_images, image_keywords, reddit_image_subreddits, wb_categories
+    # уже могут быть заполнены предыдущими шагами — не перезаписываем их
     base_defaults = {
         "audience": "широкая аудитория",
         "post_length": "100–200 слов",
         "use_emoji": True,
         "active": True,
         "example_posts": [],
-        "use_images": False,
     }
 
     if channel_type == "marketplace":
         base_defaults["post_formats"] = ["wb_product"]
-        base_defaults["image_keywords"] = []
         base_defaults.setdefault("tone", "продающий, дружелюбный")
+        # use_images для WB не нужен
+        base_defaults["use_images"] = False
     else:
         base_defaults["post_formats"] = ["совет дня", "факт/статистика", "вопрос аудитории", "мини-разбор", "инфоповод"]
-        base_defaults["image_keywords"] = [t.strip() for t in ch.get("topic", "").split(",")][:3]
+        # use_images и image_keywords уже выставлены на шаге ADD_IMAGE_SOURCE
+        # Но добавим fallback на случай если шаг был пропущен
+        if "use_images" not in ch:
+            base_defaults["use_images"] = False
+        if "image_keywords" not in ch:
+            base_defaults["image_keywords"] = [t.strip() for t in ch.get("topic", "").split(",")][:3]
 
-    ch.update(base_defaults)
+    # update() не перезапишет уже установленные ключи в ch — используем reversed merge
+    for k, v in base_defaults.items():
+        ch.setdefault(k, v)
 
     save_channel_card(ch)
 
@@ -765,21 +869,21 @@ async def handle_add_channel_type(update: Update, context: ContextTypes.DEFAULT_
     context.user_data["new_channel"]["channel_type"] = ch_type
 
     if ch_type == "marketplace":
-        # Для маркетплейса RSS/тон не нужны — сразу спрашиваем кол-во постов
+        # Для маркетплейса RSS/тон не нужны — сразу спрашиваем категории
         context.user_data["new_channel"]["tone"] = "продающий, дружелюбный"
         await query.edit_message_text(
             "🛍 <b>Маркетплейс-канал</b>\n\n"
-            "Бот будет автоматически находить товары из разных категорий WB "
-            "и публиковать карточки с ценами и ссылками.\n\n"
-            "Сколько постов генерировать в день?",
+            "Бот будет находить товары WB и публиковать карточки с ценами.\n\n"
+            "📦 <b>Категории товаров</b> (необязательно)\n\n"
+            "Напиши категории через запятую — бот будет искать товары именно в них.\n"
+            "Например: <code>кроссовки, наушники, косметика</code>\n\n"
+            "Или нажми <b>Все категории</b> — парсер сам подберёт из кеша.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("4 поста",  callback_data="postscount:4"),
-                InlineKeyboardButton("10 постов", callback_data="postscount:10"),
-                InlineKeyboardButton("20 постов", callback_data="postscount:20"),
+                InlineKeyboardButton("📦 Все категории", callback_data="wbcats:all"),
             ]]),
         )
-        return ADD_POSTS_COUNT
+        return ADD_WB_CATEGORIES
 
     else:
         # Контент — продолжаем обычный флоу
@@ -790,6 +894,61 @@ async def handle_add_channel_type(update: Update, context: ContextTypes.DEFAULT_
             parse_mode=ParseMode.HTML,
         )
         return ADD_TONE
+
+
+async def handle_add_wb_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Шаг WB-канала: получает категории товаров (текстом или кнопкой 'Все').
+    Затем спрашивает кол-во постов в день.
+    """
+    ch = context.user_data["new_channel"]
+
+    # Кнопка "Все категории"
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        # Категории не задаём — парсер возьмёт из общего кеша
+        ch.pop("wb_categories", None)
+        msg_obj = query.message
+        await query.edit_message_text(
+            "✅ Будут использоваться все доступные категории из кеша.\n\n"
+            "Сколько постов генерировать в день?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("4 поста",  callback_data="postscount:4"),
+                InlineKeyboardButton("8 постов",  callback_data="postscount:8"),
+                InlineKeyboardButton("20 постов", callback_data="postscount:20"),
+            ]]),
+        )
+    else:
+        # Пришёл текст с категориями
+        text = update.message.text.strip()
+        cats = [c.strip() for c in text.replace("\n", ",").split(",") if c.strip()]
+        if not cats:
+            await update.message.reply_text(
+                "⚠️ Не понял. Напиши категории через запятую, например:\n"
+                "<code>кроссовки, наушники, косметика</code>\n\n"
+                "Или нажми кнопку ниже:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📦 Все категории", callback_data="wbcats:all"),
+                ]]),
+            )
+            return ADD_WB_CATEGORIES
+
+        ch["wb_categories"] = cats
+        cats_str = ", ".join(cats)
+        await update.message.reply_text(
+            f"✅ Категории: <b>{cats_str}</b>\n\n"
+            f"Сколько постов генерировать в день?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("4 поста",  callback_data="postscount:4"),
+                InlineKeyboardButton("8 постов",  callback_data="postscount:8"),
+                InlineKeyboardButton("20 постов", callback_data="postscount:20"),
+            ]]),
+        )
+
+    return ADD_POSTS_COUNT
 
 
 async def handle_channel_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2199,6 +2358,14 @@ def main():
             ADD_TONE:           [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_add_tone)],
             ADD_FORBIDDEN:      [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_add_forbidden)],
             ADD_RSS_CONFIRM:    [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_add_rss_confirm)],
+            # Шаги выбора картинок (контент-каналы)
+            ADD_IMAGE_SOURCE:   [CallbackQueryHandler(handle_add_image_source, pattern="^imgsource:")],
+            ADD_REDDIT_SUBS:    [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_reddit_subs)],
+            # Шаг категорий WB (маркетплейс)
+            ADD_WB_CATEGORIES:  [
+                CallbackQueryHandler(handle_add_wb_categories, pattern="^wbcats:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_wb_categories),
+            ],
             ADD_POSTS_COUNT:    [CallbackQueryHandler(cmd_add_posts_count, pattern="^postscount:")],
         },
         per_message=False,
