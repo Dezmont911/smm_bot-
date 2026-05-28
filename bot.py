@@ -1347,15 +1347,18 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Проверяем что у нас есть посты для этого канала
     ready_count = buffer.get_ready_count(channel_id)
     if ready_count == 0:
-        logger.warning(f"Реклама в {channel_id}, но буфер пуст — нет поста для перекрытия!")
+        logger.warning(f"Реклама в {channel_id}, но буфер пуст — запускаю экстренную генерацию!")
         await context.bot.send_message(
             chat_id=cfg.ADMIN_CHAT_ID,
             text=(
                 f"📢 <b>Реклама РСЯ в {channel_id}</b>\n"
-                f"⚠️ Буфер пуст — нечем перекрыть!\n"
-                f"Запусти /generate срочно."
+                f"⚠️ Буфер пуст — запускаю генерацию и публикую автоматически..."
             ),
             parse_mode=ParseMode.HTML,
+        )
+        # Генерируем пост и сразу публикуем — не ждём пользователя
+        asyncio.create_task(
+            _generate_and_post_after_ad(context.bot, channel_id)
         )
         return
 
@@ -1370,6 +1373,79 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     asyncio.create_task(
         _post_after_ad(context.bot, channel_id, delay_seconds)
     )
+
+
+async def _generate_and_post_after_ad(bot, channel_id: str):
+    """
+    Когда реклама РСЯ пришла а буфер пуст:
+    1. Генерируем 1 пост через Claude
+    2. Сразу публикуем его
+    3. Отправляем отчёт администратору
+    """
+    try:
+        # Генерируем 1 пост для канала
+        from content_generator import generator
+        channels = load_all_channels()
+        channel = next((c for c in channels if c["channel_id"] == channel_id), None)
+        if not channel:
+            await bot.send_message(
+                chat_id=cfg.ADMIN_CHAT_ID,
+                text=f"❌ Канал {channel_id} не найден в карточках — не могу сгенерировать пост.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        result = await generator.run_for_channel(channel, target_count=1, force=True)
+        generated = result.get("generated", 0)
+
+        if generated == 0:
+            reason = result.get("reason", "нет тем")
+            logger.error(f"Экстренная генерация для {channel_id} не дала постов: {reason}")
+            await bot.send_message(
+                chat_id=cfg.ADMIN_CHAT_ID,
+                text=(
+                    f"❌ <b>Не смог перекрыть рекламу в {channel_id}</b>\n"
+                    f"Генерация не дала постов: {reason}\n"
+                    f"Запусти /generate {channel_id} вручную."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        # Пост сгенерирован — публикуем сразу
+        pub_result = await poster.post_now(channel_id)
+        if pub_result["success"]:
+            post = pub_result["post"]
+            logger.success(f"✅ Экстренный пост опубликован в {channel_id} после рекламы РСЯ")
+            await bot.send_message(
+                chat_id=cfg.ADMIN_CHAT_ID,
+                text=(
+                    f"✅ <b>Реклама РСЯ перекрыта!</b>\n"
+                    f"Канал: {channel_id}\n"
+                    f"Формат: {post.get('format', '?')}\n"
+                    f"Буфер был пуст — сгенерировал и опубликовал автоматически.\n\n"
+                    f"💡 Рекомендую запустить /generate чтобы пополнить буфер."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await bot.send_message(
+                chat_id=cfg.ADMIN_CHAT_ID,
+                text=(
+                    f"⚠️ <b>Пост сгенерирован, но не опубликован в {channel_id}</b>\n"
+                    f"Причина: {pub_result['error']}\n"
+                    f"Пост сохранён в буфере — попробуй /post_now {channel_id}"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+
+    except Exception as e:
+        logger.error(f"Ошибка экстренной генерации+публикации [{channel_id}]: {e}")
+        await bot.send_message(
+            chat_id=cfg.ADMIN_CHAT_ID,
+            text=f"❌ Ошибка при экстренной генерации для {channel_id}: {e}",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 async def _post_after_ad(bot, channel_id: str, delay_seconds: int):
