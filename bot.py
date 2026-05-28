@@ -1170,9 +1170,12 @@ async def _send_review_page(message, channel_id: str, offset: int):
 
     if total == 0:
         await message.reply_text(
-            f"📭 Очередь <b>{channel_id}</b> пуста.\n\n"
-            f"Запусти /generate {channel_id} чтобы создать посты.",
+            f"📭 Очередь <b>{channel_id}</b> пуста.",
             parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚡ Сгенерировать посты", callback_data=f"ui:ch_generate:{channel_id}")],
+                [InlineKeyboardButton("◀️ К каналу",           callback_data=f"ui:ch:{channel_id}")],
+            ]),
         )
         return
 
@@ -1228,14 +1231,21 @@ async def _send_review_page(message, channel_id: str, offset: int):
             InlineKeyboardButton(next_label, callback_data=f"review_page:{channel_id}:{shown_end}")
         )
 
+    # Навигационная строка: пагинация + кнопка «Назад к каналу»
+    back_btn = InlineKeyboardButton("◀️ К каналу", callback_data=f"ui:ch:{channel_id}")
+
     if nav_buttons:
         await message.reply_text(
             f"👆 {offset + 1}–{shown_end} из {total}",
-            reply_markup=InlineKeyboardMarkup([nav_buttons]),
+            reply_markup=InlineKeyboardMarkup([nav_buttons, [back_btn]]),
         )
-    elif total > PAGE:
-        # Последняя страница — без кнопок
-        await message.reply_text(f"✅ Все посты показаны ({total} шт.)")
+    else:
+        # Последняя (или единственная) страница
+        label = f"✅ Все посты показаны ({total} шт.)" if total > PAGE else f"📋 {total} постов в очереди"
+        await message.reply_text(
+            label,
+            reply_markup=InlineKeyboardMarkup([[back_btn]]),
+        )
 
 
 async def handle_gen_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
