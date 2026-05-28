@@ -2119,6 +2119,7 @@ def main():
             ADD_RSS_CONFIRM:    [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_add_rss_confirm)],
             ADD_POSTS_COUNT:    [CallbackQueryHandler(cmd_add_posts_count, pattern="^postscount:")],
         },
+        per_message=False,
         fallbacks=[CommandHandler("cancel", cmd_add_cancel)],
     )
     app.add_handler(add_channel_conv)
@@ -2131,6 +2132,7 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edited_text)
             ],
         },
+        per_message=False,
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
     app.add_handler(edit_conversation)
