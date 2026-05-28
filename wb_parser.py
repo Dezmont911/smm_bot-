@@ -158,21 +158,35 @@ class WBParser:
         """
         Запрашивает данные по артикулам через card.wb.ru.
         Батчами по 20 штук — WB отдаёт до 20 за раз.
+        Если задан WB_PROXY_URL — используем его (нужен для datacenter IP).
         """
         posts = []
         batch_size = 20
 
+        # Собираем список прокси: сначала WB_PROXY_URLS (список), потом WB_PROXY_URL
+        proxy_list = list(cfg.WB_PROXY_URLS) if cfg.WB_PROXY_URLS else []
+        if not proxy_list and cfg.WB_PROXY_URL:
+            proxy_list = [cfg.WB_PROXY_URL]
+
+        if proxy_list:
+            logger.debug(f"WB card API: {len(proxy_list)} прокси для ротации")
+        else:
+            logger.warning("WB card API: прокси не заданы — datacenter IP может быть заблокирован")
+
         connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(
             headers=self.HEADERS,
-            connector=connector
+            connector=connector,
+            trust_env=False,
         ) as session:
             for i in range(0, len(article_ids), batch_size):
                 if len(posts) >= need:
                     break
 
+                # Случайный прокси для каждого батча
+                proxy = random.choice(proxy_list) if proxy_list else None
                 batch = article_ids[i:i + batch_size]
-                batch_posts = await self._fetch_batch(session, batch)
+                batch_posts = await self._fetch_batch(session, batch, proxy=proxy)
                 posts.extend(batch_posts)
 
                 if i + batch_size < len(article_ids):
@@ -184,6 +198,7 @@ class WBParser:
         self,
         session: aiohttp.ClientSession,
         article_ids: list[int],
+        proxy: str | None = None,
     ) -> list[dict]:
         """Запрашивает данные по пачке артикулов через card.wb.ru."""
         nm_param = ";".join(str(a) for a in article_ids)
@@ -199,6 +214,7 @@ class WBParser:
                 async with session.get(
                     self.CARD_API,
                     params=params,
+                    proxy=proxy,
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
                     if resp.status == 429:
@@ -337,7 +353,7 @@ class WBParser:
     async def fetch_single(self, article: int) -> dict | None:
         """Получает данные одного товара по артикулу (для /add_product)."""
         connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(headers=self.HEADERS, connector=connector) as session:
+        async with aiohttp.ClientSession(headers=self.HEADERS, connector=connector, trust_env=False) as session:
             posts = await self._fetch_batch(session, [article])
             return posts[0] if posts else None
 
