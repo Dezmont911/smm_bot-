@@ -994,6 +994,116 @@ async def cmd_post_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
+# Удаление постов (/delete_posts)
+# ============================================================
+
+async def cmd_delete_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Удаляет все готовые посты из буфера с подтверждением.
+
+    Использование:
+      /delete_posts              — удалить все posты со всех каналов
+      /delete_posts @channel     — удалить все посты конкретного канала
+    """
+    if not is_admin(update.effective_user.id):
+        return
+
+    args = context.args or []
+
+    # Определяем: все каналы или конкретный
+    if args:
+        handle = args[0] if args[0].startswith("@") else "@" + args[0]
+        channels = load_all_channels()
+        if not any(c["channel_id"] == handle for c in channels):
+            await update.message.reply_text(
+                f"❌ Канал <code>{handle}</code> не найден. Список: /list",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        filter_channel = handle
+    else:
+        filter_channel = None  # все каналы
+
+    # Считаем сколько постов будет удалено
+    with db.connect() as conn:
+        if filter_channel:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM posts WHERE channel_id = ? AND status = 'ready'",
+                (filter_channel,),
+            ).fetchone()[0]
+        else:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM posts WHERE status = 'ready'"
+            ).fetchone()[0]
+
+    if count == 0:
+        target = f"канала <b>{filter_channel}</b>" if filter_channel else "всех каналов"
+        await update.message.reply_text(
+            f"📭 В буфере {target} нет готовых постов — нечего удалять.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Кодируем фильтр в callback_data (пустая строка = все каналы)
+    encoded = filter_channel or "ALL"
+    target_label = f"<b>{filter_channel}</b>" if filter_channel else "<b>всех каналов</b>"
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Да, удалить", callback_data=f"delete_all_confirm:{encoded}"),
+            InlineKeyboardButton("❌ Отмена",      callback_data="delete_all_cancel"),
+        ]
+    ])
+    await update.message.reply_text(
+        f"⚠️ <b>Удалить посты?</b>\n\n"
+        f"Канал: {target_label}\n"
+        f"Постов к удалению: <b>{count}</b>\n\n"
+        f"Это действие <b>необратимо</b> — посты из очереди исчезнут.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def handle_delete_posts_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопок подтверждения/отмены удаления постов."""
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    data = query.data  # "delete_all_confirm:@channel" или "delete_all_cancel"
+
+    if data == "delete_all_cancel":
+        await query.edit_message_text("❌ Удаление отменено.")
+        return
+
+    # Подтверждение
+    encoded = data.split(":", 1)[1]
+    filter_channel = None if encoded == "ALL" else encoded
+
+    with db.connect() as conn:
+        if filter_channel:
+            result = conn.execute(
+                "DELETE FROM posts WHERE channel_id = ? AND status = 'ready'",
+                (filter_channel,),
+            )
+        else:
+            result = conn.execute(
+                "DELETE FROM posts WHERE status = 'ready'"
+            )
+        deleted = result.rowcount
+
+    target_label = f"канала {filter_channel}" if filter_channel else "всех каналов"
+    logger.info(f"Удалено {deleted} постов из буфера ({target_label})")
+    await query.edit_message_text(
+        f"🗑 <b>Удалено {deleted} постов</b> из буфера {target_label}.\n\n"
+        f"Запусти /generate чтобы заполнить буфер заново.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ============================================================
 # Обработчики кнопок (одобрение постов)
 # ============================================================
 
@@ -1530,6 +1640,13 @@ def main():
     app.add_handler(CommandHandler("preview", cmd_preview))
     app.add_handler(CommandHandler("post_now", cmd_post_now))
     app.add_handler(CommandHandler("schedule", cmd_schedule))
+    app.add_handler(CommandHandler("delete_posts", cmd_delete_posts))
+
+    # --- Кнопки: удаление всех постов ---
+    app.add_handler(CallbackQueryHandler(
+        handle_delete_posts_confirm,
+        pattern="^(delete_all_confirm:|delete_all_cancel)",
+    ))
 
     # --- Кнопки: редактирование постов ---
     app.add_handler(CallbackQueryHandler(handle_post_actions, pattern="^(delete|image|regen|done):"))
