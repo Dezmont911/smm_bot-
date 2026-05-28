@@ -340,8 +340,10 @@ class WBParser:
 
     def _get_basket(self, vol: int) -> int:
         """Номер CDN-корзины по vol.
-        Таблица: baskets 1-19 фиксированные, 20+ по формуле step=288.
-        Проверено: vol=7620→basket35, vol=9017→basket39 (2026-05).
+
+        Baskets 1-19: точная таблица.
+        Baskets 20+: кусочно-линейная формула из проверенных точек (2026-05):
+          (4622, 26), (7620, 35), (7901, 36), (9017, 39), (10243, 41)
         """
         if   vol <=  143: return 1
         elif vol <=  287: return 2
@@ -362,9 +364,13 @@ class WBParser:
         elif vol <= 2837: return 17
         elif vol <= 3053: return 18
         elif vol <= 3269: return 19
-        else:
-            # Динамическая формула: шаг 288 vol-единиц на корзину
-            return 20 + (vol - 3270) // 288
+        # Baskets 20+: кусочно-линейные сегменты (step разный по сегментам)
+        elif vol <= 4622: return 20 + (vol - 3270) // 225   # step≈225 (подтв.: 4622→26)
+        elif vol <= 7620: return 26 + (vol - 4622) // 333   # step≈333 (подтв.: 7620→35)
+        elif vol <  7901: return 35                          # узкий сегмент (подтв.: 7620→35)
+        elif vol <= 9017: return 36 + (vol - 7901) // 372   # step≈372 (подтв.: 7901→36, 9017→39)
+        elif vol <= 10243: return 39 + (vol - 9017) // 613  # step≈613 (подтв.: 10243→41)
+        else:              return 41 + (vol - 10243) // 613  # экстраполяция
 
     async def fetch_single(self, article: int) -> dict | None:
         """Получает данные одного товара по артикулу (для /add_product)."""
