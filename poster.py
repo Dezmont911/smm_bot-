@@ -135,18 +135,21 @@ class Poster:
         content = post["content"]
         image_url = post.get("image_url")
 
+        # Берём parse_mode из самого поста (WB-посты имеют "HTML", остальные — "Markdown")
+        post_parse_mode = post.get("parse_mode", "Markdown")
+
         # Формируем список попыток: (parse_mode, use_image)
         if image_url:
             attempts = [
-                ("Markdown", True),
-                (None,       True),
-                ("Markdown", False),  # картинка недоступна — пробуем без неё
-                (None,       False),
+                (post_parse_mode, True),
+                (None,            True),
+                (post_parse_mode, False),  # картинка недоступна — пробуем без неё
+                (None,            False),
             ]
         else:
             attempts = [
-                ("Markdown", False),
-                (None,       False),
+                (post_parse_mode, False),
+                (None,            False),
             ]
 
         for parse_mode, use_image in attempts:

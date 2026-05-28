@@ -128,9 +128,10 @@ class WBParser:
         if not pool:
             pool = [art for ids in self._cache.values() for art in ids]
 
-        # Перемешиваем и берём нужное количество (с запасом ×2 для фильтрации)
+        # Перемешиваем и берём нужное количество (с запасом ×5 для фильтрации)
+        # Запас нужен: часть артикулов может быть недоступна или вернуть ошибку
         random.shuffle(pool)
-        return pool[:min(count * 2, len(pool))]
+        return pool[:min(count * 5, len(pool))]
 
     async def generate_posts(self, channel: dict, count: int = 10) -> list[dict]:
         """
