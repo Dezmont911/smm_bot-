@@ -151,7 +151,18 @@ async def _build_english_query(topic: str, channel_topic: str = "") -> str:
     is_english = latin_ratio > 0.6
 
     if is_english:
-        # Заголовок на английском — фильтруем стоп-слова
+        # Заголовок на английском — просим Claude извлечь визуальные ключевые слова.
+        # Простая фильтрация стоп-слов давала мусор: "rate house" → финансовые фото
+        # вместо Minecraft. Claude понимает контекст и даёт правильный запрос.
+        try:
+            visual_query = await _extract_visual_keywords(title, channel_context)
+            if visual_query:
+                logger.debug(f"Claude visual query: '{title[:50]}' → '{visual_query}'")
+                return visual_query
+        except Exception as e:
+            logger.debug(f"Claude visual extraction не удался: {e}")
+
+        # Фоллбэк: старая логика если Claude недоступен
         words = re.findall(r"[a-zA-Z]+", title.lower())
         keywords = [w for w in words if w not in EN_STOP and len(w) > 3]
         title_part = " ".join(keywords[:2])
@@ -178,6 +189,37 @@ async def _build_english_query(topic: str, channel_topic: str = "") -> str:
             logger.debug(f"Claude перевод не удался: {e}")
 
         return channel_context or "lifestyle technology"
+
+
+async def _extract_visual_keywords(en_title: str, channel_context: str = "") -> str | None:
+    """
+    Извлекает 2-3 визуальных ключевых слова из английского заголовка через Claude.
+    Учитывает контекст канала чтобы не путать "rate" (оценить) с "rate" (ставка).
+
+    Например:
+      "rate my house that I made in creative mode" + "minecraft"
+      → "minecraft house building"
+    """
+    import anthropic
+    client = anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
+
+    context_hint = f"Channel context: {channel_context}. " if channel_context else ""
+    prompt = (
+        f"{context_hint}"
+        f"Extract 2-3 visual keywords for a stock photo search from this title. "
+        f"Return ONLY a short phrase (max 4 words), no explanations: {en_title}"
+    )
+
+    message = client.messages.create(
+        model=cfg.CLAUDE_MODEL,
+        max_tokens=20,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    result = message.content[0].text.strip().lower()
+    result = result.splitlines()[0]
+    result = re.sub(r"[\"'.,:;\n]", "", result).strip()
+    return result if result else None
 
 
 async def _translate_with_claude(ru_text: str) -> str | None:
