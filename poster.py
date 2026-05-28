@@ -94,9 +94,9 @@ class Poster:
             return
 
         # Публикуем пост
-        success = await self._publish(post)
+        result = await self._publish(post)
 
-        if success:
+        if result["success"]:
             buffer.mark_published(post["id"])
             logger.success(
                 f"Опубликован пост в {channel_id} | "
@@ -119,7 +119,7 @@ class Poster:
     # Публикация поста
     # --------------------------------------------------------
 
-    async def _publish(self, post: dict) -> bool:
+    async def _publish(self, post: dict) -> dict:
         """
         Отправляет пост в Telegram-канал.
         Порядок попыток:
@@ -127,7 +127,9 @@ class Poster:
           2. Plain text + картинка
           3. Markdown без картинки  (если картинка недоступна)
           4. Plain text без картинки
-        Возвращает True если хотя бы одна попытка успешна.
+
+        Возвращает dict:
+          {"success": True/False, "used_image": True/False}
         """
         channel_id = post["channel_id"]
         content = post["content"]
@@ -165,7 +167,7 @@ class Poster:
                     )
                 if image_url and not use_image:
                     logger.warning(f"Пост опубликован БЕЗ картинки (недоступна): {channel_id}")
-                return True
+                return {"success": True, "used_image": use_image and bool(img)}
 
             except Exception as e:
                 logger.warning(
@@ -175,7 +177,7 @@ class Poster:
                 continue  # переходим к следующей попытке
 
         logger.error(f"Все попытки публикации в {channel_id} провалились")
-        return False
+        return {"success": False, "used_image": False}
 
     # --------------------------------------------------------
     # Проверка буфера и запуск генерации
@@ -288,10 +290,10 @@ class Poster:
         if post is None:
             return {"success": False, "error": "Буфер пуст"}
 
-        success = await self._publish(post)
-        if success:
+        result = await self._publish(post)
+        if result["success"]:
             buffer.mark_published(post["id"])
-            return {"success": True, "post": post}
+            return {"success": True, "post": post, "used_image": result["used_image"]}
         else:
             return {"success": False, "error": "Ошибка отправки в Telegram"}
 

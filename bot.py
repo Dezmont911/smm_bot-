@@ -1251,26 +1251,29 @@ async def handle_post_actions(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Публикуем этот конкретный пост немедленно
         with db.connect() as conn:
             row = conn.execute(
-                "SELECT channel_id FROM posts WHERE id = ? AND status = 'ready'",
+                "SELECT * FROM posts WHERE id = ? AND status = 'ready'",
                 (post_id,),
             ).fetchone()
         if not row:
             await query.edit_message_reply_markup(reply_markup=None)
             await query.message.reply_text("❌ Пост не найден или уже опубликован.")
             return
-        channel_id = row["channel_id"]
+
+        post_data = dict(row)
         await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("⏳ Публикую...", callback_data="done")
         ]]))
-        # Публикуем напрямую через poster
-        post_data = dict(db.connect().__enter__().execute(
-            "SELECT * FROM posts WHERE id = ?", (post_id,)
-        ).fetchone())
-        success = await poster._publish(post_data)
-        if success:
+
+        pub = await poster._publish(post_data)
+        if pub["success"]:
             buffer.mark_published(post_id)
+            had_image = bool(post_data.get("image_url"))
+            if had_image and not pub["used_image"]:
+                label = "✅ Опубликовано (без картинки — URL недоступен)"
+            else:
+                label = "✅ Опубликовано!"
             await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Опубликовано!", callback_data="done")
+                InlineKeyboardButton(label, callback_data="done")
             ]]))
             logger.info(f"Пост опубликован вручную из /review: {post_id[:8]}")
         else:
