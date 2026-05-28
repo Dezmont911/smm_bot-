@@ -124,6 +124,11 @@ class Config:
     WB_API_MODE: str = field(
         default_factory=lambda: _optional("WB_API_MODE", "auto")
     )
+    # Прокси для WB парсера (резидентный/мобильный — обходит PoW блокировку с VPS)
+    # Форматы: http://user:pass@host:port  или  socks5://user:pass@host:port
+    WB_PROXY_URL: str = field(
+        default_factory=lambda: _optional("WB_PROXY_URL", "")
+    )
 
     # --- Режим отладки ---
     DEBUG: bool = field(

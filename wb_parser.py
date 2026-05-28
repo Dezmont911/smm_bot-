@@ -15,6 +15,8 @@ import asyncio
 import random
 from loguru import logger
 
+from config import cfg
+
 try:
     import aiohttp
     AIOHTTP_AVAILABLE = True
@@ -105,6 +107,11 @@ class WBParser:
             f"запрос {count} постов из {n_cats} категорий: {selected_cats}"
         )
 
+        # Прокси (если задан WB_PROXY_URL в .env — обходит PoW блокировку VPS)
+        proxy = cfg.WB_PROXY_URL or None
+        if proxy:
+            logger.debug(f"WB-парсер: используем прокси {proxy.split('@')[-1]}")
+
         # Создаём одну сессию на всё — WB видит цепочку запросов с cookies
         connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(headers=self.HEADERS, connector=connector) as session:
@@ -112,6 +119,7 @@ class WBParser:
             try:
                 await session.get(
                     "https://www.wildberries.ru/",
+                    proxy=proxy,
                     timeout=aiohttp.ClientTimeout(total=10),
                 )
                 await asyncio.sleep(random.uniform(1.0, 2.0))
@@ -156,7 +164,9 @@ class WBParser:
         for attempt in range(3):
             try:
                 async with session.get(
-                    self.SEARCH_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)
+                    self.SEARCH_URL, params=params,
+                    proxy=proxy,
+                    timeout=aiohttp.ClientTimeout(total=15)
                 ) as resp:
                     if resp.status == 429:
                         wait = 8 * (attempt + 1)  # 8с, 16с, 24с
