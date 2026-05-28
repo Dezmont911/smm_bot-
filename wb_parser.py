@@ -71,7 +71,7 @@ class WBParser:
     Данные: кеш артикулов + card.wb.ru API (без 429).
     """
 
-    CARD_API = "https://card.wb.ru/cards/v2/detail"
+    CARD_API = "https://card.wb.ru/cards/v4/detail"
     HEADERS = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json",
@@ -228,7 +228,8 @@ class WBParser:
 
                     data = await resp.json(content_type=None)
 
-                products = data.get("data", {}).get("products", [])
+                # v4 API: {"products": [...]}  (v2 было: {"data": {"products": [...]}})
+                products = data.get("products") or data.get("data", {}).get("products", [])
                 posts = []
                 for product in products:
                     post = self._format_post(product)
@@ -263,6 +264,8 @@ class WBParser:
             sizes = product.get("sizes", [])
             price = 0
             original_price = 0
+
+            # Сначала ищем в sizes[].price (работает в v2 и v4)
             for size in sizes:
                 price_data = size.get("price", {})
                 p = price_data.get("product", 0)
@@ -271,6 +274,14 @@ class WBParser:
                     price = p // 100
                     original_price = b // 100
                     break
+
+            # Fallback: поля priceU / salePriceU (некоторые версии API)
+            if price == 0:
+                sale = product.get("salePriceU", 0)
+                basic = product.get("priceU", 0)
+                if sale > 0:
+                    price = sale // 100
+                    original_price = basic // 100 if basic > sale else 0
 
             if price == 0:
                 return None
@@ -328,7 +339,10 @@ class WBParser:
         )
 
     def _get_basket(self, vol: int) -> int:
-        """Номер CDN-корзины по vol (таблица актуальна 2024-2025)."""
+        """Номер CDN-корзины по vol.
+        Таблица: baskets 1-19 фиксированные, 20+ по формуле step=288.
+        Проверено: vol=7620→basket35, vol=9017→basket39 (2026-05).
+        """
         if   vol <=  143: return 1
         elif vol <=  287: return 2
         elif vol <=  431: return 3
@@ -348,7 +362,9 @@ class WBParser:
         elif vol <= 2837: return 17
         elif vol <= 3053: return 18
         elif vol <= 3269: return 19
-        else:             return 20
+        else:
+            # Динамическая формула: шаг 288 vol-единиц на корзину
+            return 20 + (vol - 3270) // 288
 
     async def fetch_single(self, article: int) -> dict | None:
         """Получает данные одного товара по артикулу (для /add_product)."""
