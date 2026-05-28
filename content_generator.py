@@ -107,6 +107,10 @@ class ContentGenerator:
         # Авто-регистрация канала в БД если его там ещё нет
         self._ensure_channel_registered(channel)
 
+        # ---- Marketplace-каналы (WB/Ozon) — отдельный pipeline ----
+        if channel.get("channel_type") == "marketplace":
+            return await self._run_marketplace(channel, target_count)
+
         # Получаем темы из источников
         topics, sources_used = await self._collect_topics(channel, target_count)
 
@@ -272,6 +276,108 @@ class ContentGenerator:
         # Генерируем минимальный запас — до уровня EMERGENCY
         target = cfg.BUFFER_MIN - buffer.get_level(channel_id)
         return await self.run_for_channel(channel, target_count=max(target, 4))
+
+    # --------------------------------------------------------
+    # Marketplace pipeline (WB / Ozon)
+    # --------------------------------------------------------
+
+    async def _run_marketplace(self, channel: dict, target_count: int) -> dict:
+        """
+        Генерирует посты для маркетплейс-каналов (WB/Ozon).
+        Вместо Claude → wb_parser: берём товары из публичного API WB.
+        """
+        from wb_parser import wb_parser
+
+        channel_id = channel["channel_id"]
+
+        logger.info(f"WB-pipeline [{channel_id}]: запрос {target_count} постов")
+
+        try:
+            posts = await wb_parser.generate_posts(channel, count=target_count)
+        except Exception as e:
+            logger.error(f"WB-pipeline [{channel_id}]: ошибка парсера: {e}")
+            return {
+                "channel_id": channel_id,
+                "generated": 0,
+                "skipped": 0,
+                "buffer_level": buffer.get_level(channel_id),
+                "sources_used": [],
+            }
+
+        if not posts:
+            logger.warning(f"WB-pipeline [{channel_id}]: парсер не вернул ни одного товара")
+            return {
+                "channel_id": channel_id,
+                "generated": 0,
+                "skipped": 0,
+                "buffer_level": buffer.get_level(channel_id),
+                "sources_used": ["wb_parser"],
+            }
+
+        generated = 0
+        skipped = 0
+
+        for post_data in posts:
+            try:
+                # Проверка анти-повтора — не публикуем один товар дважды
+                article = post_data.get("wb_article", "")
+                if article and self._wb_article_in_buffer(channel_id, article):
+                    logger.debug(f"WB дубликат [{channel_id}]: арт. {article}")
+                    skipped += 1
+                    continue
+
+                # Формируем запись для буфера
+                # topic содержит артикул — используется для анти-повтора
+                buf_post = {
+                    "channel_id": channel_id,
+                    "content": post_data["content"],
+                    "image_url": post_data.get("image_url"),
+                    "has_image": bool(post_data.get("image_url")),
+                    "format": "wb_product",
+                    "topic": f"WB арт.{article} [{post_data.get('wb_category', '')}]",
+                    "source": "wb_parser",
+                }
+                buffer.add(buf_post)
+                generated += 1
+                logger.success(f"WB-пост добавлен [{channel_id}]: арт. {article}")
+
+            except Exception as e:
+                logger.error(f"WB-pipeline [{channel_id}]: ошибка добавления поста: {e}")
+                skipped += 1
+
+        new_level = buffer.get_level(channel_id)
+        logger.info(
+            f"WB-pipeline завершён [{channel_id}]: "
+            f"создано={generated}, пропущено={skipped}, буфер={new_level}"
+        )
+
+        return {
+            "channel_id": channel_id,
+            "generated": generated,
+            "skipped": skipped,
+            "buffer_level": new_level,
+            "sources_used": ["wb_parser"],
+        }
+
+    def _wb_article_in_buffer(self, channel_id: str, article: str) -> bool:
+        """
+        Проверяет, есть ли товар с таким артикулом уже в буфере.
+        Ищет по полю topic, куда мы записываем 'WB арт.{article}'.
+        """
+        try:
+            with db.connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT id FROM posts
+                    WHERE channel_id = ? AND status = 'ready'
+                      AND topic LIKE ?
+                    LIMIT 1
+                    """,
+                    (channel_id, f"%арт.{article}%"),
+                ).fetchone()
+            return row is not None
+        except Exception:
+            return False  # если ошибка — не блокируем
 
     # --------------------------------------------------------
     # Вспомогательные методы

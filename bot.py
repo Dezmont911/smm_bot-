@@ -59,6 +59,8 @@ WAITING_EDITED_TEXT = 1
 
 # Состояния для /add (добавление канала — пошаговый диалог)
 ADD_HANDLE, ADD_NAME, ADD_TOPIC, ADD_TONE, ADD_FORBIDDEN, ADD_RSS_CONFIRM, ADD_POSTS_COUNT = range(10, 17)
+# Новые состояния: выбор метода + экспорт-флоу + channel_type
+ADD_CHOOSE_METHOD, ADD_WAITING_EXPORT, ADD_EXPORT_HANDLE, ADD_EXPORT_CONFIRM, ADD_CHANNEL_TYPE = range(17, 22)
 
 
 # ============================================================
@@ -235,19 +237,26 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начинает диалог добавления нового канала."""
+    """Начинает диалог добавления нового канала — предлагает выбор метода."""
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
 
     context.user_data.clear()
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📂 Загрузить экспорт Telegram", callback_data="addmethod:export"),
+        InlineKeyboardButton("✏️ Описать вручную",           callback_data="addmethod:manual"),
+    ]])
     await update.message.reply_text(
         "➕ <b>Добавление канала</b>\n\n"
-        "Шаг 1/5: Пришли <b>handle</b> канала.\n"
-        "Например: <code>@my_finance_channel</code>\n\n"
+        "Как хочешь настроить канал?\n\n"
+        "📂 <b>Экспорт Telegram</b> — скинь <code>result.json</code> из Telegram Desktop, "
+        "и бот сам определит тему, тон, тип канала и вечнозелёные темы.\n\n"
+        "✏️ <b>Вручную</b> — пошаговый диалог с вопросами.\n\n"
         "/cancel — отменить",
         parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
     )
-    return ADD_HANDLE
+    return ADD_CHOOSE_METHOD
 
 
 async def cmd_add_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -299,15 +308,20 @@ async def cmd_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_add_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получает тему канала."""
+    """Получает тему канала, затем спрашивает тип канала."""
     context.user_data["new_channel"]["topic"] = update.message.text.strip()
     await update.message.reply_text(
-        f"✅ Тема сохранена.\n\n"
-        f"Шаг 4/5: <b>Тон общения</b> с аудиторией?\n"
-        f"Например: <i>дружелюбный эксперт, без снобизма, с юмором</i>",
+        "✅ Тема сохранена.\n\n"
+        "Шаг 3.5/5: <b>Тип канала</b>\n\n"
+        "📝 <b>Контент</b> — пишем посты: новости, советы, факты, разборы\n"
+        "🛍 <b>Маркетплейс</b> — постим товары с WB/Ozon (цена, фото, ссылка)",
         parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("📝 Контент-канал",     callback_data="channeltype:content"),
+            InlineKeyboardButton("🛍 Маркетплейс WB/Ozon", callback_data="channeltype:marketplace"),
+        ]]),
     )
-    return ADD_TONE
+    return ADD_CHANNEL_TYPE
 
 
 async def cmd_add_tone(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -416,38 +430,48 @@ async def cmd_add_posts_count(update: Update, context: ContextTypes.DEFAULT_TYPE
     ch = context.user_data["new_channel"]
     ch["daily_posts_count"] = count
 
+    channel_type = ch.get("channel_type", "content")
+
     # Финальная сборка карточки
-    ch.update({
+    base_defaults = {
         "audience": "широкая аудитория",
         "post_length": "100–200 слов",
         "use_emoji": True,
         "active": True,
-        "post_formats": ["совет дня", "факт/статистика", "вопрос аудитории", "мини-разбор", "инфоповод"],
         "example_posts": [],
         "use_images": False,
-        "image_keywords": [t.strip() for t in ch["topic"].split(",")][:3],
-    })
+    }
+
+    if channel_type == "marketplace":
+        base_defaults["post_formats"] = ["wb_product"]
+        base_defaults["image_keywords"] = []
+        base_defaults.setdefault("tone", "продающий, дружелюбный")
+    else:
+        base_defaults["post_formats"] = ["совет дня", "факт/статистика", "вопрос аудитории", "мини-разбор", "инфоповод"]
+        base_defaults["image_keywords"] = [t.strip() for t in ch.get("topic", "").split(",")][:3]
+
+    ch.update(base_defaults)
 
     save_channel_card(ch)
 
-    # Добавляем вечнозелёные темы в БД
+    # Добавляем вечнозелёные темы в БД (для контент-каналов)
     buffer.add_evergreen_topics(ch["channel_id"], ch.get("evergreen_topics", []))
 
     rss_count = len(ch.get("rss_sources", []))
     eg_count = len(ch.get("evergreen_topics", []))
+    ch_type_label = "🛍 Маркетплейс" if channel_type == "marketplace" else "📝 Контент"
 
     await query.edit_message_text(
         f"🎉 <b>Канал добавлен!</b>\n\n"
         f"Handle: {ch['channel_id']}\n"
         f"Название: {ch['name']}\n"
-        f"Тема: {ch['topic']}\n"
+        f"Тип: {ch_type_label}\n"
+        f"Тема: {ch.get('topic', '—')}\n"
         f"Постов в день: {count}\n"
-        f"RSS-источников: {rss_count}\n"
-        f"Вечнозелёных тем: {eg_count}\n\n"
-        f"<b>Следующие шаги:</b>\n"
+        + (f"RSS-источников: {rss_count}\nВечнозелёных тем: {eg_count}\n" if channel_type == "content" else "") +
+        f"\n<b>Следующие шаги:</b>\n"
         f"1. Добавь бота администратором в канал {ch['channel_id']}\n"
-        f"2. Запусти /generate чтобы создать первые посты\n"
-        f"3. Посты автоматически встанут в очередь публикации",
+        f"2. Запусти /generate чтобы создать первые посты",
         parse_mode=ParseMode.HTML,
     )
     context.user_data.clear()
@@ -466,6 +490,301 @@ async def cmd_add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("❌ Добавление канала отменено.")
     return ConversationHandler.END
+
+
+# ============================================================
+# /add — выбор метода: экспорт или вручную
+# ============================================================
+
+async def handle_add_method_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает выбор метода добавления канала."""
+    query = update.callback_query
+    await query.answer()
+
+    method = query.data.split(":")[1]  # "export" или "manual"
+
+    if method == "export":
+        await query.edit_message_text(
+            "📂 <b>Загрузка экспорта</b>\n\n"
+            "Как экспортировать канал:\n"
+            "1. Открой Telegram Desktop\n"
+            "2. Зайди в канал → ⋮ меню → <b>Экспорт истории чата</b>\n"
+            "3. Формат: <b>JSON</b>, галочки на медиа убрать\n"
+            "4. Пришли файл <code>result.json</code> сюда\n\n"
+            "/cancel — отменить",
+            parse_mode=ParseMode.HTML,
+        )
+        return ADD_WAITING_EXPORT
+
+    else:  # manual
+        await query.edit_message_text(
+            "✏️ <b>Ручное добавление</b>\n\n"
+            "Шаг 1: Пришли <b>handle</b> канала.\n"
+            "Например: <code>@my_finance_channel</code>\n\n"
+            "/cancel — отменить",
+            parse_mode=ParseMode.HTML,
+        )
+        return ADD_HANDLE
+
+
+# ============================================================
+# /add — экспорт-флоу
+# ============================================================
+
+async def handle_export_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принимает JSON-файл экспорта, анализирует через Claude."""
+    from channel_analyzer import analyzer
+
+    doc = update.message.document
+    if not doc:
+        await update.message.reply_text(
+            "⚠️ Пришли JSON-файл экспорта.\n/cancel — отменить"
+        )
+        return ADD_WAITING_EXPORT
+
+    # Проверяем что это JSON
+    if not (doc.file_name or "").endswith(".json") and doc.mime_type != "application/json":
+        await update.message.reply_text(
+            "⚠️ Нужен файл <code>result.json</code> в формате JSON.\n"
+            "/cancel — отменить",
+            parse_mode=ParseMode.HTML,
+        )
+        return ADD_WAITING_EXPORT
+
+    # Проверяем размер (не больше 50 МБ)
+    if doc.file_size and doc.file_size > 50 * 1024 * 1024:
+        await update.message.reply_text(
+            "⚠️ Файл слишком большой (>50 МБ). Попробуй сделать экспорт "
+            "только последних нескольких месяцев.\n/cancel — отменить"
+        )
+        return ADD_WAITING_EXPORT
+
+    msg = await update.message.reply_text("⏳ Читаю файл и анализирую канал...")
+
+    try:
+        # Скачиваем файл
+        tg_file = await doc.get_file()
+        file_bytes = await tg_file.download_as_bytearray()
+
+        # Анализируем через Claude
+        analysis = await analyzer.analyze_from_bytes(bytes(file_bytes), doc.file_name)
+
+        # Сохраняем анализ в user_data
+        context.user_data["export_analysis"] = analysis
+        context.user_data["new_channel"] = {}
+
+        # Форматируем превью
+        ch_type_label = (
+            "🛍 Маркетплейс (WB/Ozon)" if analysis.get("channel_type") == "marketplace"
+            else "📝 Контент-канал"
+        )
+        confidence_pct = int(analysis.get("confidence", 0.8) * 100)
+        evergreen_preview = "\n".join(
+            f"  • {t}" for t in analysis.get("evergreen_topics", [])[:5]
+        )
+
+        await msg.edit_text(
+            f"✅ <b>Анализ завершён</b> (уверенность: {confidence_pct}%)\n\n"
+            f"📌 <b>Канал:</b> {analysis.get('export_channel_name', '?')}\n"
+            f"🏷 <b>Тип:</b> {ch_type_label}\n"
+            f"📝 <b>Тема:</b> {analysis.get('topic', '?')}\n"
+            f"🎤 <b>Тон:</b> {analysis.get('tone', '?')}\n"
+            f"📊 <b>Частота:</b> ~{analysis.get('post_frequency', 3)} поста/день\n"
+            f"💡 <b>Вечнозелёные темы ({len(analysis.get('evergreen_topics', []))}):</b>\n"
+            f"{evergreen_preview}\n\n"
+            f"🔍 <i>{analysis.get('analysis_notes', '')}</i>\n\n"
+            f"Теперь укажи <b>@handle</b> канала в Telegram:\n"
+            f"(например <code>@my_channel</code>)\n\n"
+            f"/cancel — отменить",
+            parse_mode=ParseMode.HTML,
+        )
+        return ADD_EXPORT_HANDLE
+
+    except ValueError as e:
+        await msg.edit_text(
+            f"❌ <b>Ошибка анализа:</b> {e}\n\n"
+            "Убедись что файл — это <code>result.json</code> от Telegram.\n"
+            "/cancel — отменить",
+            parse_mode=ParseMode.HTML,
+        )
+        return ADD_WAITING_EXPORT
+
+    except Exception as e:
+        logger.error(f"Ошибка анализа экспорта: {e}")
+        await msg.edit_text(
+            "❌ Не удалось проанализировать файл. Проверь логи.\n"
+            "/cancel — отменить"
+        )
+        return ADD_WAITING_EXPORT
+
+
+async def handle_export_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получает @handle после экспорт-анализа, показывает итоговую карточку."""
+    text = update.message.text.strip()
+
+    # Нормализуем handle
+    if "t.me/" in text:
+        handle = "@" + text.split("t.me/")[-1].strip("/").split("?")[0]
+    elif text.startswith("@"):
+        handle = text
+    else:
+        handle = f"@{text}"
+    handle = handle.split()[0]
+
+    # Проверяем дублирование
+    existing = load_all_channels()
+    if any(ch["channel_id"] == handle for ch in existing):
+        await update.message.reply_text(
+            f"❌ Канал {handle} уже добавлен.\nПришли другой handle или /cancel"
+        )
+        return ADD_EXPORT_HANDLE
+
+    analysis = context.user_data.get("export_analysis", {})
+    context.user_data["new_channel"]["channel_id"] = handle
+
+    # Показываем итоговую карточку
+    ch_type_label = (
+        "🛍 Маркетплейс" if analysis.get("channel_type") == "marketplace"
+        else "📝 Контент"
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Создать канал", callback_data="exportconfirm:yes"),
+        InlineKeyboardButton("❌ Отмена",        callback_data="exportconfirm:no"),
+    ]])
+
+    await update.message.reply_text(
+        f"📋 <b>Карточка канала</b>\n\n"
+        f"🔗 Handle: <code>{handle}</code>\n"
+        f"📌 Название: {analysis.get('export_channel_name', handle)}\n"
+        f"🏷 Тип: {ch_type_label}\n"
+        f"📝 Тема: {analysis.get('topic', '—')}\n"
+        f"🎤 Тон: {analysis.get('tone', '—')}\n"
+        f"📊 Постов в день: {analysis.get('post_frequency', 3)}\n\n"
+        f"Всё верно? Создаём канал?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+    return ADD_EXPORT_CONFIRM
+
+
+async def handle_export_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждение создания канала из экспорта."""
+    from ai_client import suggest_rss_sources
+
+    query = update.callback_query
+    await query.answer()
+
+    action = query.data.split(":")[1]
+
+    if action == "no":
+        context.user_data.clear()
+        await query.edit_message_text("❌ Добавление канала отменено.")
+        return ConversationHandler.END
+
+    # action == "yes" — создаём канал
+    analysis = context.user_data.get("export_analysis", {})
+    ch = context.user_data["new_channel"]
+
+    channel_id = ch["channel_id"]
+    channel_type = analysis.get("channel_type", "content")
+
+    # Для контент-каналов подтягиваем RSS если есть rss_keywords
+    rss_urls = []
+    if channel_type == "content":
+        kw_list = analysis.get("rss_keywords", [])
+        if kw_list:
+            try:
+                topic_for_rss = analysis.get("topic", " ".join(kw_list[:3]))
+                rss_urls = await suggest_rss_sources(
+                    topic_for_rss, analysis.get("export_channel_name", "")
+                )
+            except Exception as e:
+                logger.warning(f"RSS suggest ошибка: {e}")
+
+    # Собираем карточку
+    channel_card = {
+        "channel_id": channel_id,
+        "name": analysis.get("export_channel_name", channel_id),
+        "topic": analysis.get("topic", ""),
+        "tone": analysis.get("tone", "информационный"),
+        "channel_type": channel_type,
+        "daily_posts_count": analysis.get("post_frequency", 4),
+        "rss_sources": rss_urls,
+        "evergreen_topics": analysis.get("evergreen_topics", []),
+        "forbidden_topics": [],
+        "audience": "широкая аудитория",
+        "post_length": "100–200 слов",
+        "use_emoji": True,
+        "active": True,
+        "post_formats": ["совет дня", "факт/статистика", "вопрос аудитории", "мини-разбор", "инфоповод"],
+        "example_posts": [],
+        "use_images": False,
+        "image_keywords": [],
+    }
+
+    # Marketplace-специфика
+    if channel_type == "marketplace":
+        channel_card["post_formats"] = ["wb_product"]
+
+    save_channel_card(channel_card)
+    buffer.add_evergreen_topics(channel_id, channel_card.get("evergreen_topics", []))
+
+    ch_type_label = "🛍 Маркетплейс" if channel_type == "marketplace" else "📝 Контент"
+    await query.edit_message_text(
+        f"🎉 <b>Канал добавлен!</b>\n\n"
+        f"Handle: {channel_id}\n"
+        f"Тип: {ch_type_label}\n"
+        f"Тема: {channel_card['topic'][:80]}\n"
+        f"Постов в день: {channel_card['daily_posts_count']}\n"
+        f"RSS-источников: {len(rss_urls)}\n"
+        f"Вечнозелёных тем: {len(channel_card['evergreen_topics'])}\n\n"
+        f"<b>Следующие шаги:</b>\n"
+        f"1. Добавь бота администратором в <code>{channel_id}</code>\n"
+        f"2. Запусти /generate для первых постов",
+        parse_mode=ParseMode.HTML,
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# ============================================================
+# /add — ручной флоу: выбор типа канала (после темы)
+# ============================================================
+
+async def handle_add_channel_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает выбор типа канала (контент / маркетплейс)."""
+    query = update.callback_query
+    await query.answer()
+
+    ch_type = query.data.split(":")[1]  # "content" или "marketplace"
+    context.user_data["new_channel"]["channel_type"] = ch_type
+
+    if ch_type == "marketplace":
+        # Для маркетплейса RSS/тон не нужны — сразу спрашиваем кол-во постов
+        context.user_data["new_channel"]["tone"] = "продающий, дружелюбный"
+        await query.edit_message_text(
+            "🛍 <b>Маркетплейс-канал</b>\n\n"
+            "Бот будет автоматически находить товары из разных категорий WB "
+            "и публиковать карточки с ценами и ссылками.\n\n"
+            "Сколько постов генерировать в день?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("4 поста",  callback_data="postscount:4"),
+                InlineKeyboardButton("10 постов", callback_data="postscount:10"),
+                InlineKeyboardButton("20 постов", callback_data="postscount:20"),
+            ]]),
+        )
+        return ADD_POSTS_COUNT
+
+    else:
+        # Контент — продолжаем обычный флоу
+        await query.edit_message_text(
+            "✅ Тип сохранён.\n\n"
+            "Шаг 4/5: <b>Тон общения</b> с аудиторией?\n"
+            "Например: <i>дружелюбный эксперт, без снобизма, с юмором</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return ADD_TONE
 
 
 async def handle_channel_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1782,13 +2101,23 @@ def main():
     add_channel_conv = ConversationHandler(
         entry_points=[CommandHandler("add", cmd_add_start)],
         states={
-            ADD_HANDLE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_add_handle)],
-            ADD_NAME:        [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_add_name)],
-            ADD_TOPIC:       [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_add_topic)],
-            ADD_TONE:        [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_add_tone)],
-            ADD_FORBIDDEN:   [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_add_forbidden)],
-            ADD_RSS_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_add_rss_confirm)],
-            ADD_POSTS_COUNT: [CallbackQueryHandler(cmd_add_posts_count, pattern="^postscount:")],
+            # Шаг 0: выбор метода (кнопки)
+            ADD_CHOOSE_METHOD:  [CallbackQueryHandler(handle_add_method_choice, pattern="^addmethod:")],
+
+            # Экспорт-флоу
+            ADD_WAITING_EXPORT: [MessageHandler(filters.Document.ALL, handle_export_upload)],
+            ADD_EXPORT_HANDLE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_export_handle)],
+            ADD_EXPORT_CONFIRM: [CallbackQueryHandler(handle_export_confirm, pattern="^exportconfirm:")],
+
+            # Ручной флоу
+            ADD_HANDLE:         [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_add_handle)],
+            ADD_NAME:           [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_add_name)],
+            ADD_TOPIC:          [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_add_topic)],
+            ADD_CHANNEL_TYPE:   [CallbackQueryHandler(handle_add_channel_type, pattern="^channeltype:")],
+            ADD_TONE:           [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_add_tone)],
+            ADD_FORBIDDEN:      [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_add_forbidden)],
+            ADD_RSS_CONFIRM:    [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_add_rss_confirm)],
+            ADD_POSTS_COUNT:    [CallbackQueryHandler(cmd_add_posts_count, pattern="^postscount:")],
         },
         fallbacks=[CommandHandler("cancel", cmd_add_cancel)],
     )
