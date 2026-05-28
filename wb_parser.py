@@ -131,7 +131,7 @@ class WBParser:
             posts = []
             for cat in selected_cats:
                 try:
-                    cat_posts = await self._fetch_category_posts(cat, per_cat + 1, session)
+                    cat_posts = await self._fetch_category_posts(cat, per_cat + 1, session, proxy)
                     posts.extend(cat_posts)
                 except Exception as e:
                     logger.error(f"WB-парсер: ошибка для категории '{cat}': {e}")
@@ -144,7 +144,8 @@ class WBParser:
         return final
 
     async def _fetch_category_posts(
-        self, category: str, limit: int, session: "aiohttp.ClientSession"
+        self, category: str, limit: int, session: "aiohttp.ClientSession",
+        proxy: str | None = None,
     ) -> list[dict]:
         """Берёт товары по поисковому запросу WB. Ретрай при 429."""
         params = {
