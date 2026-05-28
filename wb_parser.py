@@ -18,11 +18,19 @@ from loguru import logger
 from config import cfg
 
 try:
+    from curl_cffi.requests import AsyncSession as CurlSession
+    CURL_CFFI_AVAILABLE = True
+except ImportError:
+    CURL_CFFI_AVAILABLE = False
+
+try:
     import aiohttp
     AIOHTTP_AVAILABLE = True
 except ImportError:
     AIOHTTP_AVAILABLE = False
-    logger.warning("aiohttp не установлен — WB-парсер недоступен. Запустите: pip install aiohttp")
+
+if not CURL_CFFI_AVAILABLE and not AIOHTTP_AVAILABLE:
+    logger.warning("Установите curl_cffi: pip install curl_cffi")
 
 
 # ============================================================
@@ -88,49 +96,153 @@ class WBParser:
     async def generate_posts(self, channel: dict, count: int = 10) -> list[dict]:
         """
         Главный метод. Генерирует count постов из разных категорий.
-        channel — карточка канала из JSON.
+        Использует curl_cffi (Chrome TLS fingerprint) если установлен,
+        иначе падает на aiohttp.
         """
-        if not AIOHTTP_AVAILABLE:
-            logger.error("WB-парсер: aiohttp не установлен")
+        if not CURL_CFFI_AVAILABLE and not AIOHTTP_AVAILABLE:
+            logger.error("WB-парсер: установите curl_cffi: pip install curl_cffi")
             return []
 
-        # Берём категории из настроек канала или из дефолтного списка
         categories = channel.get("wb_categories", WB_CATEGORIES)
-
-        # Выбираем несколько случайных категорий
         n_cats = _categories_count(count)
         selected_cats = random.sample(categories, min(len(categories), n_cats))
-        per_cat = max(1, (count + n_cats - 1) // n_cats)  # округление вверх
+        per_cat = max(1, (count + n_cats - 1) // n_cats)
+
+        proxy_url = cfg.WB_PROXY_URL or None
+        if proxy_url:
+            logger.debug(f"WB-парсер: прокси {proxy_url.split('@')[-1]}")
 
         logger.info(
             f"WB-парсер [{channel.get('channel_id', '?')}]: "
-            f"запрос {count} постов из {n_cats} категорий: {selected_cats}"
+            f"запрос {count} постов, движок={'curl_cffi' if CURL_CFFI_AVAILABLE else 'aiohttp'}"
         )
 
-        # Прокси (если задан WB_PROXY_URL в .env — обходит PoW блокировку VPS)
-        proxy_url = cfg.WB_PROXY_URL or None
-        # HTTP-прокси передаётся как параметр запроса, SOCKS5 — через коннектор
-        http_proxy = None  # для aiohttp proxy= параметра
+        if CURL_CFFI_AVAILABLE:
+            posts = await self._generate_curl(selected_cats, per_cat, proxy_url)
+        else:
+            posts = await self._generate_aiohttp(selected_cats, per_cat, proxy_url)
+
+        random.shuffle(posts)
+        final = posts[:count]
+        logger.info(f"WB-парсер: собрано {len(final)} из {count} запрошенных")
+        return final
+
+    async def _generate_curl(
+        self, selected_cats: list, per_cat: int, proxy_url: str | None
+    ) -> list[dict]:
+        """Генерация через curl_cffi — имитирует TLS fingerprint Chrome."""
+        proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else None
+
+        async with CurlSession(impersonate="chrome124") as session:
+            # Прогреваем сессию — получаем cookies с главной страницы WB
+            try:
+                await session.get(
+                    "https://www.wildberries.ru/",
+                    proxies=proxies,
+                    timeout=10,
+                )
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+                logger.debug("WB-парсер (curl): сессия прогрета")
+            except Exception as e:
+                logger.warning(f"WB-парсер (curl): не удалось прогреть сессию: {e}")
+
+            posts = []
+            for cat in selected_cats:
+                try:
+                    cat_posts = await self._fetch_curl(cat, per_cat + 1, session, proxies)
+                    posts.extend(cat_posts)
+                except Exception as e:
+                    logger.error(f"WB-парсер (curl): ошибка '{cat}': {e}")
+        return posts
+
+    async def _fetch_curl(
+        self,
+        category: str,
+        limit: int,
+        session: "CurlSession",
+        proxies: dict | None,
+    ) -> list[dict]:
+        """Запрос к WB search через curl_cffi с ретраем при 429."""
+        params = {
+            "appType": "1",
+            "curr": "rub",
+            "dest": "-1257786",
+            "query": category,
+            "resultset": "catalog",
+            "sort": "popular",
+            "spp": "30",
+            "page": str(random.randint(1, 3)),
+        }
+
+        await asyncio.sleep(random.uniform(2.0, 4.0))
+
+        for attempt in range(3):
+            try:
+                resp = await session.get(
+                    self.SEARCH_URL,
+                    params=params,
+                    proxies=proxies,
+                    timeout=15,
+                )
+                if resp.status_code == 429:
+                    # Читаем Retry-After если WB его отдаёт
+                    retry_after = int(resp.headers.get("Retry-After", 8 * (attempt + 1)))
+                    wait = max(retry_after, 8 * (attempt + 1))
+                    logger.warning(f"WB (curl) '{category}' → 429, жду {wait}с (попытка {attempt+1}/3)")
+                    await asyncio.sleep(wait)
+                    continue
+                if resp.status_code != 200:
+                    logger.warning(f"WB (curl) '{category}' → HTTP {resp.status_code}")
+                    return []
+
+                data = resp.json()
+                products = data.get("data", {}).get("products", [])
+                if not products:
+                    logger.warning(f"WB (curl) '{category}': нет результатов")
+                    return []
+
+                pool = random.sample(products, min(limit * 3, len(products)))
+                posts = []
+                for product in pool:
+                    if len(posts) >= limit:
+                        break
+                    post = self._format_post(product, category)
+                    if post:
+                        posts.append(post)
+
+                logger.debug(f"WB (curl) '{category}': {len(posts)} товаров")
+                return posts
+
+            except asyncio.TimeoutError:
+                logger.warning(f"WB (curl) '{category}': таймаут (попытка {attempt+1}/3)")
+                await asyncio.sleep(5)
+            except Exception as e:
+                logger.error(f"WB (curl) '{category}': {e}")
+                return []
+
+        logger.error(f"WB (curl) '{category}': все попытки исчерпаны")
+        return []
+
+    async def _generate_aiohttp(
+        self, selected_cats: list, per_cat: int, proxy_url: str | None
+    ) -> list[dict]:
+        """Fallback генерация через aiohttp (без Chrome TLS fingerprint)."""
+        http_proxy = None
         if proxy_url:
-            logger.debug(f"WB-парсер: используем прокси {proxy_url.split('@')[-1]}")
             if proxy_url.startswith("socks"):
-                # SOCKS4/SOCKS5 — используем aiohttp-socks ProxyConnector
                 try:
                     from aiohttp_socks import ProxyConnector
                     connector = ProxyConnector.from_url(proxy_url, ssl=False)
                 except ImportError:
-                    logger.error("Для SOCKS5 прокси установите: pip install aiohttp-socks")
+                    logger.error("pip install aiohttp-socks")
                     connector = aiohttp.TCPConnector(ssl=False)
             else:
-                # HTTP/HTTPS прокси — стандартный коннектор + proxy= в запросах
                 connector = aiohttp.TCPConnector(ssl=False)
                 http_proxy = proxy_url
         else:
             connector = aiohttp.TCPConnector(ssl=False)
 
-        # Создаём одну сессию на всё — WB видит цепочку запросов с cookies
         async with aiohttp.ClientSession(headers=self.HEADERS, connector=connector) as session:
-            # Прогреваем сессию — получаем cookies с главной страницы
             try:
                 await session.get(
                     "https://www.wildberries.ru/",
@@ -138,25 +250,18 @@ class WBParser:
                     timeout=aiohttp.ClientTimeout(total=10),
                 )
                 await asyncio.sleep(random.uniform(1.0, 2.0))
-                logger.debug("WB-парсер: сессия прогрета (cookies получены)")
+                logger.debug("WB-парсер (aiohttp): сессия прогрета")
             except Exception as e:
-                logger.warning(f"WB-парсер: не удалось прогреть сессию: {e}")
+                logger.warning(f"WB-парсер (aiohttp): не удалось прогреть: {e}")
 
-            # Запрашиваем категории последовательно
             posts = []
             for cat in selected_cats:
                 try:
                     cat_posts = await self._fetch_category_posts(cat, per_cat + 1, session, http_proxy)
                     posts.extend(cat_posts)
                 except Exception as e:
-                    logger.error(f"WB-парсер: ошибка для категории '{cat}': {e}")
-
-        # Перемешиваем и обрезаем до нужного количества
-        random.shuffle(posts)
-        final = posts[:count]
-
-        logger.info(f"WB-парсер: собрано {len(final)} постов из {count} запрошенных")
-        return final
+                    logger.error(f"WB-парсер (aiohttp): ошибка '{cat}': {e}")
+        return posts
 
     async def _fetch_category_posts(
         self, category: str, limit: int, session: "aiohttp.ClientSession",
