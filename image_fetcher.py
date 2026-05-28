@@ -150,6 +150,17 @@ async def _build_english_query(topic: str, channel_topic: str = "") -> str:
     latin_ratio = len(re.findall(r"[a-zA-Z]", title)) / max(len(title), 1)
     is_english = latin_ratio > 0.6
 
+    # Для игровых каналов — не пытаемся угадать скриншот по теме поста,
+    # а ищем красивую геймерскую картинку. Pexels не знает Minecraft.
+    GAMING_CONTEXTS = {"minecraft", "gaming", "gaming pc"}
+    if channel_context in GAMING_CONTEXTS:
+        queries = {
+            "minecraft": "minecraft game blocks landscape",
+            "gaming pc": "gaming setup pc rgb",
+            "gaming":    "video game controller gamer",
+        }
+        return queries.get(channel_context, "gaming setup")
+
     if is_english:
         # Заголовок на английском — просим Claude извлечь визуальные ключевые слова.
         # Простая фильтрация стоп-слов давала мусор: "rate house" → финансовые фото

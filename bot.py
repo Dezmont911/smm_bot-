@@ -113,11 +113,14 @@ def review_keyboard(post_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✏️ Изменить текст", callback_data=f"edit:{post_id}"),
-            InlineKeyboardButton("🖼 Картинку", callback_data=f"image:{post_id}"),
+            InlineKeyboardButton("🖼 Картинку",        callback_data=f"image:{post_id}"),
         ],
         [
             InlineKeyboardButton("🔄 Перегенерировать", callback_data=f"regen:{post_id}"),
-            InlineKeyboardButton("🗑 Удалить", callback_data=f"delete:{post_id}"),
+            InlineKeyboardButton("🗑 Удалить",           callback_data=f"delete:{post_id}"),
+        ],
+        [
+            InlineKeyboardButton("📤 Опубликовать сейчас", callback_data=f"postnow:{post_id}"),
         ],
     ])
 
@@ -1244,6 +1247,37 @@ async def handle_post_actions(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return WAITING_EDITED_TEXT
 
+    elif action == "postnow":
+        # Публикуем этот конкретный пост немедленно
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT channel_id FROM posts WHERE id = ? AND status = 'ready'",
+                (post_id,),
+            ).fetchone()
+        if not row:
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.message.reply_text("❌ Пост не найден или уже опубликован.")
+            return
+        channel_id = row["channel_id"]
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⏳ Публикую...", callback_data="done")
+        ]]))
+        # Публикуем напрямую через poster
+        post_data = dict(db.connect().__enter__().execute(
+            "SELECT * FROM posts WHERE id = ?", (post_id,)
+        ).fetchone())
+        success = await poster._publish(post_data)
+        if success:
+            buffer.mark_published(post_id)
+            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Опубликовано!", callback_data="done")
+            ]]))
+            logger.info(f"Пост опубликован вручную из /review: {post_id[:8]}")
+        else:
+            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Ошибка публикации", callback_data="done")
+            ]]))
+
     elif action == "done":
         pass  # уже обработано, ничего не делаем
 
@@ -1794,7 +1828,7 @@ def main():
     ))
 
     # --- Кнопки: редактирование постов ---
-    app.add_handler(CallbackQueryHandler(handle_post_actions, pattern="^(delete|image|regen|done):"))
+    app.add_handler(CallbackQueryHandler(handle_post_actions, pattern="^(delete|image|regen|done|postnow):"))
 
     # --- Кнопки: превью поста ---
     app.add_handler(CallbackQueryHandler(handle_preview_actions, pattern="^preview_(queue|now|regen|discard):"))
