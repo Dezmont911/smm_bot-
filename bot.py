@@ -1424,7 +1424,7 @@ async def _generate_and_post_after_ad(bot, channel_id: str):
                     f"Канал: {channel_id}\n"
                     f"Формат: {post.get('format', '?')}\n"
                     f"Буфер был пуст — сгенерировал и опубликовал автоматически.\n\n"
-                    f"💡 Рекомендую запустить /generate чтобы пополнить буфер."
+                    f"💡 Рекомендую запустить /generate {channel_id} чтобы пополнить буфер."
                 ),
                 parse_mode=ParseMode.HTML,
             )
