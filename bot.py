@@ -556,13 +556,13 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     lines = ["📊 <b>Состояние буферов</b>\n"]
+    need_generation = []  # каналы где нужна генерация
 
     for ch in channels:
         ch_id = ch["channel_id"]
         level = buffer.get_ready_count(ch_id)
         status = buffer.check_status(ch_id)
 
-        # Иконка по статусу
         icon = {"ok": "✅", "low": "⚠️", "emergency": "🔴", "critical": "🚨"}.get(status, "❓")
 
         lines.append(
@@ -570,7 +570,24 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"   В очереди: {level} постов\n"
         )
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        if status in ("emergency", "critical", "low"):
+            need_generation.append(ch_id)
+
+    # Кнопки генерации для каналов с малым буфером
+    keyboard = None
+    if need_generation:
+        lines.append("——\n⚡ <i>Нажми чтобы пополнить буфер:</i>")
+        buttons = [
+            [InlineKeyboardButton(f"⚡ Генерировать {ch_id}", callback_data=f"gen_channel:{ch_id}")]
+            for ch_id in need_generation
+        ]
+        keyboard = InlineKeyboardMarkup(buttons)
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
 
 
 async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -685,6 +702,29 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
 
+async def handle_gen_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопки '⚡ Генерировать @channel' из /status."""
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    channel_id = query.data.split(":", 1)[1]
+    await query.edit_message_reply_markup(reply_markup=None)  # убираем кнопки
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=(
+            f"⏳ <b>Генерация для {channel_id} запущена в фоне</b>\n"
+            f"Пришлю результат когда готово."
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+    asyncio.create_task(
+        _run_generation_background(context.bot, query.message.chat_id, force=True, channel_id=channel_id)
+    )
+
+
 async def cmd_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Запускает генерацию контента в фоне — бот не зависает."""
     if not is_admin(update.effective_user.id):
@@ -735,9 +775,32 @@ async def _regen_one_post(bot, chat_id: int, channel_id: str):
         await bot.send_message(chat_id=chat_id, text=f"❌ Ошибка: {e}")
 
 
-async def _run_generation_background(bot, chat_id: int, force: bool = False):
-    """Фоновая задача генерации — отправляет результат когда готово."""
+async def _run_generation_background(bot, chat_id: int, force: bool = False, channel_id: str = None):
+    """
+    Фоновая задача генерации — отправляет результат когда готово.
+    channel_id: если указан — генерируем только для этого канала.
+    """
     try:
+        if channel_id:
+            # Генерация для одного конкретного канала
+            channels = load_all_channels()
+            channel = next((c for c in channels if c["channel_id"] == channel_id), None)
+            if not channel:
+                await bot.send_message(chat_id=chat_id, text=f"❌ Канал {channel_id} не найден.")
+                return
+            result = await generator.run_for_channel(channel, force=force)
+            generated = result.get("generated", 0)
+            sources = ", ".join(result.get("sources_used", [])) or "нет тем"
+            text = (
+                f"✅ <b>Генерация для {channel_id} завершена!</b>\n\n"
+                f"Постов создано: {generated}\n"
+                f"Источники: {sources}\n\n"
+                f"Посты добавлены в очередь и будут публиковаться по расписанию."
+            )
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+            return
+
+        # Генерация для всех каналов
         result = await generator.run_morning_batch(force=force)
 
         # Формируем детальный отчёт по каналам
@@ -1722,6 +1785,12 @@ def main():
     app.add_handler(CallbackQueryHandler(
         handle_delete_posts_confirm,
         pattern="^(delete_all_confirm:|delete_all_cancel)",
+    ))
+
+    # --- Кнопки: генерация для конкретного канала из /status ---
+    app.add_handler(CallbackQueryHandler(
+        handle_gen_channel,
+        pattern="^gen_channel:",
     ))
 
     # --- Кнопки: редактирование постов ---
