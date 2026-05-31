@@ -1,0 +1,50 @@
+{
+  "channel_id": "@steam_arti",
+  "name": "Общие аккаунты Steam",
+  "topic": "Канал публикует новости о играх в Steam, релизы, скидки, обзоры и раздачи аккаунтов со скидками на игры. Контент ориентирован на геймеров, следящих за актуальными предложениями платформы.",
+  "tone": "информационный, развлекательный, ориентированный на сообщество геймеров",
+  "channel_type": "content",
+  "daily_posts_count": 1,
+  "rss_sources": [
+    "https://dtf.ru/rss",
+    "https://3dnews.ru/news/rss/",
+    "https://vc.ru/rss",
+    "https://lenta.ru/rss",
+    "https://www.gamespot.com/feeds/news/"
+  ],
+  "evergreen_topics": [
+    "Новые релизы игр в Steam",
+    "Скидки и распродажи на игры",
+    "Обзоры и сравнения игр",
+    "Новости индустрии видеоигр",
+    "Трейлеры и анонсы предстоящих проектов",
+    "История развития игровых франшиз",
+    "Механики и геймплей популярных игр",
+    "События в игровом сообществе",
+    "Персоналии в игровой индустрии",
+    "Платформа Steam и её обновления"
+  ],
+  "forbidden_topics": [],
+  "audience": "широкая аудитория",
+  "post_length": "100–200 слов",
+  "use_emoji": true,
+  "active": true,
+  "post_formats": [
+    "совет дня",
+    "факт/статистика",
+    "вопрос аудитории",
+    "мини-разбор",
+    "инфоповод"
+  ],
+  "example_posts": [],
+  "use_images": false,
+  "image_keywords": [],
+  "web_sources": [
+    "https://www.reddit.com/r/steam/.rss",
+    "https://www.reddit.com/r/gamedeals/.rss",
+    "https://www.reddit.com/r/pcgaming/.rss",
+    "https://medium.com/feed/tag/gaming",
+    "https://medium.com/feed/tag/steam"
+  ],
+  "image_source": "auto"
+}

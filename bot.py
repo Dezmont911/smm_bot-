@@ -22,6 +22,7 @@ bot.py — Главный файл: Telegram бот администратора
 
 import asyncio
 import json
+import re
 import warnings
 from pathlib import Path
 from datetime import datetime, timezone
@@ -59,6 +60,7 @@ from ui import (
     ui_router,
     screen_main,
     handle_settings_text_input,
+    handle_img_test_input,
     MENU_KEYBOARD,
 )
 
@@ -74,6 +76,8 @@ ADD_HANDLE, ADD_NAME, ADD_TOPIC, ADD_TONE, ADD_FORBIDDEN, ADD_RSS_CONFIRM, ADD_P
 ADD_CHOOSE_METHOD, ADD_WAITING_EXPORT, ADD_EXPORT_HANDLE, ADD_EXPORT_CONFIRM, ADD_CHANNEL_TYPE = range(17, 22)
 # Шаги настройки картинок и WB-категорий
 ADD_IMAGE_SOURCE, ADD_REDDIT_SUBS, ADD_WB_CATEGORIES = range(22, 25)
+# Добавление по @username через Telethon-юзербота (авто-анализ)
+ADD_USERNAME, ADD_USERNAME_CONFIRM = range(25, 27)
 
 
 # ============================================================
@@ -82,7 +86,21 @@ ADD_IMAGE_SOURCE, ADD_REDDIT_SUBS, ADD_WB_CATEGORIES = range(22, 25)
 
 def is_admin(user_id: int) -> bool:
     """Проверяет что команду отправил администратор."""
-    return user_id == cfg.ADMIN_CHAT_ID
+    return user_id in cfg.ADMIN_CHAT_IDS
+
+
+def safe_slug(channel_id: str) -> str:
+    """
+    Превращает handle канала в безопасное имя файла.
+    Убирает @ и всё, что не буква/цифра/_/-/. — защита от path traversal
+    (например '../../etc/passwd' → 'etcpasswd').
+    Telegram-хендлы и так состоят только из [A-Za-z0-9_], так что
+    нормальные имена не страдают.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "", channel_id.lstrip("@"))
+    if not cleaned:
+        raise ValueError(f"Недопустимый handle канала: {channel_id!r}")
+    return cleaned
 
 
 def load_all_channels() -> list[dict]:
@@ -144,13 +162,40 @@ def review_keyboard(post_id: str) -> InlineKeyboardMarkup:
 # Управление каналами — сохранение/удаление
 # ============================================================
 
+def clamp_channel_fields(channel: dict) -> dict:
+    """
+    Обрезает и чистит текстовые поля карточки канала по лимитам FIELD_LIMITS.
+    Защита от раздувания контекста и промт-инъекций через поля канала.
+    Меняет словарь на месте и возвращает его.
+    """
+    from ai_client import sanitize_field, FIELD_LIMITS
+
+    for key in ("name", "topic", "audience", "tone", "post_length"):
+        if channel.get(key):
+            limit = FIELD_LIMITS.get(key, 300)
+            channel[key] = sanitize_field(channel[key], limit)
+
+    if isinstance(channel.get("forbidden_topics"), list):
+        channel["forbidden_topics"] = [
+            sanitize_field(t, FIELD_LIMITS["forbidden"])
+            for t in channel["forbidden_topics"][:15]
+        ]
+    if isinstance(channel.get("example_posts"), list):
+        channel["example_posts"] = [
+            sanitize_field(t, FIELD_LIMITS["example"])
+            for t in channel["example_posts"][:5]
+        ]
+    return channel
+
+
 def save_channel_card(channel: dict):
     """
     Сохраняет карточку канала в JSON файл и регистрирует в БД.
     Имя файла = handle без @ (например finance_channel.json).
     """
+    clamp_channel_fields(channel)  # защита: обрезаем поля до лимитов
     channels_dir = Path(__file__).parent / "channels"
-    handle_clean = channel["channel_id"].lstrip("@")
+    handle_clean = safe_slug(channel["channel_id"])
     file_path = channels_dir / f"{handle_clean}.json"
 
     # Сохраняем JSON
@@ -174,7 +219,7 @@ def save_channel_card(channel: dict):
 def deactivate_channel(channel_id: str):
     """Деактивирует канал — ставит active=false в JSON и БД."""
     channels_dir = Path(__file__).parent / "channels"
-    handle_clean = channel_id.lstrip("@")
+    handle_clean = safe_slug(channel_id)
     file_path = channels_dir / f"{handle_clean}.json"
 
     if file_path.exists():
@@ -243,25 +288,39 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начинает диалог добавления нового канала — предлагает выбор метода."""
+    """Начинает диалог добавления нового канала — предлагает выбор метода.
+    Работает и как команда /add, и как callback от кнопки 'Добавить канал'.
+    """
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
 
     context.user_data.clear()
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("📂 Загрузить экспорт Telegram", callback_data="addmethod:export"),
-        InlineKeyboardButton("✏️ Описать вручную",           callback_data="addmethod:manual"),
-    ]])
-    await update.message.reply_text(
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 По ссылке / @username (авто)", callback_data="addmethod:username")],
+        [InlineKeyboardButton("✏️ Описать вручную",              callback_data="addmethod:manual")],
+        [InlineKeyboardButton("📂 Загрузить экспорт Telegram",   callback_data="addmethod:export")],
+    ])
+    text = (
         "➕ <b>Добавление канала</b>\n\n"
         "Как хочешь настроить канал?\n\n"
-        "📂 <b>Экспорт Telegram</b> — скинь <code>result.json</code> из Telegram Desktop, "
-        "и бот сам определит тему, тон, тип канала и вечнозелёные темы.\n\n"
+        "🔍 <b>По ссылке / @username</b> — просто пришли ссылку или @username "
+        "публичного канала. Бот сам прочитает его и определит тему, стиль, тон "
+        "и источники. <b>Рекомендуется.</b>\n\n"
         "✏️ <b>Вручную</b> — пошаговый диалог с вопросами.\n\n"
-        "/cancel — отменить",
-        parse_mode=ParseMode.HTML,
-        reply_markup=keyboard,
+        "📂 <b>Экспорт Telegram</b> — файл <code>result.json</code> из Telegram Desktop.\n\n"
+        "/cancel — отменить"
     )
+
+    # Поддержка и команды /add, и нажатия inline-кнопки
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.message.reply_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+        )
+    else:
+        await update.message.reply_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+        )
     return ADD_CHOOSE_METHOD
 
 
@@ -297,6 +356,7 @@ async def cmd_add_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Шаг 2/5: Как называется канал?\n"
         f"Например: <i>Финансы для людей</i>",
         parse_mode=ParseMode.HTML,
+        reply_markup=_add_cancel_kb(),
     )
     return ADD_NAME
 
@@ -309,6 +369,7 @@ async def cmd_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Шаг 3/5: <b>Тема канала</b> — о чём пишем?\n"
         f"Например: <i>личные финансы, инвестиции, сбережения</i>",
         parse_mode=ParseMode.HTML,
+        reply_markup=_add_cancel_kb(),
     )
     return ADD_TOPIC
 
@@ -322,10 +383,13 @@ async def cmd_add_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📝 <b>Контент</b> — пишем посты: новости, советы, факты, разборы\n"
         "🛍 <b>Маркетплейс</b> — постим товары с WB/Ozon (цена, фото, ссылка)",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("📝 Контент-канал",     callback_data="channeltype:content"),
-            InlineKeyboardButton("🛍 Маркетплейс WB/Ozon", callback_data="channeltype:marketplace"),
-        ]]),
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📝 Контент-канал",        callback_data="channeltype:content"),
+                InlineKeyboardButton("🛍 Маркетплейс WB/Ozon",  callback_data="channeltype:marketplace"),
+            ],
+            [InlineKeyboardButton("❌ Отменить", callback_data="add_cancel_inline")],
+        ]),
     )
     return ADD_CHANNEL_TYPE
 
@@ -338,6 +402,7 @@ async def cmd_add_tone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Шаг 5/5: <b>Запрещённые темы</b> — что нельзя упоминать?\n"
         f"Перечисли через запятую или напиши <i>нет</i>",
         parse_mode=ParseMode.HTML,
+        reply_markup=_add_cancel_kb(),
     )
     return ADD_FORBIDDEN
 
@@ -371,6 +436,7 @@ async def cmd_add_forbidden(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Подтверди или пришли свои URL через запятую.\n"
         f"Напиши <b>ок</b> чтобы принять предложенные.",
         parse_mode=ParseMode.HTML,
+        reply_markup=_add_cancel_kb(),
     )
     return ADD_RSS_CONFIRM
 
@@ -423,13 +489,29 @@ async def cmd_add_rss_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
         "• <b>Pexels/Unsplash</b> — стоковые фото по ключевым словам (хорошо для бизнеса, лайфстайл)\n"
         "• <b>Без картинок</b> — только текст",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🎮 Reddit", callback_data="imgsource:reddit"),
-            InlineKeyboardButton("📸 Pexels/Unsplash", callback_data="imgsource:stock"),
-            InlineKeyboardButton("🚫 Без картинок", callback_data="imgsource:none"),
-        ]]),
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🎮 Reddit",              callback_data="imgsource:reddit"),
+                InlineKeyboardButton("📸 Pexels/Unsplash",     callback_data="imgsource:stock"),
+                InlineKeyboardButton("🚫 Без картинок",        callback_data="imgsource:none"),
+            ],
+            [InlineKeyboardButton("❌ Отменить", callback_data="add_cancel_inline")],
+        ]),
     )
     return ADD_IMAGE_SOURCE
+
+
+def _derive_image_keywords(topic: str, name: str = "") -> list[str]:
+    """Короткие ключевые слова для поиска картинок (анкор к теме канала).
+
+    Берёт только КОРОТКИЕ фрагменты темы (≤3 слов, ≤30 симв). Если тема —
+    это описание-предложение ("Канал публикует ..."), такие длинные части
+    отбрасываются и возвращается [], чтобы не засорять запрос к Pexels:
+    тогда image_fetcher сам построит чистый запрос через Claude.
+    """
+    parts = [p.strip() for p in (topic or "").split(",") if p.strip()]
+    keywords = [p for p in parts if len(p.split()) <= 3 and len(p) <= 30]
+    return keywords[:3]
 
 
 async def handle_add_image_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -445,22 +527,26 @@ async def handle_add_image_source(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text(
             "🚫 Картинки отключены — посты будут только текстовые.\n\n"
             "Сколько постов генерировать в день?",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("4 поста", callback_data="postscount:4"),
-                InlineKeyboardButton("10 постов", callback_data="postscount:10"),
-                InlineKeyboardButton("20 постов", callback_data="postscount:20"),
-            ]]),
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("4 поста",    callback_data="postscount:4"),
+                    InlineKeyboardButton("10 постов",  callback_data="postscount:10"),
+                    InlineKeyboardButton("20 постов",  callback_data="postscount:20"),
+                ],
+                [InlineKeyboardButton("❌ Отменить", callback_data="add_cancel_inline")],
+            ]),
         )
         return ADD_POSTS_COUNT
 
     elif source == "stock":
         ch["use_images"] = True
         ch["image_source"] = "stock"
-        # Ключевые слова — из темы канала
-        ch["image_keywords"] = [t.strip() for t in ch.get("topic", "").split(",")][:3]
+        # Ключевые слова — короткий анкор из темы (без описаний-предложений)
+        ch["image_keywords"] = _derive_image_keywords(ch.get("topic", ""), ch.get("name", ""))
+        kw_label = ", ".join(ch["image_keywords"]) if ch["image_keywords"] else "(по теме автоматически)"
         await query.edit_message_text(
             f"📸 Pexels/Unsplash выбран.\n"
-            f"Ключевые слова для поиска: <b>{', '.join(ch['image_keywords'])}</b>\n"
+            f"Ключевые слова для поиска: <b>{kw_label}</b>\n"
             f"(можно поменять позже через карточку канала)\n\n"
             f"Сколько постов генерировать в день?",
             parse_mode=ParseMode.HTML,
@@ -484,6 +570,7 @@ async def handle_add_image_source(update: Update, context: ContextTypes.DEFAULT_
             "• Аниме: <code>anime, Animemes, manga</code>\n"
             "• Общее: <code>gaming, pcgaming</code>",
             parse_mode=ParseMode.HTML,
+            reply_markup=_add_cancel_kb(),
         )
         return ADD_REDDIT_SUBS
 
@@ -540,6 +627,10 @@ async def cmd_add_posts_count(update: Update, context: ContextTypes.DEFAULT_TYPE
         "use_emoji": True,
         "active": True,
         "example_posts": [],
+        # Новый канал НЕ постит по умолчанию — расписание включается вручную
+        # через /schedule @channel on (или установкой часов). Так нет «дефолтных»
+        # 09/12/16/20, которые раньше включались сами.
+        "schedule_disabled": True,
     }
 
     if channel_type == "marketplace":
@@ -552,13 +643,25 @@ async def cmd_add_posts_count(update: Update, context: ContextTypes.DEFAULT_TYPE
         # use_images и image_keywords уже выставлены на шаге ADD_IMAGE_SOURCE
         # Но добавим fallback на случай если шаг был пропущен
         if "use_images" not in ch:
-            base_defaults["use_images"] = False
+            base_defaults["use_images"] = True
         if "image_keywords" not in ch:
-            base_defaults["image_keywords"] = [t.strip() for t in ch.get("topic", "").split(",")][:3]
+            base_defaults["image_keywords"] = _derive_image_keywords(
+                ch.get("topic", ""), ch.get("name", "")
+            )
 
     # update() не перезапишет уже установленные ключи в ch — используем reversed merge
     for k, v in base_defaults.items():
         ch.setdefault(k, v)
+
+    # Авто-определение архетипа (стиль) и источника тем по описанию — для контента
+    if channel_type == "content" and "archetype" not in ch:
+        from channel_analyzer import classify_channel
+        meta = await classify_channel(ch.get("name", ""), ch.get("topic", ""))
+        ch["archetype"] = meta["archetype"]
+        # topic_source ставим только если уверенность приличная; иначе оставляем rss
+        if meta["confidence"] >= 0.6:
+            ch.setdefault("topic_source", meta["topic_source"])
+        ch.setdefault("topic_source", "rss")
 
     save_channel_card(ch)
 
@@ -569,17 +672,32 @@ async def cmd_add_posts_count(update: Update, context: ContextTypes.DEFAULT_TYPE
     eg_count = len(ch.get("evergreen_topics", []))
     ch_type_label = "🛍 Маркетплейс" if channel_type == "marketplace" else "📝 Контент"
 
+    # Строка про авто-определённый стиль и источник тем (для контент-каналов)
+    meta_line = ""
+    if channel_type == "content":
+        from archetypes import ARCHETYPE_LABELS
+        arch_label = ARCHETYPE_LABELS.get(ch.get("archetype", "default"), ch.get("archetype", "default"))
+        src_label = "🌐 веб-поиск" if ch.get("topic_source") == "search" else "📡 RSS"
+        meta_line = f"Стиль: {arch_label}\nИсточник тем: {src_label}\n"
+
+    channel_id_added = ch['channel_id']
     await query.edit_message_text(
         f"🎉 <b>Канал добавлен!</b>\n\n"
-        f"Handle: {ch['channel_id']}\n"
+        f"Handle: {channel_id_added}\n"
         f"Название: {ch['name']}\n"
         f"Тип: {ch_type_label}\n"
         f"Тема: {ch.get('topic', '—')}\n"
         f"Постов в день: {count}\n"
+        + meta_line
         + (f"RSS-источников: {rss_count}\nВечнозелёных тем: {eg_count}\n" if channel_type == "content" else "") +
-        f"\n<b>Следующие шаги:</b>\n"
-        f"1. Добавь бота администратором в канал {ch['channel_id']}\n"
-        f"2. Запусти /generate чтобы создать первые посты",
+        f"\n⏸ Автопубликация <b>выключена</b> — включи расписание:\n"
+        f"<code>/schedule {channel_id_added} 09 12 16 20</code>\n"
+        f"\n⚠️ Добавь бота администратором в <code>{channel_id_added}</code>",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚡ Сгенерировать первые посты", callback_data=f"ui:ch_generate:{channel_id_added}")],
+            [InlineKeyboardButton("⚙️ Настройки канала",           callback_data=f"ui:ch_settings:{channel_id_added}")],
+            [InlineKeyboardButton("◀️ В меню",                     callback_data="ui:main")],
+        ]),
         parse_mode=ParseMode.HTML,
     )
     context.user_data.clear()
@@ -593,10 +711,36 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+def _add_cancel_kb() -> InlineKeyboardMarkup:
+    """Кнопка отмены для каждого шага диалога добавления канала."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Отменить", callback_data="add_cancel_inline"),
+    ]])
+
+
 async def cmd_add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отменяет добавление канала."""
+    """Отменяет добавление канала (команда /cancel)."""
     context.user_data.clear()
-    await update.message.reply_text("❌ Добавление канала отменено.")
+    await update.message.reply_text(
+        "❌ Добавление канала отменено.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ В меню", callback_data="ui:main"),
+        ]]),
+    )
+    return ConversationHandler.END
+
+
+async def cmd_add_cancel_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отменяет добавление канала (inline-кнопка)."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data.clear()
+    await query.edit_message_text(
+        "❌ Добавление канала отменено.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ В меню", callback_data="ui:main"),
+        ]]),
+    )
     return ConversationHandler.END
 
 
@@ -609,7 +753,18 @@ async def handle_add_method_choice(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
 
-    method = query.data.split(":")[1]  # "export" или "manual"
+    method = query.data.split(":")[1]  # "username" / "export" / "manual"
+
+    if method == "username":
+        await query.edit_message_text(
+            "🔍 <b>Добавление по ссылке / @username</b>\n\n"
+            "Пришли ссылку или @username <b>публичного</b> канала.\n"
+            "Например: <code>@durov</code> или <code>https://t.me/durov</code>\n\n"
+            "Бот прочитает канал через юзербота и сам всё определит.\n\n"
+            "/cancel — отменить",
+            parse_mode=ParseMode.HTML,
+        )
+        return ADD_USERNAME
 
     if method == "export":
         await query.edit_message_text(
@@ -718,10 +873,13 @@ async def handle_export_upload(update: Update, context: ContextTypes.DEFAULT_TYP
         return ADD_WAITING_EXPORT
 
     except Exception as e:
-        logger.error(f"Ошибка анализа экспорта: {e}")
+        import traceback
+        logger.error(f"Ошибка анализа экспорта: {e}\n{traceback.format_exc()}")
         await msg.edit_text(
-            "❌ Не удалось проанализировать файл. Проверь логи.\n"
-            "/cancel — отменить"
+            f"❌ Не удалось проанализировать файл.\n\n"
+            f"<code>{type(e).__name__}: {str(e)[:200]}</code>\n\n"
+            "/cancel — отменить",
+            parse_mode=ParseMode.HTML,
         )
         return ADD_WAITING_EXPORT
 
@@ -826,29 +984,249 @@ async def handle_export_confirm(update: Update, context: ContextTypes.DEFAULT_TY
         "active": True,
         "post_formats": ["совет дня", "факт/статистика", "вопрос аудитории", "мини-разбор", "инфоповод"],
         "example_posts": [],
-        "use_images": False,
+        "use_images": True,
         "image_keywords": [],
+        # Новый канал не постит по умолчанию — расписание включается через /schedule
+        "schedule_disabled": True,
     }
 
     # Marketplace-специфика
     if channel_type == "marketplace":
         channel_card["post_formats"] = ["wb_product"]
+        channel_card["use_images"] = False
+    else:
+        # Архетип (стиль) и источник тем — из анализа постов (нормализуем)
+        from channel_analyzer import normalize_meta
+        arch, src = normalize_meta(analysis.get("archetype"), analysis.get("topic_source"))
+        channel_card["archetype"] = arch
+        channel_card["topic_source"] = src
 
     save_channel_card(channel_card)
     buffer.add_evergreen_topics(channel_id, channel_card.get("evergreen_topics", []))
 
     ch_type_label = "🛍 Маркетплейс" if channel_type == "marketplace" else "📝 Контент"
+    meta_line = ""
+    if channel_type == "content":
+        from archetypes import ARCHETYPE_LABELS
+        arch_label = ARCHETYPE_LABELS.get(channel_card.get("archetype", "default"),
+                                          channel_card.get("archetype", "default"))
+        src_label = "🌐 веб-поиск" if channel_card.get("topic_source") == "search" else "📡 RSS"
+        meta_line = f"Стиль: {arch_label}\nИсточник тем: {src_label}\n"
     await query.edit_message_text(
         f"🎉 <b>Канал добавлен!</b>\n\n"
         f"Handle: {channel_id}\n"
         f"Тип: {ch_type_label}\n"
         f"Тема: {channel_card['topic'][:80]}\n"
         f"Постов в день: {channel_card['daily_posts_count']}\n"
+        + meta_line +
         f"RSS-источников: {len(rss_urls)}\n"
         f"Вечнозелёных тем: {len(channel_card['evergreen_topics'])}\n\n"
-        f"<b>Следующие шаги:</b>\n"
-        f"1. Добавь бота администратором в <code>{channel_id}</code>\n"
-        f"2. Запусти /generate для первых постов",
+        f"⏸ Автопубликация <b>выключена</b> — включи расписание:\n"
+        f"<code>/schedule {channel_id} 09 12 16 20</code>\n\n"
+        f"⚠️ Добавь бота администратором в <code>{channel_id}</code>",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚡ Сгенерировать первые посты", callback_data=f"ui:ch_generate:{channel_id}")],
+            [InlineKeyboardButton("⚙️ Настройки канала",           callback_data=f"ui:ch_settings:{channel_id}")],
+            [InlineKeyboardButton("◀️ В меню",                     callback_data="ui:main")],
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# ============================================================
+# /add — авто-добавление по @username через Telethon-юзербота
+# ============================================================
+
+async def _create_channel_from_analysis(analysis: dict, channel_id: str, display_name: str) -> tuple[dict, list]:
+    """Собирает и сохраняет карточку канала из результата анализа.
+    Общая логика для экспорт- и username-пути. Возвращает (карточка, rss_urls)."""
+    from ai_client import suggest_rss_sources
+    from channel_analyzer import normalize_meta
+
+    channel_type = analysis.get("channel_type", "content")
+    rss_urls = []
+    if channel_type == "content":
+        kw_list = analysis.get("rss_keywords", [])
+        if kw_list:
+            try:
+                topic_for_rss = analysis.get("topic", " ".join(kw_list[:3]))
+                rss_urls = await suggest_rss_sources(topic_for_rss, display_name)
+            except Exception as e:
+                logger.warning(f"RSS suggest ошибка: {e}")
+
+    card = {
+        "channel_id": channel_id,
+        "name": display_name or channel_id,
+        "topic": analysis.get("topic", ""),
+        "tone": analysis.get("tone", "информационный"),
+        "channel_type": channel_type,
+        "daily_posts_count": analysis.get("post_frequency", 4),
+        "rss_sources": rss_urls,
+        "evergreen_topics": analysis.get("evergreen_topics", []),
+        "forbidden_topics": [],
+        "audience": "широкая аудитория",
+        "post_length": "100–200 слов",
+        "use_emoji": True,
+        "active": True,
+        "post_formats": ["совет дня", "факт/статистика", "вопрос аудитории", "мини-разбор", "инфоповод"],
+        "example_posts": [],
+        "use_images": True,
+        "image_keywords": [],
+        # Новый канал не постит по умолчанию — расписание включается через /schedule
+        "schedule_disabled": True,
+    }
+    if channel_type == "marketplace":
+        card["post_formats"] = ["wb_product"]
+        card["use_images"] = False
+    else:
+        arch, src = normalize_meta(analysis.get("archetype"), analysis.get("topic_source"))
+        card["archetype"] = arch
+        card["topic_source"] = src
+
+    save_channel_card(card)
+    buffer.add_evergreen_topics(channel_id, card.get("evergreen_topics", []))
+    return card, rss_urls
+
+
+async def handle_add_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принимает @username/ссылку, читает канал юзерботом и анализирует."""
+    from userbot_reader import read_channel, normalize_handle, UserbotNotAuthorized
+    from channel_analyzer import analyzer
+
+    handle = normalize_handle(update.message.text or "")
+    if not handle or handle == "@":
+        await update.message.reply_text(
+            "⚠️ Не похоже на username. Пришли, например, <code>@durov</code>.\n/cancel — отменить",
+            parse_mode=ParseMode.HTML,
+        )
+        return ADD_USERNAME
+
+    # Уже добавлен?
+    if any(ch["channel_id"].lower() == handle.lower() for ch in load_all_channels()):
+        await update.message.reply_text(
+            f"❌ Канал {handle} уже добавлен.\n/cancel — отменить"
+        )
+        return ADD_USERNAME
+
+    msg = await update.message.reply_text("🔎 Анализирую канал…")
+
+    try:
+        data = await read_channel(handle, limit=50)
+    except UserbotNotAuthorized:
+        await msg.edit_text(
+            "❌ Юзербот не авторизован — авто-чтение недоступно.\n"
+            "Добавь канал вручную (✏️) или через экспорт (📂).\n/cancel — отменить"
+        )
+        return ADD_USERNAME
+    except ValueError as e:
+        await msg.edit_text(f"❌ {e}\n\nПопробуй другой username или /cancel.")
+        return ADD_USERNAME
+    except Exception as e:
+        logger.error(f"Чтение канала {handle} не удалось: {e}")
+        await msg.edit_text(
+            f"❌ Не удалось прочитать канал: {e}\n\nПопробуй ещё раз или /cancel."
+        )
+        return ADD_USERNAME
+
+    if data["post_count"] < 3:
+        await msg.edit_text(
+            f"❌ В канале {handle} мало текстовых постов ({data['post_count']}) — "
+            f"не хватает для анализа.\nДобавь вручную (✏️) или пришли другой канал.\n/cancel"
+        )
+        return ADD_USERNAME
+
+    try:
+        analysis = await analyzer.analyze_posts(
+            data["title"], data["posts"], about=data["about"]
+        )
+    except Exception as e:
+        logger.error(f"Анализ {handle} не удался: {e}")
+        await msg.edit_text(f"❌ Ошибка анализа: {e}\n/cancel — отменить")
+        return ADD_USERNAME
+
+    # Сохраняем в user_data для подтверждения
+    real_handle = data["handle"]
+    context.user_data["uname_analysis"] = analysis
+    context.user_data["uname_handle"] = real_handle
+    context.user_data["uname_title"] = data["title"]
+
+    ch_type_label = (
+        "🛍 Маркетплейс (WB/Ozon)" if analysis.get("channel_type") == "marketplace"
+        else "📝 Контент-канал"
+    )
+    from archetypes import ARCHETYPE_LABELS
+    arch_label = ARCHETYPE_LABELS.get(analysis.get("archetype", "default"), analysis.get("archetype", "default"))
+    src_label = "🌐 веб-поиск" if analysis.get("topic_source") == "search" else "📡 по лентам"
+    conf_pct = int(analysis.get("confidence", 0.8) * 100)
+    topics_preview = "\n".join(f"  • {t}" for t in analysis.get("evergreen_topics", [])[:5])
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Добавить канал", callback_data="usernameconfirm:yes")],
+        [InlineKeyboardButton("❌ Отмена",          callback_data="usernameconfirm:no")],
+    ])
+    await msg.edit_text(
+        f"✅ <b>Анализ канала готов</b> (изучено постов: {analysis.get('analyzed_posts', '?')}, "
+        f"уверенность: {conf_pct}%)\n\n"
+        f"📌 <b>Канал:</b> {data['title']}  <code>{real_handle}</code>\n"
+        f"🏷 <b>Тип:</b> {ch_type_label}\n"
+        f"📝 <b>Тема:</b> {analysis.get('topic', '?')}\n"
+        f"🎭 <b>Стиль:</b> {arch_label}\n"
+        f"📰 <b>Источник тем:</b> {src_label}\n"
+        f"📊 <b>Частота:</b> ~{analysis.get('post_frequency', 4)} поста/день\n"
+        f"💡 <b>Постоянные темы:</b>\n{topics_preview}\n\n"
+        f"Добавить с этими настройками? (тему и расписание можно изменить позже)",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+    return ADD_USERNAME_CONFIRM
+
+
+async def handle_username_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждение создания канала, добавленного по username."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data.split(":")[1] == "no":
+        context.user_data.clear()
+        await query.edit_message_text("❌ Добавление канала отменено.")
+        return ConversationHandler.END
+
+    analysis = context.user_data.get("uname_analysis", {})
+    handle = context.user_data.get("uname_handle")
+    title = context.user_data.get("uname_title", handle)
+    if not analysis or not handle:
+        await query.edit_message_text("❌ Данные устарели, начни заново: /add")
+        return ConversationHandler.END
+
+    card, rss_urls = await _create_channel_from_analysis(analysis, handle, title)
+
+    ch_type_label = "🛍 Маркетплейс" if card.get("channel_type") == "marketplace" else "📝 Контент"
+    meta_line = ""
+    if card.get("channel_type") == "content":
+        from archetypes import ARCHETYPE_LABELS
+        arch_label = ARCHETYPE_LABELS.get(card.get("archetype", "default"), card.get("archetype", "default"))
+        src_label = "🌐 веб-поиск" if card.get("topic_source") == "search" else "📡 по лентам"
+        meta_line = f"Стиль: {arch_label}\nИсточник тем: {src_label}\n"
+
+    await query.edit_message_text(
+        f"🎉 <b>Канал добавлен!</b>\n\n"
+        f"Handle: {handle}\n"
+        f"Название: {title}\n"
+        f"Тип: {ch_type_label}\n"
+        f"Тема: {card.get('topic', '—')[:80]}\n"
+        f"Постов в день: {card.get('daily_posts_count')}\n"
+        + meta_line
+        + (f"Лент подобрано: {len(rss_urls)}\n" if card.get("channel_type") == "content" else "") +
+        f"\n⏸ Автопубликация <b>выключена</b> — включи расписание:\n"
+        f"<code>/schedule {handle} 09 12 16 20</code>\n"
+        f"\n⚠️ Чтобы бот мог публиковать, добавь его администратором в <code>{handle}</code>",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚡ Сгенерировать первые посты", callback_data=f"ui:ch_generate:{handle}")],
+            [InlineKeyboardButton("⚙️ Настройки канала",           callback_data=f"ui:ch_settings:{handle}")],
+            [InlineKeyboardButton("◀️ В меню",                     callback_data="ui:main")],
+        ]),
         parse_mode=ParseMode.HTML,
     )
     context.user_data.clear()
@@ -1002,9 +1380,10 @@ async def handle_set_topic_text(update: Update, context: ContextTypes.DEFAULT_TY
     if not channel_id:
         return
 
-    new_topic = update.message.text.strip()
+    from ai_client import sanitize_field, FIELD_LIMITS
+    new_topic = sanitize_field(update.message.text, FIELD_LIMITS["topic"])
     channels_dir = Path(__file__).parent / "channels"
-    handle_clean = channel_id.lstrip("@")
+    handle_clean = safe_slug(channel_id)
     file_path = channels_dir / f"{handle_clean}.json"
 
     if file_path.exists():
@@ -1208,7 +1587,11 @@ async def _send_review_page(message, channel_id: str, offset: int):
                 )
                 continue
             except Exception:
-                pass  # картинка битая — покажем без неё
+                # Картинка по ссылке не открылась — честно сообщаем об этом
+                msg_text = msg_text.replace(
+                    "🖼 Есть картинка",
+                    "⚠️ Картинка недоступна (перегенерируется при публикации)",
+                )
 
         await message.reply_text(
             msg_text,
@@ -1272,45 +1655,42 @@ async def handle_gen_channel(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def cmd_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запускает генерацию контента в фоне.
+    """Запускает генерацию для конкретного канала.
 
     Использование:
-      /generate          — генерация для всех каналов
-      /generate @channel — генерация только для одного канала
+      /generate @channel — генерация для одного канала
     """
     if not is_admin(update.effective_user.id):
         return
 
     args = context.args or []
-    channel_id = None
 
-    if args:
-        # Нормализуем handle
-        raw = args[0]
-        channel_id = raw if raw.startswith("@") else f"@{raw}"
-
-        # Проверяем что канал существует
+    if not args:
         channels = load_all_channels()
-        if not any(c["channel_id"] == channel_id for c in channels):
-            await update.message.reply_text(
-                f"❌ Канал <code>{channel_id}</code> не найден.\n"
-                f"Используй /list чтобы увидеть все каналы.",
-                parse_mode=ParseMode.HTML,
-            )
+        if not channels:
+            await update.message.reply_text("Каналов нет. Добавь канал через меню.")
             return
+        lines = ["Укажи канал: <code>/generate @handle</code>\n\nДоступные каналы:"]
+        for ch in channels:
+            lines.append(f"  • <code>/generate {ch['channel_id']}</code>")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        return
 
+    raw = args[0]
+    channel_id = raw if raw.startswith("@") else f"@{raw}"
+
+    channels = load_all_channels()
+    if not any(c["channel_id"] == channel_id for c in channels):
         await update.message.reply_text(
-            f"⏳ <b>Генерация для {channel_id} запущена в фоне</b>\n\n"
-            "Пришлю результат когда готово.",
+            f"❌ Канал <code>{channel_id}</code> не найден.",
             parse_mode=ParseMode.HTML,
         )
-    else:
-        await update.message.reply_text(
-            "⏳ <b>Генерация для всех каналов запущена в фоне</b>\n\n"
-            "Это займёт 1–2 минуты. Пришлю сообщение когда готово.",
-            parse_mode=ParseMode.HTML,
-        )
+        return
 
+    await update.message.reply_text(
+        f"⏳ <b>Генерация для {channel_id} запущена в фоне</b>\n\nПришлю результат когда готово.",
+        parse_mode=ParseMode.HTML,
+    )
     asyncio.create_task(
         _run_generation_background(context.bot, update.effective_chat.id, force=True, channel_id=channel_id)
     )
@@ -1742,6 +2122,168 @@ async def handle_delete_posts_confirm(update: Update, context: ContextTypes.DEFA
 # Обработчики кнопок (одобрение постов)
 # ============================================================
 
+async def handle_img_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обрабатывает выбор способа добавления картинки к посту:
+      upload   — пользователь отправит фото сам
+      auto     — бот подбирает новую картинку автоматически
+      generate — заглушка для будущей генерации через API
+      cancel   — отмена
+    """
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        return
+
+    _, action, post_id = query.data.split(":", 2)
+
+    if action == "upload":
+        # Просим пользователя прислать фото
+        context.user_data["awaiting_image_for"] = post_id
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ Отмена", callback_data=f"img_action:cancel:{post_id}")
+        ]])
+        await query.edit_message_text(
+            "📤 <b>Отправь фото</b>\n\n"
+            "Пришли фото прямо в этот чат — из галереи или скачай с интернета.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+        )
+
+    elif action == "auto":
+        # Ищем новую картинку автоматически через image_fetcher
+        await query.edit_message_text("🔄 Подбираю новую картинку...")
+        try:
+            with db.connect() as conn:
+                row = conn.execute(
+                    "SELECT topic, channel_id FROM posts WHERE id = ?", (post_id,)
+                ).fetchone()
+            if not row:
+                raise ValueError("Пост не найден")
+
+            from image_fetcher import fetch_image_url
+
+            channels = load_all_channels()
+            channel = next((c for c in channels if c["channel_id"] == row["channel_id"]), {})
+            new_url = await fetch_image_url(
+                topic=row["topic"],
+                channel_topic=channel.get("topic", "") if channel else "",
+                subreddits=channel.get("reddit_image_subreddits") if channel else None,
+                channel_name=channel.get("name", "") if channel else "",
+                image_keywords=channel.get("image_keywords") if channel else None,
+            )
+
+            if new_url:
+                with db.connect() as conn:
+                    conn.execute(
+                        "UPDATE posts SET image_url = ? WHERE id = ?", (new_url, post_id)
+                    )
+                channel_id = row["channel_id"]
+                await query.edit_message_text(
+                    "✅ <b>Новая картинка подобрана!</b>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("◀️ К очереди постов", callback_data=f"ui:ch_review:{channel_id}")
+                    ]]),
+                )
+            else:
+                await query.edit_message_text(
+                    "😔 Не удалось найти подходящую картинку.\nПопробуй отправить своё фото.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("📤 Отправить своё фото", callback_data=f"img_action:upload:{post_id}"),
+                        InlineKeyboardButton("◀️ Отмена", callback_data=f"img_action:cancel:{post_id}"),
+                    ]]),
+                )
+        except Exception as e:
+            logger.error(f"Ошибка автоподбора картинки: {e}")
+            await query.edit_message_text(
+                f"❌ Ошибка: {e}",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ Отмена", callback_data=f"img_action:cancel:{post_id}")
+                ]]),
+            )
+
+    elif action == "generate":
+        from image_generator import generate_image
+        if not cfg.FAL_API_KEY:
+            await query.edit_message_text(
+                "🎨 <b>Генерация изображений</b>\n\n"
+                "❌ FAL_API_KEY не задан в .env\n"
+                "Зарегистрируйся на fal.ai и добавь ключ.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ Назад", callback_data=f"img_action:back:{post_id}")
+                ]]),
+            )
+            return
+
+        # Показываем прогресс
+        await query.edit_message_text(
+            "🎨 <b>Генерирую картинку...</b>\n\n"
+            "⚡ FLUX AI работает, обычно 3-10 секунд.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⏳ Генерация...", callback_data="noop")
+            ]]),
+        )
+
+        try:
+            with db.connect() as conn:
+                row = conn.execute(
+                    "SELECT topic, channel_id FROM posts WHERE id=?", (post_id,)
+                ).fetchone()
+
+            channels = load_all_channels()
+            channel = next((c for c in channels if c["channel_id"] == row["channel_id"]), {})
+
+            new_url = await generate_image(
+                topic=row["topic"],
+                channel_topic=channel.get("topic", ""),
+                channel_name=channel.get("name", ""),
+            )
+
+            if new_url:
+                with db.connect() as conn:
+                    conn.execute(
+                        "UPDATE posts SET image_url=?, has_image=1 WHERE id=?",
+                        (new_url, post_id)
+                    )
+                    conn.commit()
+                await query.edit_message_text(
+                    "✅ <b>Картинка сгенерирована!</b>\n\nОткрой пост чтобы увидеть результат.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            "📋 К очереди постов",
+                            callback_data=f"ui:ch_review:{row['channel_id']}"
+                        )
+                    ]]),
+                )
+            else:
+                await query.edit_message_text(
+                    "😔 Не удалось сгенерировать картинку.\nПопробуй ещё раз или загрузи своё фото.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔄 Попробовать снова", callback_data=f"img_action:generate:{post_id}"),
+                        InlineKeyboardButton("📤 Своё фото", callback_data=f"img_action:upload:{post_id}"),
+                    ]]),
+                )
+        except Exception as e:
+            logger.error(f"Ошибка генерации картинки: {e}")
+            await query.edit_message_text(
+                f"❌ Ошибка: {e}",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ Назад", callback_data=f"img_action:back:{post_id}")
+                ]]),
+            )
+
+    elif action in ("cancel", "back"):
+        # Убираем состояние ожидания фото
+        context.user_data.pop("awaiting_image_for", None)
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.delete()
+
+
 async def handle_post_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Обрабатывает кнопки редактирования постов в очереди.
@@ -1757,12 +2299,13 @@ async def handle_post_actions(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if action == "delete":
         buffer.mark_skipped(post_id)
-        await query.edit_message_reply_markup(
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🗑 Удалён из очереди", callback_data="done")
-            ]])
-        )
         logger.info(f"Пост удалён из очереди: {post_id[:8]}")
+        # Удаляем само сообщение с постом — не висит в ленте
+        try:
+            await query.message.delete()
+        except Exception:
+            # Если удалить не удалось — хотя бы убираем кнопки
+            await query.edit_message_reply_markup(reply_markup=None)
 
     elif action == "regen":
         # Удаляем старый пост и запускаем генерацию нового
@@ -1785,15 +2328,27 @@ async def handle_post_actions(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     elif action == "image":
         context.user_data["awaiting_image_for"] = post_id
-        # Сбрасываем состояние редактирования текста чтобы не было конфликта
         context.user_data.pop("editing_post_id", None)
+
+        # Получаем тему поста для автоподбора
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT topic, channel_id FROM posts WHERE id = ?", (post_id,)
+            ).fetchone()
+        topic     = row["topic"]     if row else ""
+        chan_id   = row["channel_id"] if row else ""
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Отправить своё фото", callback_data=f"img_action:upload:{post_id}")],
+            [InlineKeyboardButton("🔄 Подобрать новую автоматически", callback_data=f"img_action:auto:{post_id}")],
+            [InlineKeyboardButton("🎨 Сгенерировать изображение", callback_data=f"img_action:generate:{post_id}")],
+            [InlineKeyboardButton("◀️ Отмена", callback_data=f"img_action:cancel:{post_id}")],
+        ])
         await query.message.reply_text(
-            "🖼 <b>Добавить картинку к посту</b>\n\n"
-            "Два способа:\n"
-            "• <b>Отправь фото</b> прямо сюда (из галереи или скачай с гугла)\n"
-            "• <b>Пришли URL</b> — прямую ссылку на .jpg/.png/.webp\n\n"
-            "/cancel — отменить",
+            "🖼 <b>Картинка для поста</b>\n\n"
+            "Выбери способ:",
             parse_mode=ParseMode.HTML,
+            reply_markup=kb,
         )
 
     elif action == "edit":
@@ -1838,6 +2393,12 @@ async def handle_post_actions(update: Update, context: ContextTypes.DEFAULT_TYPE
             buffer.mark_published(post_id)
             had_image = bool(post_data.get("image_url"))
             if had_image and not pub["used_image"]:
+                # Картинка была, но URL не сработал — чистим из базы
+                with db.connect() as conn:
+                    conn.execute(
+                        "UPDATE posts SET image_url = NULL WHERE id = ?",
+                        (post_id,),
+                    )
                 label = "✅ Опубликовано (без картинки — URL недоступен)"
             else:
                 label = "✅ Опубликовано!"
@@ -1845,6 +2406,12 @@ async def handle_post_actions(update: Update, context: ContextTypes.DEFAULT_TYPE
                 InlineKeyboardButton(label, callback_data="done")
             ]]))
             logger.info(f"Пост опубликован вручную из /review: {post_id[:8]}")
+            # Удаляем карточку поста из чата через 3 секунды
+            await asyncio.sleep(3)
+            try:
+                await query.message.delete()
+            except Exception:
+                pass  # Если не удалось удалить — не страшно
         else:
             await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("❌ Ошибка публикации", callback_data="done")
@@ -1904,6 +2471,10 @@ async def handle_image_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text_msg = update.message.text or ""
     if text_msg.strip() in ("☰ Меню", "☰Меню", "Меню"):
         await screen_main(update.message, context)
+        return
+
+    # Проверяем тест генерации картинок
+    if await handle_img_test_input(update, context):
         return
 
     post_id = context.user_data.get("awaiting_image_for")
@@ -2025,6 +2596,12 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if not is_rsy_ad(message):
         return  # обычный пост — ничего не делаем
+
+    # Проверяем что для этого канала включено перекрытие РСЯ
+    channels = load_all_channels()
+    channel = next((c for c in channels if c["channel_id"] == channel_id), None)
+    if not channel or not channel.get("rsy_override", False):
+        return  # перекрытие выключено для этого канала
 
     logger.info(f"📢 Обнаружена реклама РСЯ в {channel_id} | message_id: {message.message_id}")
 
@@ -2343,6 +2920,34 @@ async def send_alert(bot, message: str):
 
 
 # ============================================================
+# Глобальный обработчик ошибок
+# ============================================================
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Ловит все необработанные исключения в хендлерах.
+    Без него ошибка просто молча падала в лог, а пользователь ничего не получал.
+    Логирует traceback и уведомляет администратора.
+    """
+    logger.exception(f"Необработанная ошибка в хендлере: {context.error}")
+
+    # Пытаемся уведомить администратора (коротко, без traceback в чат)
+    try:
+        err_type = type(context.error).__name__
+        await context.bot.send_message(
+            chat_id=cfg.ADMIN_CHAT_ID,
+            text=(
+                f"⚠️ <b>Ошибка в боте</b>\n"
+                f"<code>{err_type}: {str(context.error)[:300]}</code>\n"
+                f"Подробности в логах."
+            ),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"Не удалось отправить алерт об ошибке: {e}")
+
+
+# ============================================================
 # Запуск бота
 # ============================================================
 
@@ -2362,12 +2967,22 @@ def main():
         logger.info(f"Используется прокси: {proxy_url}")
     app = builder.build()
 
+    # Глобальный обработчик ошибок — ловит всё, что не поймали хендлеры
+    app.add_error_handler(error_handler)
+
     # --- Диалог добавления канала (/add) ---
     add_channel_conv = ConversationHandler(
-        entry_points=[CommandHandler("add", cmd_add_start)],
+        entry_points=[
+            CommandHandler("add", cmd_add_start),
+            CallbackQueryHandler(cmd_add_start, pattern="^add_start$"),
+        ],
         states={
             # Шаг 0: выбор метода (кнопки)
             ADD_CHOOSE_METHOD:  [CallbackQueryHandler(handle_add_method_choice, pattern="^addmethod:")],
+
+            # Авто-добавление по @username (Telethon-юзербот)
+            ADD_USERNAME:         [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_username)],
+            ADD_USERNAME_CONFIRM: [CallbackQueryHandler(handle_username_confirm, pattern="^usernameconfirm:")],
 
             # Экспорт-флоу
             ADD_WAITING_EXPORT: [MessageHandler(filters.Document.ALL, handle_export_upload)],
@@ -2393,7 +3008,10 @@ def main():
             ADD_POSTS_COUNT:    [CallbackQueryHandler(cmd_add_posts_count, pattern="^postscount:")],
         },
         per_message=False,
-        fallbacks=[CommandHandler("cancel", cmd_add_cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cmd_add_cancel),
+            CallbackQueryHandler(cmd_add_cancel_inline, pattern="^add_cancel_inline$"),
+        ],
     )
     app.add_handler(add_channel_conv)
 
@@ -2418,7 +3036,7 @@ def main():
         filters.TEXT & filters.Regex(r"^☰\s*[Мм]еню?$") & filters.ChatType.PRIVATE,
         lambda u, c: screen_main(u.message, c),
     ))
-    app.add_handler(CallbackQueryHandler(cmd_add_start, pattern="^add_start$"))
+    # add_start теперь entry_point в add_channel_conv выше
 
     # --- Команды ---
     app.add_handler(CommandHandler("start", cmd_start))
@@ -2450,6 +3068,9 @@ def main():
 
     # --- Кнопки: редактирование постов ---
     app.add_handler(CallbackQueryHandler(handle_post_actions, pattern="^(delete|image|regen|done|postnow):"))
+
+    # --- Кнопки: действия с картинкой поста ---
+    app.add_handler(CallbackQueryHandler(handle_img_action, pattern="^img_action:"))
 
     # --- Кнопки: превью поста ---
     app.add_handler(CallbackQueryHandler(handle_preview_actions, pattern="^preview_(queue|now|regen|discard):"))
@@ -2494,22 +3115,38 @@ def main():
             misfire_grace_time=300,
         )
 
-        # Утренняя генерация — каждый день в 06:00 UTC (09:00 МСК)
+        # Ступенчатая генерация — каждый час (в :30, со сдвигом от постера),
+        # подливает понемногу только каналы с просевшим буфером. Распределяет
+        # нагрузку по дню вместо одного большого батча ночью.
         scheduler.add_job(
-            generator.run_morning_batch,
-            CronTrigger(hour=cfg.GENERATION_HOUR, minute=cfg.GENERATION_MINUTE),
-            id="morning_generation",
-            name="Утренняя генерация",
+            generator.run_top_up_cycle,
+            CronTrigger(minute=30),
+            id="topup_generation",
+            name="Ступенчатая генерация",
             misfire_grace_time=600,
+            max_instances=1,  # не запускать второй цикл, пока идёт первый
+        )
+
+        # Импорт референсов — раз в день (08:00 UTC = 11:00 МСК): забираем
+        # новые посты каналов-доноров в буфер.
+        from reference_importer import import_all as import_references_all
+        scheduler.add_job(
+            import_references_all,
+            CronTrigger(hour=8, minute=0),
+            id="reference_import",
+            name="Импорт референсов",
+            misfire_grace_time=3600,
+            max_instances=1,
         )
 
         scheduler.start()
         application.bot_data["scheduler"] = scheduler
 
         logger.success(
-            f"Планировщик запущен:\n"
-            f"  • Постер: каждый час\n"
-            f"  • Генерация: {cfg.GENERATION_HOUR:02d}:{cfg.GENERATION_MINUTE:02d} UTC ежедневно"
+            "Планировщик запущен:\n"
+            "  • Постер: каждый час (:00)\n"
+            "  • Ступенчатая генерация: каждый час (:30), только просевшие каналы\n"
+            "  • Импорт референсов: раз в день (08:00 UTC)"
         )
 
     async def on_shutdown(application):

@@ -19,11 +19,11 @@ import asyncio
 import json
 from pathlib import Path
 
-import anthropic
 import feedparser
 from loguru import logger
 
 from config import cfg
+from claude_helper import claude_text
 
 
 # ============================================================
@@ -37,7 +37,7 @@ class WebScraper:
     """Находит Reddit/Medium RSS-ленты под тему канала и читает их."""
 
     def __init__(self):
-        self._claude = anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
+        pass
 
     # ----------------------------------------------------------
     # Публичный метод — вызывается из content_generator
@@ -117,12 +117,10 @@ reddit:feedthebeast
 medium:gaming"""
 
         try:
-            message = self._claude.messages.create(
-                model=cfg.CLAUDE_MODEL,
+            raw   = await claude_text(
                 max_tokens=200,
                 messages=[{"role": "user", "content": prompt}],
             )
-            raw   = message.content[0].text.strip()
             lines = [l.strip() for l in raw.splitlines() if l.strip()]
 
             # Конвертируем в RSS URL

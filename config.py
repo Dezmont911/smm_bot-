@@ -39,9 +39,18 @@ class Config:
 
     # --- Telegram Bot ---
     BOT_TOKEN: str = field(default_factory=lambda: _require("BOT_TOKEN"))
-    ADMIN_CHAT_ID: int = field(
-        default_factory=lambda: int(_require("ADMIN_CHAT_ID"))
+    # Поддержка нескольких adminов: ADMIN_CHAT_ID=111,222,333
+    ADMIN_CHAT_IDS: list = field(
+        default_factory=lambda: [
+            int(x.strip()) for x in _require("ADMIN_CHAT_ID").split(",")
+            if x.strip().lstrip("-").isdigit()
+        ]
     )
+
+    @property
+    def ADMIN_CHAT_ID(self) -> int:
+        """Первый (главный) admin ID — для обратной совместимости."""
+        return self.ADMIN_CHAT_IDS[0] if self.ADMIN_CHAT_IDS else 0
 
     # --- Telegram User API (Telethon) ---
     # Необязательные пока — нужны только для Слоя 4 (мониторинг рекламы)
@@ -136,6 +145,29 @@ class Config:
             u.strip() for u in _optional("WB_PROXY_URLS", "").split(",")
             if u.strip()
         ]
+    )
+
+    # --- fal.ai (генерация картинок через FLUX) ---
+    FAL_API_KEY: str = field(
+        default_factory=lambda: _optional("FAL_API_KEY", "")
+    )
+
+    # --- Кэш тем из веб-поиска ---
+    # За один поиск берём с запасом, лишнее кладём в кэш и переиспользуем,
+    # пока не протухнет (TTL). Срезает число обращений к веб-поиску.
+    TOPIC_CACHE_TTL_HOURS: int = field(
+        default_factory=lambda: int(_optional("TOPIC_CACHE_TTL_HOURS", "8"))
+    )
+    # Сколько тем запрашивать за один поиск (с запасом сверх нужного)
+    TOPIC_SEARCH_BATCH: int = field(
+        default_factory=lambda: int(_optional("TOPIC_SEARCH_BATCH", "15"))
+    )
+
+    # --- Семантический дедуп ---
+    # Порог cosine-близости: посты выше него считаются смысловыми дублями.
+    # 0.85 — ловит перефраз, но не режет реально разные посты (проверено на модели).
+    DEDUP_THRESHOLD: float = field(
+        default_factory=lambda: float(_optional("DEDUP_THRESHOLD", "0.85"))
     )
 
     # --- Режим отладки ---

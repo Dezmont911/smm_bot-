@@ -30,6 +30,7 @@ import aiohttp
 from loguru import logger
 
 from config import cfg
+from claude_helper import claude_text
 
 
 # ============================================================
@@ -56,50 +57,82 @@ async def fetch_image_url(
     topic: str,
     channel_topic: str = "",
     subreddits: list[str] | None = None,
+    channel_name: str = "",
+    image_keywords: list[str] | None = None,
 ) -> str | None:
     """
     Ищет подходящую картинку для поста.
 
     Порядок приоритетов:
-      1. Reddit (если указаны subreddits в карточке канала) — реальные скриншоты
-      2. Pexels — стоковые фото
+      1. Reddit (явно заданные или авто-определённые сабреддиты) — реальные скриншоты/арт
+      2. Pexels — стоковые фото (запрос формирует Claude на основе темы поста + контекста канала)
       3. Unsplash — резервный
 
+    Авто-определение сабреддитов:
+      Если subreddits не заданы вручную, но тема нишевая (игры, аниме, авто и т.д.) —
+      Claude предложит подходящие сабреддиты, они сохранятся в JSON канала на будущее.
+
     Args:
-        topic        — тема/инфоповод конкретного поста
-        channel_topic — общая тема канала
-        subreddits   — список сабреддитов из карточки канала (например ["Minecraft", "feedthebeast"])
+        topic          — тема/инфоповод конкретного поста
+        channel_topic  — общая тема канала (например "майнкрафт, игры")
+        subreddits     — список сабреддитов из карточки канала (None = ещё не задано)
+        channel_name   — название канала
+        image_keywords — ключевые слова из карточки канала
+        channel_id     — @handle канала (для сохранения авто-сабреддитов в JSON)
 
     Returns:
         Прямой URL картинки (пригоден для Telegram send_photo) или None
     """
-    # Reddit — первый приоритет для нишевых каналов
+    # Строим полный контекст канала для Claude
+    full_channel_context = channel_topic
+    if channel_name:
+        full_channel_context = f"{channel_name}: {full_channel_context}"
+    if image_keywords:
+        full_channel_context += ", " + ", ".join(image_keywords)
+
+    # 1. Reddit — только если сабреддиты явно заданы в карточке канала
     if subreddits:
         url = await _fetch_reddit_image(subreddits)
         if url:
             return url
+        logger.debug("Reddit не дал картинки, пробуем Pexels/Unsplash")
 
     if not cfg.PEXELS_API_KEY and not cfg.UNSPLASH_ACCESS_KEY:
         logger.debug("Нет ключей Pexels/Unsplash — пост без картинки")
         return None
 
-    # Переводим русские ключевые слова в английские для поиска
-    query = await _build_english_query(topic, channel_topic)
+    # 3. Pexels / Unsplash — фоллбэк для универсальных тем
+    query = await _build_english_query(topic, full_channel_context)
+
+    # Якорим запрос к теме канала коротким ключом, чтобы картинка не «уплывала»
+    # (например тема CS2 → не случайный геймпад). Берём первый image_keyword
+    # или первое слово темы канала.
+    anchor = ""
+    if image_keywords:
+        anchor = image_keywords[0].strip()
+    elif channel_topic:
+        first = channel_topic.split(",")[0].strip()
+        # Якорь — только если это короткий ключ, а не описание-предложение
+        # («Практические советы и лайфхаки…» якорем только портит запрос)
+        if len(first.split()) <= 3:
+            anchor = first[:30]
+    if anchor and anchor.lower() not in query.lower():
+        query = f"{anchor} {query}"
+
     logger.debug(f"Ищу картинку | запрос: '{query}'")
 
-    # Pexels — первый приоритет (выше лимит, лучше доступность из РФ)
     if cfg.PEXELS_API_KEY:
         url = await _search_pexels(query)
         if url:
             return url
 
-    # Unsplash — резервный
     if cfg.UNSPLASH_ACCESS_KEY:
         url = await _search_unsplash(query)
         if url:
             return url
 
     return None
+
 
 
 # ============================================================
@@ -131,10 +164,18 @@ async def _reddit_top_image(subreddit: str) -> str | None:
     """Запрашивает топ-посты за неделю из сабреддита и возвращает URL картинки."""
     import random
 
-    api_url = f"https://www.reddit.com/r/{subreddit}/top.json?t=week&limit=50"
+    # old.reddit.com менее агрессивно блокирует серверные IP чем www.reddit.com
+    api_url = f"https://old.reddit.com/r/{subreddit}/top.json?t=week&limit=50"
     headers = {
-        "User-Agent": "smm_bot/1.0 (Telegram SMM automation)",
-        "Accept": "application/json",
+        # Имитируем браузерный запрос — снижает вероятность 403
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/html, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
     }
 
     try:
@@ -247,13 +288,15 @@ async def _build_english_query(topic: str, channel_topic: str = "") -> str:
     GAMING_QUERIES = {
         "minecraft": [
             "minecraft blocks landscape",
-            "gaming adventure exploration",
-            "video game building",
-            "game world fantasy",
-            "pixel game art",
-            "gaming controller joystick",
-            "gamer setup desk",
-            "multiplayer game fun",
+            "sandbox game building blocks",
+            "video game adventure exploration",
+            "game world fantasy landscape",
+            "pixel art game",
+            "open world game environment",
+            "game building construction",
+            "survival game forest",
+            "indie game colorful",
+            "game crafting workshop",
         ],
         "gaming pc": [
             "gaming setup rgb",
@@ -264,15 +307,30 @@ async def _build_english_query(topic: str, channel_topic: str = "") -> str:
             "gaming chair rgb",
         ],
         "gaming": [
-            "video game controller",
-            "gamer playing console",
+            "video game screen",
+            "gamer playing game",
             "gaming headset",
             "esports competition",
-            "gaming joystick hands",
+            "game console playing",
             "retro game console",
         ],
     }
+    # Для нишевых тематик (игры и др.) — сначала пробуем Claude для точного запроса.
+    # Например "Топ-5 модов для выживания" + "minecraft" → "minecraft survival mods gameplay"
+    # GAMING_QUERIES используем только как запасной вариант если Claude недоступен.
     if channel_context in GAMING_QUERIES:
+        try:
+            visual_query = await _extract_visual_keywords(title, channel_context)
+            if visual_query:
+                # Принудительно добавляем название игры если Claude его потерял.
+                # Без этого "rate my house" → "house interior" вместо "minecraft house"
+                if channel_context not in visual_query.lower():
+                    visual_query = f"{channel_context} {visual_query}"
+                logger.debug(f"Claude gaming query: '{title[:50]}' → '{visual_query}'")
+                return visual_query
+        except Exception as e:
+            logger.debug(f"Claude gaming visual extraction не удался: {e}")
+        # Фоллбэк: рандомный вариант из списка
         return random.choice(GAMING_QUERIES[channel_context])
 
     if is_english:
@@ -318,31 +376,33 @@ async def _build_english_query(topic: str, channel_topic: str = "") -> str:
 
 async def _extract_visual_keywords(en_title: str, channel_context: str = "") -> str | None:
     """
-    Извлекает 2-3 визуальных ключевых слова из английского заголовка через Claude.
-    Учитывает контекст канала чтобы не путать "rate" (оценить) с "rate" (ставка).
+    Извлекает 2-3 визуальных ключевых слова из заголовка через Claude.
+    Учитывает контекст канала чтобы запрос был релевантным теме.
 
     Например:
       "rate my house that I made in creative mode" + "minecraft"
-      → "minecraft house building"
-    """
-    import anthropic
-    client = anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
+      → "minecraft house building creative"
 
-    context_hint = f"Channel context: {channel_context}. " if channel_context else ""
+      "Top 5 survival mods" + "minecraft"
+      → "minecraft survival gameplay mods"
+    """
+    context_hint = f'This is for a "{channel_context}" themed channel. ' if channel_context else ""
     prompt = (
         f"{context_hint}"
-        f"Extract 2-3 visual keywords for a stock photo search from this title. "
-        f"Return ONLY a short phrase (max 4 words), no explanations: {en_title}"
+        f"Generate 2-4 English keywords for a stock photo search that would visually illustrate this post title. "
+        f"The keywords must be specific and visual (things you can photograph or render). "
+        f"Return ONLY the keywords as a short phrase (max 4 words), no explanations, no punctuation: {en_title}"
     )
 
-    message = client.messages.create(
-        model=cfg.CLAUDE_MODEL,
+    raw = await claude_text(
+        model="claude-haiku-4-5-20251001",  # Haiku — быстро и дёшево для 4 слов
         max_tokens=20,
         messages=[{"role": "user", "content": prompt}],
     )
+    if not raw:
+        return None
 
-    result = message.content[0].text.strip().lower()
-    result = result.splitlines()[0]
+    result = raw.lower().splitlines()[0]
     result = re.sub(r"[\"'.,:;\n]", "", result).strip()
     return result if result else None
 
@@ -352,21 +412,20 @@ async def _translate_with_claude(ru_text: str) -> str | None:
     Переводит 2-3 русских слова в английские через Claude.
     Использует минимальный prompt — быстро и дёшево (Haiku).
     """
-    import anthropic
-    client = anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
-
     prompt = (
         f"Translate these Russian words to 2-3 English keywords for stock photo search. "
         f"Return ONLY a single short phrase (max 4 words), no explanations, no newlines: {ru_text}"
     )
 
-    message = client.messages.create(
-        model=cfg.CLAUDE_MODEL,
+    raw = await claude_text(
+        model="claude-haiku-4-5-20251001",  # Haiku — быстро и дёшево для перевода
         max_tokens=30,
         messages=[{"role": "user", "content": prompt}],
     )
+    if not raw:
+        return None
 
-    result = message.content[0].text.strip().lower()
+    result = raw.lower()
     # Берём только первую строку (на случай многострочного ответа)
     result = result.splitlines()[0]
     # Убираем лишние символы
@@ -386,7 +445,7 @@ async def _search_pexels(query: str) -> str | None:
     Возвращает `src.large` — ~1280px, оптимально для Telegram.
     """
     def _sync_request() -> str | None:
-        params  = urllib.parse.urlencode({"query": query, "per_page": 5, "orientation": "landscape"})
+        params  = urllib.parse.urlencode({"query": query, "per_page": 15, "orientation": "landscape"})
         url     = f"{PEXELS_SEARCH}?{params}"
         req     = urllib.request.Request(url, headers={
             "Authorization": cfg.PEXELS_API_KEY,
@@ -402,7 +461,8 @@ async def _search_pexels(query: str) -> str | None:
                 photos = data.get("photos", [])
                 if not photos:
                     return None
-                return photos[0]["src"]["large"]
+                import random
+                return random.choice(photos)["src"]["large"]
         except urllib.error.HTTPError as e:
             code = e.code
             if code == 401:
@@ -440,7 +500,7 @@ async def _search_unsplash(query: str) -> str | None:
     """
     try:
         params  = {
-            "query": query, "per_page": 5,
+            "query": query, "per_page": 15,
             "orientation": "landscape", "client_id": cfg.UNSPLASH_ACCESS_KEY,
         }
         timeout = aiohttp.ClientTimeout(total=10)
@@ -466,7 +526,8 @@ async def _search_unsplash(query: str) -> str | None:
                     logger.debug(f"Unsplash: нет результатов для '{query}'")
                     return None
 
-                url = results[0]["urls"]["regular"]
+                import random
+                url = random.choice(results)["urls"]["regular"]
                 logger.info(f"Unsplash OK | '{query}' → {url[:70]}...")
                 return url
 

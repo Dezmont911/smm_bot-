@@ -31,6 +31,7 @@ from pathlib import Path
 from loguru import logger
 
 from config import cfg
+from claude_helper import claude_text
 
 
 # ============================================================
@@ -45,8 +46,29 @@ ANALYSIS_PROMPT = """Ты анализируешь Telegram-канал для н
 - channel_type = "marketplace" — если канал публикует товары с маркетплейсов (WB, Ozon, AliExpress): цены, артикулы, ссылки на товары. Даже если иногда есть другой контент.
 - channel_type = "content" — все остальные: новости, факты, образование, развлечения, обзоры, игры, авто, рыбалка, кулинария, лайфхаки и т.д.
 
+ИГНОРИРУЙ РЕКЛАМУ: среди постов могут попадаться рекламные/спонсорские вставки,
+не относящиеся к сути канала (сторонние товары, кредиты/займы, казино/ставки,
+похудение, вакансии, реклама других каналов и т.п.). Определяй тему, тон, архетип
+и постоянные темы ТОЛЬКО по основному (профильному) контенту канала, рекламные
+посты не учитывай.
+
 ПОСТЫ ИЗ КАНАЛА:
 {posts_text}
+
+АРХЕТИП (стиль/ниша канала) — выбери ОДИН из списка:
+- gaming_esports — киберспорт, турниры, патчи, профессиональная сцена игр
+- gaming_casual — игры казуально, мемы, забавные клипы, стримеры
+- anime — аниме, мангa, фандом, релизы тайтлов
+- news — общие/тематические новости, события
+- auto — авто, техника, тест-драйвы
+- celeb_drama — шоу-бизнес, знаменитости, светская хроника
+- finance — финансы, крипта, рынки, инвестиции
+- default — если ничего из перечисленного не подходит
+
+ИСТОЧНИК ТЕМ:
+- "search" — если канал про СВЕЖИЕ новости/события (киберспорт, новости, крипта,
+  шоубиз, релизы аниме) — тогда бот будет искать темы в интернете.
+- "rss" — если контент вечнозелёный/нишевый без привязки к срочным новостям.
 
 Ответь ТОЛЬКО валидным JSON (без markdown, без пояснений):
 {{
@@ -54,11 +76,13 @@ ANALYSIS_PROMPT = """Ты анализируешь Telegram-канал для н
   "topic": "краткое описание темы канала в 1-2 предложения, что он публикует",
   "tone": "тон общения (например: информационный, дружелюбный, экспертный, развлекательный, продающий)",
   "channel_type": "marketplace" или "content",
+  "archetype": "один из архетипов выше",
+  "topic_source": "search" или "rss",
   "evergreen_topics": ["вечнозелёная тема 1", "вечнозелёная тема 2", "...до 10 тем"],
   "post_frequency": число постов в день (целое число 1-10),
   "rss_keywords": ["ключевое слово для RSS 1", "ключевое слово 2", "...до 5 слов"],
   "confidence": число от 0.5 до 1.0 (насколько ты уверен в анализе),
-  "analysis_notes": "1-2 предложения: что за канал, что постит"
+  "analysis_notes": "1-2 предложения простым языком: о чём канал и что публикует (без терминов вроде «вечнозелёный»)"
 }}
 
 Для "evergreen_topics" придумай темы которые ПОДХОДЯТ для этого канала и никогда не устаревают.
@@ -124,6 +148,38 @@ class ChannelAnalyzer:
         logger.success(
             f"Анализ завершён: type={analysis.get('channel_type')}, "
             f"confidence={analysis.get('confidence')}"
+        )
+        return analysis
+
+    async def analyze_posts(
+        self, channel_name: str, posts: list[str], about: str = ""
+    ) -> dict:
+        """
+        Анализирует канал по уже извлечённым постам (например, прочитанным
+        через Telethon-юзербота по @username — без файла экспорта).
+
+        channel_name — название канала, posts — список текстов постов,
+        about — описание канала (если есть). Возвращает ту же карточку,
+        что и analyze_export.
+        """
+        clean = [p.strip() for p in posts if p and len(p.strip()) >= self.MIN_POST_LENGTH]
+        if len(clean) < 3:
+            raise ValueError(
+                f"Слишком мало текстовых постов для анализа ({len(clean)}). "
+                "Нужно минимум 3 поста с текстом."
+            )
+
+        sample = self._make_sample(clean)
+        # Описание канала добавляем подсказкой к имени — помогает классификации
+        name_hint = channel_name + (f" — {about}" if about else "")
+        analysis = await self._analyze_with_claude(sample, name_hint)
+
+        analysis["export_channel_name"] = channel_name
+        analysis["analyzed_posts"] = len(sample)
+        analysis.setdefault("post_frequency", 4)
+        logger.success(
+            f"Анализ по постам завершён: type={analysis.get('channel_type')}, "
+            f"archetype={analysis.get('archetype')}, conf={analysis.get('confidence')}"
         )
         return analysis
 
@@ -235,15 +291,10 @@ class ChannelAnalyzer:
         prompt = ANALYSIS_PROMPT.format(posts_text=header + posts_text)
 
         try:
-            import anthropic
-            client = anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
-
-            response = client.messages.create(
-                model=cfg.CLAUDE_MODEL,
+            raw = await claude_text(
                 max_tokens=1000,
                 messages=[{"role": "user", "content": prompt}],
             )
-            raw = response.content[0].text.strip()
 
             # Убираем возможный markdown-блок
             if raw.startswith("```"):
@@ -276,6 +327,8 @@ class ChannelAnalyzer:
             "topic": f"Контент канала «{channel_name}»",
             "tone": "информационный",
             "channel_type": channel_type,
+            "archetype": "default",
+            "topic_source": "rss",
             "evergreen_topics": [],
             "post_frequency": 3,
             "rss_keywords": [],
@@ -321,6 +374,72 @@ class ChannelAnalyzer:
         # Округляем до разумных значений
         freq = round(avg)
         return max(1, min(10, freq))  # от 1 до 10 постов в день
+
+
+# ============================================================
+# Авто-определение архетипа и источника по описанию (ручной /add)
+# ============================================================
+
+# Список валидных архетипов берём из пресетов, чтобы не рассинхронизироваться
+from archetypes import ARCHETYPES
+
+_VALID_ARCHETYPES = set(ARCHETYPES.keys())
+_VALID_SOURCES = {"search", "rss"}
+
+
+def normalize_meta(archetype: str | None, topic_source: str | None) -> tuple[str, str]:
+    """Приводит архетип/источник к валидным значениям (с дефолтами)."""
+    arch = (archetype or "").strip().lower()
+    if arch not in _VALID_ARCHETYPES:
+        arch = "default"
+    src = (topic_source or "").strip().lower()
+    if src not in _VALID_SOURCES:
+        src = "rss"
+    return arch, src
+
+
+async def classify_channel(name: str, topic: str) -> dict:
+    """
+    Лёгкая классификация канала по краткому описанию (ручной путь /add).
+    Возвращает {"archetype", "topic_source", "confidence"}.
+    Не падает: при ошибке возвращает дефолт (default/rss).
+    """
+    arche_list = ", ".join(sorted(_VALID_ARCHETYPES))
+    prompt = f"""Определи нишу Telegram-канала и источник тем.
+
+Название: {name}
+Описание: {topic}
+
+Архетип (выбери ОДИН): {arche_list}
+  gaming_esports=киберспорт/турниры/патчи, gaming_casual=игры/мемы/стримеры,
+  anime=аниме/фандом, news=новости/события, auto=авто/техника,
+  celeb_drama=шоубиз/знаменитости, finance=финансы/крипта, default=иначе.
+
+Источник тем:
+  "search" — если про свежие новости/события (киберспорт, новости, крипта, шоубиз, релизы),
+  "rss" — если вечнозелёный/нишевый контент без срочности.
+
+Ответь ТОЛЬКО JSON: {{"archetype": "...", "topic_source": "...", "confidence": 0.0-1.0}}"""
+
+    try:
+        raw = await claude_text(
+            max_tokens=120,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        import re as _re
+        m = _re.search(r"\{.*\}", raw, _re.DOTALL)
+        data = json.loads(m.group()) if m else {}
+        arch, src = normalize_meta(data.get("archetype"), data.get("topic_source"))
+        conf = data.get("confidence", 0.6)
+        try:
+            conf = float(conf)
+        except (TypeError, ValueError):
+            conf = 0.6
+        logger.info(f"classify_channel '{name}': архетип={arch}, источник={src}, conf={conf}")
+        return {"archetype": arch, "topic_source": src, "confidence": conf}
+    except Exception as e:
+        logger.warning(f"classify_channel ошибка: {e} — дефолт default/rss")
+        return {"archetype": "default", "topic_source": "rss", "confidence": 0.0}
 
 
 # ============================================================

@@ -14,7 +14,9 @@
   ],
   "rss_sources": [
     "https://ru-minecraft.ru/novosti-minecraft/",
-    "https://www.playground.ru/minecraft/"
+    "https://www.playground.ru/minecraft/",
+    "https://dotesports.com/minecraft/feed",
+    "https://www.rockpapershotgun.com/tag/minecraft/feed/"
   ],
   "evergreen_topics": [
     "Лучшие моды для выживания в Minecraft",
@@ -40,9 +42,15 @@
   ],
   "example_posts": [],
   "use_images": false,
+  "reddit_image_subreddits": [
+    "Minecraft",
+    "feedthebeast",
+    "minecraftseeds"
+  ],
   "image_keywords": [
-    "игры майнкрфт",
-    "новости",
-    "аддоны"
-  ]
+    "minecraft gameplay",
+    "minecraft screenshot",
+    "minecraft build"
+  ],
+  "image_source": "auto"
 }

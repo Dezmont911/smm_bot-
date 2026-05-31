@@ -6,6 +6,8 @@
 .env
 *.pem
 *.key
+*.session
+*.session-journal
 
 # --- База данных ---
 *.db
@@ -45,6 +47,13 @@ logs/
 test_dedup.py
 test_full_cycle.py
 test_rss.py
+
+# --- Одноразовые/диагностические скрипты (содержат IP VPS, не часть деплоя) ---
+# Локальный тулинг: run_remote_gen.py, диагностика, _*-тесты. В деплой (FILES) не входят.
+scripts/
+
+# --- Скриншоты/локальные артефакты разработки ---
+screenshots/
 
 # --- Кэш Crawl4AI ---
 .crawl4ai/

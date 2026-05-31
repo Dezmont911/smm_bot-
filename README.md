@@ -4,7 +4,7 @@ Telegram-бот для автоматической генерации и пуб
 Поддерживает информационные каналы (RSS) и маркетплейс-каналы (Wildberries).
 
 > **Последнее обновление README:** 2026-05-28
-> **Статус:** Работает на VPS `77.233.215.77` (Amsterdam)
+> **Статус:** Работает на VPS `<VPS_HOST>` (Amsterdam)
 > **Python:** 3.12, venv в `/opt/smm_bot/venv`
 
 ---
@@ -184,7 +184,7 @@ else:              basket = 41 + (vol - 10243) // 613
 Таблица может устареть — проверять раз в несколько месяцев.
 
 **Прокси:**
-- С VPS Amsterdam (77.233.215.77) карточный API доступен без прокси
+- С VPS Amsterdam (<VPS_HOST>) карточный API доступен без прокси
 - `search.wb.ru` заблокирован с дата-центровых IP — не использовать
 - Webshare резидентные прокси: `ryryrvfb` / `95xgdgxzev5d` (10 штук, настроены в .env)
 
@@ -195,9 +195,9 @@ else:              basket = 41 + (vol - 10243) // 613
 ### Текущий сервер
 
 ```
-IP:      77.233.215.77
+IP:      <VPS_HOST>
 Регион:  Amsterdam, Netherlands
-SSH:     ssh -i C:\Users\Admin\.ssh\smm_bot root@77.233.215.77
+SSH:     ssh -i C:\Users\Admin\.ssh\smm_bot root@<VPS_HOST>
 Проект:  /opt/smm_bot
 Venv:    /opt/smm_bot/venv/bin/python
 Сервис:  smm_bot.service
@@ -271,7 +271,7 @@ sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 client = paramiko.SSHClient()
 client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-client.connect("77.233.215.77", port=22, username="root",
+client.connect("<VPS_HOST>", port=22, username="root",
                key_filename=r"C:\Users\Admin\.ssh\smm_bot", timeout=15)
 
 def run(client, cmd, timeout=60):
@@ -419,7 +419,7 @@ DEBUG=True
 ### Anthropic API
 
 - Блокирует запросы с российских IP (HTTP 403)
-- VPS должен быть в EU/US — Amsterdam 77.233.215.77 работает
+- VPS должен быть в EU/US — Amsterdam <VPS_HOST> работает
 
 ### Webshare прокси
 

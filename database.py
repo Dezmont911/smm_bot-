@@ -32,10 +32,12 @@ class Database:
 
     def connect(self) -> sqlite3.Connection:
         """Открывает соединение с БД. Всегда возвращает строки как словари."""
-        conn = sqlite3.connect(self.db_path)
+        # timeout=15 — ждём освобождения блокировки на уровне драйвера sqlite3
+        conn = sqlite3.connect(self.db_path, timeout=15)
         conn.row_factory = sqlite3.Row  # строки как словари: row["column"]
-        conn.execute("PRAGMA journal_mode=WAL")  # лучше для конкурентного доступа
-        conn.execute("PRAGMA foreign_keys=ON")   # проверка внешних ключей
+        conn.execute("PRAGMA journal_mode=WAL")     # лучше для конкурентного доступа
+        conn.execute("PRAGMA foreign_keys=ON")      # проверка внешних ключей
+        conn.execute("PRAGMA busy_timeout=15000")   # ждать 15с при 'database is locked'
         return conn
 
     def init(self):
@@ -71,6 +73,10 @@ class Database:
                     topic        TEXT,                   -- инфоповод/тема для этого поста
                     status       TEXT DEFAULT 'ready',   -- ready / pending_review / published / skipped
                     image_url    TEXT,                   -- URL картинки (из RSS или Unsplash) или NULL
+                    parse_mode   TEXT DEFAULT 'Markdown', -- Markdown / HTML (для WB-постов)
+                    embedding    BLOB,                    -- вектор поста (float32) для семантич. дедупа
+                    media_path   TEXT,                    -- локальный файл медиа (референс «как есть») или NULL
+                    media_type   TEXT,                    -- photo / video / NULL
                     generated_at TEXT NOT NULL,          -- ISO timestamp
                     published_at TEXT,                   -- ISO timestamp или NULL
                     FOREIGN KEY (channel_id) REFERENCES channels(tg_handle)
@@ -88,6 +94,20 @@ class Database:
                     published_at     TEXT,               -- ISO timestamp или NULL
                     status           TEXT DEFAULT 'detected'  -- detected/published/failed
                 );
+
+                -- --------------------------------------------------------
+                -- Кэш тем из веб-поиска (чтобы не искать на каждый прогон)
+                -- --------------------------------------------------------
+                CREATE TABLE IF NOT EXISTS topic_cache (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel_id  TEXT NOT NULL,           -- @mychannel
+                    topic       TEXT NOT NULL,           -- текст темы
+                    created_at  TEXT NOT NULL,           -- ISO timestamp (для TTL)
+                    used        INTEGER DEFAULT 0        -- 0=свободна, 1=уже взята в пост
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_topic_cache_channel
+                    ON topic_cache(channel_id, used);
 
                 -- --------------------------------------------------------
                 -- Банк вечнозелёных тем (резерв когда RSS пустой)

@@ -167,9 +167,27 @@ class RSSParser:
         if not title:
             return None
 
+        # Фильтруем мусорные записи — служебные сообщения Reddit и пустые заглушки
+        _JUNK_PHRASES = [
+            "this post contains content not supported",
+            "content not supported on",
+            "reddit video",
+            "[removed]",
+            "[deleted]",
+            "&#x200b;",  # zero-width space — типичный мусор Reddit
+        ]
+        if any(p in title.lower() for p in _JUNK_PHRASES):
+            return None
+
         # Ссылка
         link = getattr(entry, "link", "").strip()
         if not link:
+            return None
+
+        # Пропускаем записи которые ведут на Reddit — это пользовательские посты,
+        # не профессиональный контент. Для игровых каналов такие темы дают
+        # нерелевантные картинки и "сырой" Reddit-стиль в тексте.
+        if "reddit.com/r/" in link or "redd.it/" in link:
             return None
 
         # Краткое описание — убираем HTML теги

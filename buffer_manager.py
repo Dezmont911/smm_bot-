@@ -55,8 +55,8 @@ class BufferManager:
         with db.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO posts (id, channel_id, content, format, topic, status, generated_at, image_url)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO posts (id, channel_id, content, format, topic, status, generated_at, image_url, parse_mode, embedding, media_path, media_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     post_id,
@@ -67,6 +67,10 @@ class BufferManager:
                     status,
                     now,
                     post.get("image_url"),
+                    post.get("parse_mode", "Markdown"),
+                    post.get("embedding_blob"),
+                    post.get("media_path"),
+                    post.get("media_type"),
                 ),
             )
 

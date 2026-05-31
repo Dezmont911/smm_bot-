@@ -18,12 +18,20 @@ poster.py — Планировщик публикаций (Слой 4 из handb
 Запуск встроен в bot.py через APScheduler — отдельно запускать не нужно.
 """
 
+import asyncio
+import random
 from datetime import datetime, timezone
+from io import BytesIO
+
+import aiohttp
 from loguru import logger
+from telegram import InputFile
 
 from buffer_manager import buffer
 from config import cfg
 from database import db
+from image_fetcher import fetch_image_url
+from image_generator import generate_image as generate_ai_image
 
 
 class Poster:
@@ -104,6 +112,9 @@ class Poster:
                 f"id: {post['id'][:8]}..."
             )
 
+            # Уведомляем администратора о публикации
+            await self._notify_published(post, result)
+
             # Проверяем буфер после публикации
             await self._check_buffer_after_post(channel)
         else:
@@ -116,68 +127,286 @@ class Poster:
             )
 
     # --------------------------------------------------------
+    # Скачивание WB картинки через прокси
+    # --------------------------------------------------------
+
+    async def _download_wb_image(self, url: str) -> bytes | None:
+        """
+        Скачивает картинку с WB CDN (wbbasket.ru).
+
+        Telegram не поддерживает webp-URL напрямую, поэтому скачиваем байты
+        здесь и отправляем через InputFile(BytesIO).
+
+        Формула _get_basket() приближённая — при 404 пробуем соседние
+        корзины (basket ±1 .. ±3), это решает большинство случаев несовпадения.
+        """
+        import re
+
+        # Собираем список прокси
+        proxy_list = list(cfg.WB_PROXY_URLS) if cfg.WB_PROXY_URLS else []
+        if not proxy_list and cfg.WB_PROXY_URL:
+            proxy_list = [cfg.WB_PROXY_URL]
+
+        proxy = random.choice(proxy_list) if proxy_list else None
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www.wildberries.ru/",
+            "Accept": "image/webp,image/*,*/*",
+        }
+
+        # Генерируем список URL для попыток:
+        # 1) оригинальный URL
+        # 2) соседние корзины ±1..3 (формула приближённая — для разных
+        #    диапазонов vol шаг разный, поэтому нужны fallback-попытки)
+        urls_to_try = [url]
+        m = re.match(r"(https://basket-)(\d+)(\.wbbasket\.ru/.+)", url)
+        if m:
+            prefix, basket_str, suffix = m.group(1), m.group(2), m.group(3)
+            basket_num = int(basket_str)
+            for delta in [-1, 1, -2, 2, -3, 3]:
+                candidate = basket_num + delta
+                if 1 <= candidate <= 50:
+                    urls_to_try.append(f"{prefix}{candidate:02d}{suffix}")
+
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            for try_url in urls_to_try:
+                try:
+                    async with session.get(
+                        try_url,
+                        proxy=proxy,
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=12),
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.read()
+                            if len(data) > 1000:
+                                basket_used = re.search(r"basket-(\d+)", try_url).group(1)
+                                orig_basket = re.search(r"basket-(\d+)", url).group(1)
+                                if basket_used != orig_basket:
+                                    logger.info(
+                                        f"WB CDN: basket скорректирован "
+                                        f"{orig_basket}→{basket_used} | {len(data)} байт"
+                                    )
+                                else:
+                                    logger.debug(
+                                        f"WB CDN OK: {len(data)} байт | basket-{basket_used}"
+                                    )
+                                return data
+                            # Файл есть но слишком маленький — возможно заглушка
+                            logger.warning(
+                                f"WB CDN: подозрительно мал ({len(data)} байт) | {try_url[:70]}"
+                            )
+                        elif resp.status == 404:
+                            logger.debug(f"WB CDN 404: {try_url[:80]}")
+                        else:
+                            logger.warning(f"WB CDN HTTP {resp.status}: {try_url[:70]}")
+                except asyncio.TimeoutError:
+                    logger.warning(f"WB CDN: таймаут | {try_url[:70]}")
+                except Exception as e:
+                    logger.warning(f"WB CDN ошибка: {type(e).__name__}: {e}")
+
+        logger.warning(f"WB CDN: не удалось скачать (все {len(urls_to_try)} попыток) | {url[:70]}")
+        return None
+
+    # --------------------------------------------------------
+    # Проверка и самолечение картинки
+    # --------------------------------------------------------
+
+    def _load_channel_by_id(self, channel_id: str) -> dict | None:
+        """Загружает карточку канала по handle (для политики картинок)."""
+        import json
+        from pathlib import Path
+        channels_dir = Path(__file__).parent / "channels"
+        for jf in channels_dir.glob("*.json"):
+            try:
+                with open(jf, encoding="utf-8") as f:
+                    ch = json.load(f)
+                if ch.get("channel_id") == channel_id:
+                    return ch
+            except Exception:
+                continue
+        return None
+
+    async def _regenerate_image(self, post: dict) -> str | None:
+        """
+        Перегенерирует картинку для поста (когда Telegram отклонил исходную).
+
+        Источник: stock (Pexels/Unsplash) → AI/FLUX, по политике image_source канала
+        (auto = сток, потом FLUX). Игнорирует use_images: раз пост заявлял картинку,
+        стараемся её честно дать. Сохраняет новый URL в БД и в post.
+        Возвращает новый URL или None.
+        """
+        channel_id = post["channel_id"]
+        channel = self._load_channel_by_id(channel_id) or {}
+        image_source = channel.get("image_source", "auto")
+        topic = post.get("topic", "") or channel.get("topic", "")
+
+        new_url = None
+        # 1) сток
+        if image_source in ("stock", "auto"):
+            try:
+                new_url = await fetch_image_url(
+                    topic=topic,
+                    channel_topic=channel.get("topic", ""),
+                    subreddits=channel.get("reddit_image_subreddits"),
+                    channel_name=channel.get("name", ""),
+                    image_keywords=channel.get("image_keywords"),
+                )
+            except Exception as e:
+                logger.warning(f"Сток-перегенерация не удалась [{channel_id}]: {e}")
+        # 2) AI/FLUX
+        if not new_url and image_source in ("ai", "auto") and cfg.FAL_API_KEY:
+            try:
+                new_url = await generate_ai_image(
+                    topic=topic,
+                    channel_topic=channel.get("topic", ""),
+                    channel_name=channel.get("name", ""),
+                )
+            except Exception as e:
+                logger.warning(f"AI-перегенерация не удалась [{channel_id}]: {e}")
+
+        # Сохраняем результат в БД и в post
+        try:
+            with db.connect() as conn:
+                conn.execute(
+                    "UPDATE posts SET image_url = ? WHERE id = ?",
+                    (new_url, post["id"]),
+                )
+        except Exception as e:
+            logger.warning(f"Не удалось обновить image_url в БД: {e}")
+        post["image_url"] = new_url
+
+        if new_url:
+            logger.success(f"Картинка перегенерирована [{channel_id}]: {new_url[:60]}")
+        else:
+            logger.warning(f"Перегенерация картинки не дала результата [{channel_id}]")
+        return new_url
+
+    # --------------------------------------------------------
     # Публикация поста
     # --------------------------------------------------------
+
+    async def _send_local_media(self, channel_id, path, media_type, caption, parse_mode) -> bool:
+        """Отправляет локальный медиа-файл (референс «как есть»): фото или видео.
+        Пробует оба parse_mode. Подпись может быть пустой."""
+        cap = caption or None
+        for pm in (parse_mode, None):
+            try:
+                with open(path, "rb") as fh:
+                    photo_or_video = InputFile(fh)
+                    if media_type == "video":
+                        await self.bot.send_video(
+                            chat_id=channel_id, video=photo_or_video, caption=cap, parse_mode=pm
+                        )
+                    else:
+                        await self.bot.send_photo(
+                            chat_id=channel_id, photo=photo_or_video, caption=cap, parse_mode=pm
+                        )
+                return True
+            except Exception as e:
+                logger.warning(f"send media [{media_type}, parse={pm}] в {channel_id}: {e}")
+        return False
 
     async def _publish(self, post: dict) -> dict:
         """
         Отправляет пост в Telegram-канал.
-        Порядок попыток:
-          1. Markdown + картинка
-          2. Plain text + картинка
-          3. Markdown без картинки  (если картинка недоступна)
-          4. Plain text без картинки
 
-        Возвращает dict:
-          {"success": True/False, "used_image": True/False}
+        Для WB постов (wbbasket.ru):
+          - Скачивает webp через резидентный прокси
+          - Отправляет как InputFile(BytesIO) — Telegram принимает байты напрямую
+          - Если прокси недоступен — публикует без картинки
+
+        Для остальных постов — стандартная логика:
+          1. parse_mode + картинка (URL)
+          2. plain text + картинка
+          3. parse_mode без картинки
+          4. plain text без картинки
         """
+
         channel_id = post["channel_id"]
         content = post["content"]
         image_url = post.get("image_url")
-
-        # Берём parse_mode из самого поста (WB-посты имеют "HTML", остальные — "Markdown")
         post_parse_mode = post.get("parse_mode", "Markdown")
 
-        # Формируем список попыток: (parse_mode, use_image)
-        if image_url:
-            attempts = [
-                (post_parse_mode, True),
-                (None,            True),
-                (post_parse_mode, False),  # картинка недоступна — пробуем без неё
-                (None,            False),
-            ]
-        else:
-            attempts = [
-                (post_parse_mode, False),
-                (None,            False),
-            ]
-
-        for parse_mode, use_image in attempts:
-            img = image_url if use_image else None
-            try:
-                if img:
-                    await self.bot.send_photo(
-                        chat_id=channel_id,
-                        photo=img,
-                        caption=content,
-                        parse_mode=parse_mode,
-                    )
-                else:
-                    await self.bot.send_message(
-                        chat_id=channel_id,
-                        text=content,
-                        parse_mode=parse_mode,
-                    )
-                if image_url and not use_image:
-                    logger.warning(f"Пост опубликован БЕЗ картинки (недоступна): {channel_id}")
-                return {"success": True, "used_image": use_image and bool(img)}
-
-            except Exception as e:
-                logger.warning(
-                    f"Попытка [parse={parse_mode}, img={'да' if use_image else 'нет'}] "
-                    f"в {channel_id} не удалась: {e}"
+        # ---- Референс-пост с готовым медиа-файлом (фото/видео «как есть») ----
+        media_path = post.get("media_path")
+        media_type = post.get("media_type")
+        if media_path:
+            import os
+            if os.path.exists(media_path):
+                sent = await self._send_local_media(
+                    channel_id, media_path, media_type, content, post_parse_mode
                 )
-                continue  # переходим к следующей попытке
+                if sent:
+                    try:
+                        os.remove(media_path)  # файл больше не нужен
+                    except OSError:
+                        pass
+                    return {"success": True, "used_image": True}
+                logger.warning(f"Не удалось отправить медиа-файл [{channel_id}] — публикую как текст")
+            else:
+                logger.warning(f"Медиа-файл пропал [{channel_id}]: {media_path}")
+
+        # ---- WB CDN: скачиваем картинку через прокси ----
+        wb_image_bytes: bytes | None = None
+        if image_url and "wbbasket.ru" in image_url:
+            wb_image_bytes = await self._download_wb_image(image_url)
+            if wb_image_bytes:
+                logger.info(f"WB CDN: картинка скачана ({len(wb_image_bytes)} байт)")
+            else:
+                logger.warning(f"WB CDN: не удалось скачать картинку [{channel_id}]")
+                image_url = None
+
+        # ---- Вспомогательные отправщики (пробуют оба parse_mode) ----
+        async def _send_with_image() -> bool:
+            for pm in (post_parse_mode, None):
+                try:
+                    if wb_image_bytes:
+                        photo = InputFile(BytesIO(wb_image_bytes), filename="product.webp")
+                    else:
+                        photo = image_url
+                    await self.bot.send_photo(
+                        chat_id=channel_id, photo=photo, caption=content, parse_mode=pm
+                    )
+                    return True
+                except Exception as e:
+                    logger.warning(f"send_photo [parse={pm}] в {channel_id} не удалась: {e}")
+            return False
+
+        async def _send_text() -> bool:
+            for pm in (post_parse_mode, None):
+                try:
+                    await self.bot.send_message(chat_id=channel_id, text=content, parse_mode=pm)
+                    return True
+                except Exception as e:
+                    logger.warning(f"send_message [parse={pm}] в {channel_id} не удалась: {e}")
+            return False
+
+        # ---- 1) Пробуем с картинкой ----
+        if image_url or wb_image_bytes:
+            if await _send_with_image():
+                return {"success": True, "used_image": True}
+
+            # 2) Telegram отверг картинку. Для не-WB — перегенерируем и пробуем ещё раз.
+            if image_url and not wb_image_bytes:
+                logger.warning(f"Telegram отклонил картинку [{channel_id}] — перегенерирую")
+                new_url = await self._regenerate_image(post)
+                if new_url:
+                    image_url = new_url
+                    if await _send_with_image():
+                        return {"success": True, "used_image": True}
+
+            logger.warning(f"Публикую БЕЗ картинки (не удалось ни одной): {channel_id}")
+
+        # ---- 3) Без картинки ----
+        if await _send_text():
+            return {"success": True, "used_image": False}
 
         logger.error(f"Все попытки публикации в {channel_id} провалились")
         return {"success": False, "used_image": False}
@@ -191,6 +420,7 @@ class Poster:
         После каждой публикации проверяем уровень буфера.
         Если постов мало — запускаем фоновую генерацию.
         """
+
         channel_id = channel["channel_id"]
         level = buffer.get_level(channel_id)
         status = buffer.check_status(channel_id)
@@ -209,7 +439,6 @@ class Poster:
         elif status == "emergency":
             # Мало — тихо запускаем генерацию в фоне
             logger.info(f"⚡ Мало постов [{channel_id}]: {level} — запускаю генерацию")
-            import asyncio
             asyncio.create_task(self._run_emergency_generation(channel_id))
 
     async def _run_emergency_generation(self, channel_id: str):
@@ -239,6 +468,35 @@ class Poster:
     # --------------------------------------------------------
     # Алерты администратору
     # --------------------------------------------------------
+
+    async def _notify_published(self, post: dict, result: dict):
+        """Уведомление об успешной публикации поста по расписанию."""
+        channel_id = post["channel_id"]
+        fmt = post.get("format", "?")
+        topic = post.get("topic", "")[:60]
+        has_image = "🖼️ с картинкой" if result.get("used_image") else "📝 без картинки"
+
+        # Превью текста — первые 100 символов контента
+        content_preview = post.get("content", "")[:100].strip()
+        if len(post.get("content", "")) > 100:
+            content_preview += "..."
+
+        # Уровень буфера после публикации
+        remaining = buffer.get_level(channel_id)
+        buffer_emoji = "✅" if remaining >= 6 else "⚠️" if remaining >= 3 else "🚨"
+
+        text = (
+            f"📤 <b>Опубликован пост</b>\n"
+            f"Канал: {channel_id}\n"
+            f"Формат: {fmt} · {has_image}\n"
+            f"Тема: {topic}\n"
+            f"───────────────\n"
+            f"<i>{content_preview}</i>\n"
+            f"───────────────\n"
+            f"{buffer_emoji} В очереди осталось: {remaining} постов"
+        )
+
+        await self._alert(text)
 
     async def _alert(self, text: str):
         """Отправляет сообщение администратору."""

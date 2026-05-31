@@ -25,6 +25,7 @@ content_generator.py — Дирижёр системы (Слой 2 из handbook
 """
 
 import json
+import re
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -34,8 +35,12 @@ from ai_client import generate_post
 from buffer_manager import buffer
 from database import db
 from image_fetcher import fetch_image_url
+from image_generator import generate_image as generate_ai_image
 from rss_parser import rss
 from web_scraper import scraper as web_scraper
+from topic_search import get_topics
+from content_router import resolve, pick_format, pick_hook
+import dedup
 from config import cfg
 
 
@@ -112,8 +117,13 @@ class ContentGenerator:
             return await self._run_marketplace(channel, target_count)
 
 
-        # Получаем темы из источников
-        topics, sources_used = await self._collect_topics(channel, target_count)
+        # Получаем темы из источников. Берём ПУЛ кандидатов больше нужного:
+        # часть отсеется как уже использованные (вкл. недавно очищенные) и дубли
+        # по смыслу, поэтому без запаса буфер не добирается (RSS-топ исчерпывается).
+        # Минимум 10 кандидатов даже для target=1 (перегенерация одного поста):
+        # иначе при малом пуле все темы оказываются уже использованными → 0 постов.
+        candidate_count = min(max(target_count * 3, 10), target_count + 25)
+        topics, sources_used = await self._collect_topics(channel, candidate_count)
 
         if not topics:
             logger.error(f"Нет тем для генерации [{channel_id}]")
@@ -131,52 +141,133 @@ class ContentGenerator:
         if used_topics:
             logger.debug(f"Дедупликация [{channel_id}]: {len(used_topics)} использованных тем")
 
+        # Стратегия канала (стиль/архетип/temperature/веса форматов/хуки) — один раз
+        strategy = resolve(channel)
+        logger.debug(
+            f"Стратегия [{channel_id}]: архетип={strategy['archetype']}, "
+            f"t={strategy['temperature']}, форматы={strategy['format_bias']}"
+        )
+
         # Генерируем посты
         generated = 0
         skipped = 0
         last_format = None  # для контроля ротации форматов
 
-        for topic_data in topics[:target_count]:
+        for topic_data in topics:
+            # Набрали нужное число постов — останавливаемся (остальной пул — запас)
+            if generated >= target_count:
+                break
             try:
-                # Выбираем формат с учётом ротации (не повторять подряд)
-                format_name = self._pick_format(channel, last_format)
-
-                # Генерируем пост — передаём историю тем чтобы не повторяться
-                post = await generate_post(
-                    channel, topic_data["topic"], format_name,
-                    used_topics=used_topics,
-                )
-
-                # Картинка: сначала берём из RSS, если нет — ищем через API
-                if topic_data.get("image_url"):
-                    post["image_url"] = topic_data["image_url"]
-                    post["has_image"] = True
-                elif cfg.UNSPLASH_ACCESS_KEY or cfg.PEXELS_API_KEY or channel.get("reddit_image_subreddits"):
-                    image_url = await fetch_image_url(
-                        topic=topic_data["topic"],
-                        channel_topic=channel.get("topic", ""),
-                        subreddits=channel.get("reddit_image_subreddits"),
+                # Пропускаем темы, которые уже использовались: иначе Claude получит
+                # противоречие ("напиши про X" + "не повторяй X") и вернёт мета-ответ.
+                if self._topic_already_used(topic_data["topic"], used_topics):
+                    logger.info(
+                        f"Пропускаю уже использованную тему [{channel_id}]: "
+                        f"{topic_data['topic'][:50]}"
                     )
-                    if image_url:
-                        post["image_url"] = image_url
-                        post["has_image"] = True
-                        logger.debug(f"Картинка найдена через API [{channel_id}]")
-                    else:
-                        post["has_image"] = False
-                else:
-                    post["has_image"] = False
-
-                # Анти-повтор: проверяем похожие посты в буфере
-                if await self._is_duplicate(channel_id, post["content"]):
-                    logger.debug(f"Пропускаю дубликат [{channel_id}]: {topic_data['topic'][:40]}")
                     skipped += 1
                     continue
+
+                # Формат — по весам архетипа (не повторяя предыдущий), хук — ротация структуры
+                format_name = pick_format(strategy, last_format)
+                hook = pick_hook(strategy)
+
+                # Генерируем пост — передаём историю тем, стратегию и хук
+                post = await generate_post(
+                    channel, topic_data["topic"], format_name,
+                    used_topics=used_topics, strategy=strategy, hook=hook,
+                )
+
+                # ── Выбор картинки по image_source ─────────────────────────
+                # image_source в карточке канала — ЕДИНСТВЕННОЕ правило:
+                #   "rss"        — только из RSS-статьи, иначе без картинки
+                #   "stock"      — RSS → Pexels/Unsplash → FLUX (как гарантия)
+                #   "ai"         — RSS → fal.ai FLUX
+                #   "auto"       — RSS → Pexels/Unsplash → fal.ai FLUX (дефолт)
+                #   "none"/"off" — без картинки вообще
+                # Контент-пост гарантированно получает картинку: если сток
+                # промахнулся, дорисовываем через FLUX (last resort, ~$0.003).
+                # Поле use_images больше НЕ управляет логикой (оставлено в карточках
+                # для совместимости) — источником истины служит image_source.
+                # ────────────────────────────────────────────────────────────
+                image_source = channel.get("image_source", "auto")
+                images_off = image_source in ("none", "off")
+
+                # Картинку подбираем по СОДЕРЖАНИЮ поста, а не по сырому заголовку
+                # темы (заголовки вроде «Almost ready to go!» давали картинку не в
+                # тему — чемодан вместо томатов). Контент — источник истины.
+                image_basis = (post.get("content") or "").strip()[:500] or topic_data["topic"]
+
+                image_url = None
+
+                # Шаг 1: RSS-картинка — всегда первый приоритет, бесплатно
+                if topic_data.get("image_url"):
+                    image_url = topic_data["image_url"]
+                    logger.debug(f"Картинка из RSS [{channel_id}]")
+
+                # Шаг 2: если RSS не дал — добываем по image_source
+                if not image_url and not images_off and image_source != "rss":
+
+                    # Сток (Pexels/Unsplash/Reddit)
+                    if image_source in ("stock", "auto"):
+                        has_stock = (
+                            cfg.UNSPLASH_ACCESS_KEY
+                            or cfg.PEXELS_API_KEY
+                            or channel.get("reddit_image_subreddits")
+                        )
+                        if has_stock:
+                            image_url = await fetch_image_url(
+                                topic=image_basis,
+                                channel_topic=channel.get("topic", ""),
+                                subreddits=channel.get("reddit_image_subreddits"),
+                                channel_name=channel.get("name", ""),
+                                image_keywords=channel.get("image_keywords"),
+                            )
+                            if image_url:
+                                logger.debug(f"Картинка из Pexels/Unsplash [{channel_id}]")
+
+                    # AI/FLUX — основной источник для "ai", гарантия для "stock"/"auto"
+                    if not image_url and image_source in ("ai", "stock", "auto"):
+                        if cfg.FAL_API_KEY:
+                            image_url = await generate_ai_image(
+                                topic=image_basis,
+                                channel_topic=channel.get("topic", ""),
+                                channel_name=channel.get("name", ""),
+                            )
+                            if image_url:
+                                logger.info(f"Картинка сгенерирована через FLUX [{channel_id}]")
+                        else:
+                            logger.debug(f"FAL_API_KEY не задан, FLUX пропущен [{channel_id}]")
+
+                    if not image_url:
+                        logger.warning(
+                            f"Пост без картинки [{channel_id}] — все источники промахнулись"
+                        )
+
+                post["image_url"] = image_url
+                post["has_image"] = bool(image_url)
+
+                # Считаем эмбеддинг поста (для семантич. дедупа и хранения)
+                cand_vec = await dedup.aembed(post["content"])
+
+                # Анти-повтор: семантически (по смыслу), с лексическим фолбэком
+                if await self._is_duplicate(channel_id, post["content"], cand_vec):
+                    logger.info(f"Пропускаю дубликат по смыслу [{channel_id}]: {topic_data['topic'][:40]}")
+                    skipped += 1
+                    continue
+
+                # Сохраняем вектор вместе с постом
+                if cand_vec is not None:
+                    post["embedding_blob"] = dedup.to_blob(cand_vec)
 
                 # Добавляем в буфер — сразу готов к публикации
                 buffer.add(post)
 
                 last_format = format_name
                 generated += 1
+                # Запоминаем тему внутри батча — чтобы следующие итерации
+                # не взяли её же под другим форматом
+                used_topics.append(topic_data["topic"])
 
                 logger.success(
                     f"Пост добавлен [{channel_id}] "
@@ -257,6 +348,49 @@ class ContentGenerator:
             "elapsed_seconds": elapsed,
             "channels": results,
         }
+
+    # --------------------------------------------------------
+    # Ступенчатая генерация (вместо ночного батча на все каналы)
+    # --------------------------------------------------------
+
+    async def run_top_up_cycle(self, batch_per_channel: int = 3, max_total: int = 30) -> dict:
+        """
+        Подливает посты понемногу: раз в час догенерирует небольшими порциями
+        ТОЛЬКО каналы с просевшим буфером. Распределяет нагрузку по дню вместо
+        одного большого батча ночью и держит темы свежими.
+
+        batch_per_channel — сколько постов максимум за раз на канал.
+        max_total — потолок постов за один цикл (чтобы не было пика).
+        """
+        channels = self._load_all_channels()
+        # сначала самые «голодные» каналы
+        channels.sort(key=lambda c: buffer.get_level(c["channel_id"]))
+
+        total = 0
+        results = []
+        for ch in channels:
+            if total >= max_total:
+                break
+            cid = ch["channel_id"]
+            level = buffer.get_level(cid)
+            if level >= cfg.BUFFER_MIN:
+                continue  # буфер в норме — пропускаем
+            need = min(batch_per_channel, max_total - total, cfg.BUFFER_MIN - level)
+            if need <= 0:
+                continue
+            try:
+                r = await self.run_for_channel(ch, target_count=need)
+                total += r.get("generated", 0)
+                results.append(r)
+            except Exception as e:
+                logger.error(f"Ступенчатая генерация: ошибка [{cid}]: {e}")
+                await self._log_error(cid, "generation", f"top_up: {e}")
+
+        if results:
+            logger.info(
+                f"Ступенчатая генерация: каналов={len(results)}, постов={total}"
+            )
+        return {"generated": total, "channels": results}
 
     # --------------------------------------------------------
     # Экстренная генерация (буфер упал ниже порога)
@@ -415,10 +549,33 @@ class ContentGenerator:
         """
         topics = []
         sources_used = []
+        channel_id = channel["channel_id"]
+
+        # --- Источник 0: Веб-поиск Claude (если topic_source == "search") ---
+        # Claude сам ищет свежие инфоповоды в интернете по теме канала.
+        # Не зависит от RSS-лент и не порождает повторяющихся заголовков.
+        if channel.get("topic_source") == "search":
+            try:
+                used = self._get_used_topics(channel_id, limit=20)
+                found = await get_topics(channel, count=count, used_topics=used)
+                for t in found:
+                    topics.append({"topic": t, "image_url": None, "source": "search"})
+                if found:
+                    sources_used.append("search")
+                    logger.info(f"Тем из веб-поиска [{channel_id}]: {len(found)}")
+                else:
+                    logger.warning(
+                        f"Веб-поиск не дал тем [{channel_id}] — откат на RSS/вечнозелёные"
+                    )
+            except Exception as e:
+                logger.warning(f"Веб-поиск недоступен [{channel_id}]: {e}")
+            # Если поиск дал достаточно — RSS/web не дёргаем
+            if len(topics) >= count:
+                return topics[:count], sources_used
 
         # --- Источник 1: RSS (приоритет из handbook) ---
         try:
-            articles = await rss.fetch_for_channel(channel, limit=count)
+            articles = await rss.fetch_for_channel(channel, limit=count - len(topics))
             if articles:
                 for article in articles:
                     topics.append({
@@ -492,21 +649,60 @@ class ContentGenerator:
 
         return random.choice(mapped)
 
-    async def _is_duplicate(self, channel_id: str, content: str) -> bool:
+    async def _is_duplicate(self, channel_id: str, content: str, cand_vec=None) -> bool:
         """
-        Проверяет, нет ли уже похожего поста в буфере.
-        Использует простое сравнение по общим словам.
+        Проверяет, нет ли уже похожего поста в буфере/истории канала.
+
+        Семантический путь (если есть эмбеддинг cand_vec): сравнивает по СМЫСЛУ
+        с сохранёнными векторами недавних постов — ловит перефраз. Порог cfg.DEDUP_THRESHOLD.
+        Лексический фолбэк (если эмбеддинги недоступны): сравнение по общим словам.
 
         Возвращает True если пост слишком похож на уже существующий.
         """
+        # ---- Семантический дедуп ----
+        if cand_vec is not None:
+            try:
+                with db.connect() as conn:
+                    rows = conn.execute(
+                        """
+                        SELECT embedding FROM posts
+                        WHERE channel_id = ?
+                          AND embedding IS NOT NULL
+                          AND (
+                            status IN ('ready', 'pending_review')
+                            OR (status = 'published'
+                                AND generated_at > datetime('now', '-14 days'))
+                          )
+                        ORDER BY generated_at DESC
+                        LIMIT 80
+                        """,
+                        (channel_id,),
+                    ).fetchall()
+
+                others = [dedup.from_blob(r["embedding"]) for r in rows if r["embedding"]]
+                if others:
+                    sim = dedup.max_similarity(cand_vec, others)
+                    if sim > cfg.DEDUP_THRESHOLD:
+                        logger.info(f"Семантический дубль [{channel_id}]: близость={sim:.3f}")
+                        return True
+                return False
+            except Exception as e:
+                logger.warning(f"Семантический дедуп ошибка: {e} — лексический фолбэк")
+
+        # ---- Лексический фолбэк (по общим словам) ----
         try:
             with db.connect() as conn:
                 recent_posts = conn.execute(
                     """
                     SELECT content FROM posts
-                    WHERE channel_id = ? AND status IN ('ready', 'pending_review')
+                    WHERE channel_id = ?
+                      AND (
+                        status IN ('ready', 'pending_review')
+                        OR (status = 'published'
+                            AND generated_at > datetime('now', '-14 days'))
+                      )
                     ORDER BY generated_at DESC
-                    LIMIT 20
+                    LIMIT 40
                     """,
                     (channel_id,),
                 ).fetchall()
@@ -514,7 +710,6 @@ class ContentGenerator:
             if not recent_posts:
                 return False
 
-            # Простое сравнение: если > 80% слов совпадают — дубликат
             new_words = set(content.lower().split())
             for row in recent_posts:
                 existing_words = set(row["content"].lower().split())
@@ -588,17 +783,48 @@ class ContentGenerator:
         Возвращает последние N тем опубликованных и готовых постов канала.
         Передаётся в Claude для дедупликации — чтобы не повторял темы.
         """
+        # Учитываем и недавно отброшенные (skipped) посты: иначе после очистки
+        # буфера те же темы из RSS/поиска сгенерируются повторно (одинаковые посты).
         with db.connect() as conn:
             rows = conn.execute(
                 """SELECT topic FROM posts
                    WHERE channel_id = ?
-                     AND status IN ('published', 'ready')
+                     AND status IN ('published', 'ready', 'skipped')
                      AND topic != ''
                    ORDER BY generated_at DESC
                    LIMIT ?""",
                 (channel_id, limit),
             ).fetchall()
         return [row["topic"] for row in rows if row["topic"]]
+
+    @staticmethod
+    def _normalize_topic(topic: str) -> str:
+        """Приводит тему к каноничному виду для сравнения (lower, схлопывание пробелов)."""
+        return re.sub(r"\s+", " ", (topic or "").lower()).strip()
+
+    def _topic_already_used(self, topic: str, used_topics: list[str]) -> bool:
+        """
+        True, если тема уже встречалась среди использованных
+        (точное совпадение или почти полное пересечение слов).
+        Защищает от повторяющихся RSS-заголовков (еженедельные треды Reddit и т.п.),
+        из-за которых Claude уходит в отказ вместо написания поста.
+        """
+        t = self._normalize_topic(topic)
+        if not t:
+            return False
+        tw = set(t.split())
+        for used in used_topics:
+            u = self._normalize_topic(used)
+            if not u:
+                continue
+            if t == u:
+                return True
+            uw = set(u.split())
+            if tw and uw:
+                overlap = len(tw & uw) / min(len(tw), len(uw))
+                if overlap >= 0.9:  # почти идентичные темы
+                    return True
+        return False
 
     def _load_channel_by_id(self, channel_id: str) -> dict | None:
         """Находит карточку канала по его handle."""
