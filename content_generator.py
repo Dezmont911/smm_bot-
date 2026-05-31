@@ -603,7 +603,7 @@ class ContentGenerator:
             except Exception as e:
                 logger.warning(f"web_scraper недоступен [{channel['channel_id']}]: {e}")
 
-        # --- Источник 3: Вечнозелёные темы (последний резерв) ---
+        # --- Источник 3: Вечнозелёные темы (резерв) ---
         while len(topics) < count:
             eg_topic = buffer.get_evergreen_topic(channel["channel_id"])
             if not eg_topic:
@@ -616,11 +616,40 @@ class ContentGenerator:
             if "evergreen" not in sources_used:
                 sources_used.append("evergreen")
 
+        # --- Источник 4: АБСОЛЮТНЫЙ резерв — углы по теме самого канала ---
+        # Срабатывает, только если все источники выше пусты (нет ни новостей, ни
+        # вечнозелёных в карточке). Гарантирует, что буфер не останется пустым:
+        # лучше пост по теме канала, чем ничего. Темы из живого тона выйдут норм.
+        if len(topics) < count:
+            base = (channel.get("topic", "") or "").split(",")[0].strip() or channel.get("name", "")
+            if base:
+                ANGLES = [
+                    "интересный неочевидный факт", "разбор для новичка",
+                    "частая ошибка и как её избежать", "практический совет из опыта",
+                    "мифы и правда", "свежий взгляд на привычное",
+                    "топ-подборка по теме", "короткая история из практики",
+                ]
+                for a in ANGLES:
+                    if len(topics) >= count:
+                        break
+                    topics.append({
+                        "topic": f"{base}: {a}",
+                        "image_url": None,
+                        "source": "fallback",
+                    })
+                if any(t["source"] == "fallback" for t in topics) and "fallback" not in sources_used:
+                    sources_used.append("fallback")
+                    logger.warning(
+                        f"Все источники тем пусты [{channel_id}] — резерв по теме канала «{base}»"
+                    )
+
         logger.debug(
             f"Тем собрано: {len(topics)} "
-            f"(RSS: {sum(1 for t in topics if t['source']=='rss')}, "
+            f"(search: {sum(1 for t in topics if t['source']=='search')}, "
+            f"RSS: {sum(1 for t in topics if t['source']=='rss')}, "
             f"web: {sum(1 for t in topics if t['source']=='web')}, "
-            f"вечнозелёных: {sum(1 for t in topics if t['source']=='evergreen')})"
+            f"вечнозелёных: {sum(1 for t in topics if t['source']=='evergreen')}, "
+            f"резерв: {sum(1 for t in topics if t['source']=='fallback')})"
         )
 
         return topics, sources_used

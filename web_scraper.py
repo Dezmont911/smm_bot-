@@ -216,6 +216,45 @@ medium:gaming"""
         clean = re.sub(r"\s+", " ", clean).strip()
         return clean
 
+    # Низкоусилийные паттерны заголовков Reddit (дают слабые посты)
+    _JUNK_TITLE_PATTERNS = (
+        r"^(almost|finally|done|ready|wip)\b",
+        r"^(rate|check out|look at|behold|introducing)\b",
+        r"^(my (first|new|latest))\b",
+        r"^(just (finished|made|did|got|built))\b",
+        r"^(any (tips|advice|help|ideas|recommendations))\b",
+        r"^(help|question|thoughts|opinions|update)\b",
+        r"^(day|update|part)\s*\d+",
+        r"^(is it just me|am i the only)\b",
+    )
+
+    @classmethod
+    def _looks_weak(cls, title: str, summary: str) -> bool:
+        """
+        True для мусорных заголовков-однострочников Reddit («Almost ready to go!»,
+        «Rate my base», «Day 3»). Если в summary есть содержательный текст —
+        пост спасаем (значит это нормальный текстовый пост, а не картинка с подписью).
+        """
+        import re
+        t = (title or "").strip()
+        s = (summary or "").strip()
+        if len(s) >= 80:
+            return False  # есть содержательное тело — годится
+
+        low = t.lower()
+        words = re.findall(r"[a-zA-Zа-яА-ЯёЁ]{3,}", t)
+        # слишком короткий или мало значащих слов
+        if len(t) < 20 or len(words) < 3:
+            return True
+        # шаблонные низкоусилийные открывашки
+        if any(re.search(p, low) for p in cls._JUNK_TITLE_PATTERNS):
+            return True
+        # почти нет букв (эмодзи/пунктуация)
+        letters = len(re.findall(r"[a-zA-Zа-яА-ЯёЁ]", t))
+        if letters / max(len(t), 1) < 0.5:
+            return True
+        return False
+
     async def _fetch_feed(self, url: str) -> list[dict]:
         """Читает RSS-ленту и возвращает список тем."""
         try:
@@ -224,12 +263,17 @@ medium:gaming"""
                 None, lambda: feedparser.parse(url)
             )
             articles = []
-            for entry in feed.entries[:8]:
+            skipped_weak = 0
+            for entry in feed.entries[:12]:
                 title   = entry.get("title", "").strip()
                 # Убираем HTML-теги из summary (Reddit кладёт туда таблицы)
                 raw_summary = entry.get("summary", "")
                 summary = self._strip_html(raw_summary)[:200].strip()
                 if not title or len(title) < 5:
+                    continue
+                # Отсекаем мусорные заголовки-однострочники (слабые посты)
+                if self._looks_weak(title, summary):
+                    skipped_weak += 1
                     continue
                 topic = f"{title}. {summary}" if summary else title
                 articles.append({
@@ -237,6 +281,8 @@ medium:gaming"""
                     "source":    url,
                     "image_url": None,
                 })
+            if skipped_weak:
+                logger.debug(f"web_scraper: пропущено слабых заголовков {skipped_weak} | {url}")
             return articles
         except Exception as e:
             logger.warning(f"Ошибка чтения ленты {url}: {e}")
