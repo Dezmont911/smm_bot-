@@ -933,7 +933,7 @@ async def screen_references(qm, context: ContextTypes.DEFAULT_TYPE, handle: str)
 
     rows.append([InlineKeyboardButton("➕ Добавить донор", callback_data=f"ui:ref_add:{handle}")])
     if refs:
-        rows.append([InlineKeyboardButton("🔄 Собрать ещё (10)", callback_data=f"ui:ref_import:{handle}")])
+        rows.append([InlineKeyboardButton("📥 Взять референсы", callback_data=f"ui:ref_take:{handle}")])
     rows.append([InlineKeyboardButton("◀️ К настройкам", callback_data=f"ui:ch_settings:{handle}")])
 
     await _answer_or_send(qm, "\n".join(lines), InlineKeyboardMarkup(rows))
@@ -983,17 +983,54 @@ async def action_ref_add(qm, context, handle: str):
         await qm.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
+REF_TAKE_MAX = 50  # потолок: больше не берём за раз (защита от «500»)
+
+
+async def screen_ref_take_count(qm, context, handle: str):
+    """Спрашивает, сколько постов взять: кнопки 5/10/20/50 или ввод числа (макс 50)."""
+    ch = _load_channel(handle)
+    if not ch or not ch.get("reference_channels"):
+        await qm.answer("Нет референсов")
+        return
+    # Готовим приём числа текстом (если пользователь напишет цифру)
+    context.user_data["editing"] = {"handle": handle, "field": "ref_count"}
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("5",  callback_data=f"ui:ref_go:{handle}:5"),
+            InlineKeyboardButton("10", callback_data=f"ui:ref_go:{handle}:10"),
+            InlineKeyboardButton("20", callback_data=f"ui:ref_go:{handle}:20"),
+            InlineKeyboardButton("50", callback_data=f"ui:ref_go:{handle}:50"),
+        ],
+        [InlineKeyboardButton("◀️ Отмена", callback_data=f"ui:ch_refs:{handle}")],
+    ])
+    await _answer_or_send(
+        qm,
+        "📥 <b>Сколько постов взять?</b>\n\n"
+        "Выбери кнопкой или пришли число (например <code>12</code>).\n"
+        f"Максимум — <b>{REF_TAKE_MAX}</b> за раз.",
+        kb,
+    )
+
+
 async def action_ref_import(qm, context, handle: str, count: int = 10):
     """
     Собирает ещё `count` постов доноров (relay-режим): сначала новые, если мало —
     добирает старые из архива. Медиа пересылается юзерботом в ЛС бота (без скачивания);
     медиа-посты появятся в очереди как только подтянется file_id.
     """
+    from telegram import CallbackQuery
+    context.user_data.pop("editing", None)  # ввод числа больше не ждём
+    count = max(1, min(int(count), REF_TAKE_MAX))  # кап: 1..50
+
     ch = _load_channel(handle)
     if not ch or not ch.get("reference_channels"):
-        await qm.answer("Нет референсов")
+        if isinstance(qm, CallbackQuery):
+            await qm.answer("Нет референсов")
         return
-    await qm.answer("⏳ Собираю посты…")
+    if isinstance(qm, CallbackQuery):
+        await qm.answer(f"⏳ Беру {count}…")
+    else:
+        await qm.reply_text(f"⏳ Беру {count}…")
     from reference_importer import import_for_channel
     try:
         res = await import_for_channel(ch, count=count)
@@ -1283,6 +1320,21 @@ async def handle_settings_text_input(update: Update, context: ContextTypes.DEFAU
         return False
 
     success_msg = None
+
+    # Ввод количества для «📥 Взять референсы» — не сохраняем карточку, а сразу импортируем
+    if field == "ref_count":
+        context.user_data.pop("editing", None)
+        digits = "".join(c for c in text if c.isdigit())
+        if not digits:
+            context.user_data["editing"] = {"handle": handle, "field": "ref_count"}
+            await update.message.reply_text(
+                f"⚠️ Пришли число, например <code>12</code> (максимум {REF_TAKE_MAX}).",
+                parse_mode=ParseMode.HTML,
+            )
+            return True
+        n = max(1, min(int(digits), REF_TAKE_MAX))
+        await action_ref_import(update.message, context, handle, n)
+        return True
 
     if field == "topic":
         ch["topic"] = text
@@ -1876,6 +1928,12 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "ref_add" and len(parts) >= 3:
         await action_ref_add(query, context, parts[2])
+
+    elif action == "ref_take" and len(parts) >= 3:
+        await screen_ref_take_count(query, context, parts[2])
+
+    elif action == "ref_go" and len(parts) >= 4:
+        await action_ref_import(query, context, parts[2], int(parts[3]))
 
     elif action == "ref_import" and len(parts) >= 3:
         await action_ref_import(query, context, parts[2])
