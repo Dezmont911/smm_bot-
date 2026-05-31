@@ -933,7 +933,7 @@ async def screen_references(qm, context: ContextTypes.DEFAULT_TYPE, handle: str)
 
     rows.append([InlineKeyboardButton("➕ Добавить донор", callback_data=f"ui:ref_add:{handle}")])
     if refs:
-        rows.append([InlineKeyboardButton("🔄 Импортировать сейчас", callback_data=f"ui:ref_import:{handle}")])
+        rows.append([InlineKeyboardButton("🔄 Собрать ещё (10)", callback_data=f"ui:ref_import:{handle}")])
     rows.append([InlineKeyboardButton("◀️ К настройкам", callback_data=f"ui:ch_settings:{handle}")])
 
     await _answer_or_send(qm, "\n".join(lines), InlineKeyboardMarkup(rows))
@@ -983,17 +983,33 @@ async def action_ref_add(qm, context, handle: str):
         await qm.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
-async def action_ref_import(qm, context, handle: str):
-    """Импортирует свежие посты доноров прямо сейчас."""
+async def action_ref_import(qm, context, handle: str, count: int = 10):
+    """
+    Собирает ещё `count` постов доноров (relay-режим): сначала новые, если мало —
+    добирает старые из архива. Медиа пересылается юзерботом в ЛС бота (без скачивания);
+    медиа-посты появятся в очереди как только подтянется file_id.
+    """
     ch = _load_channel(handle)
     if not ch or not ch.get("reference_channels"):
         await qm.answer("Нет референсов")
         return
-    await qm.answer("⏳ Импортирую…")
+    await qm.answer("⏳ Собираю посты…")
     from reference_importer import import_for_channel
     try:
-        res = await import_for_channel(ch)
-        msg = f"✅ Импорт завершён: добавлено <b>{res['added']}</b> постов из {res['refs']} донор(ов)."
+        res = await import_for_channel(ch, count=count)
+        dups = res.get("skipped_dups", 0)
+        lim = res.get("skipped_limits", 0)
+        notes = ""
+        if dups:
+            notes += f"\n🔁 Пропущено дублей: <b>{dups}</b>"
+        if lim:
+            notes += f"\n📏 Пропущено по лимиту видео/размера: <b>{lim}</b>"
+        msg = (
+            f"✅ Собрано: добавлено <b>{res['added']}</b> постов из {res['refs']} донор(ов).{notes}\n\n"
+            f"<i>Медиа-посты подтянутся в очередь по мере пересылки файлов ботом.</i>"
+        )
+        if res['added'] == 0 and not dups and not lim:
+            msg = "ℹ️ Новых постов нет, и архив на этом уровне исчерпан."
     except Exception as e:
         logger.error(f"Импорт референсов вручную [{handle}]: {e}")
         msg = f"❌ Ошибка импорта: {e}"

@@ -85,7 +85,7 @@ if 'embedding' not in cols:
     print("  ✅ Колонка embedding добавлена")
 else:
     print("  ℹ️  embedding уже есть")
-for _col in ('media_path', 'media_type'):
+for _col in ('media_path', 'media_type', 'tg_file_id'):
     if _col not in cols:
         conn.execute(f"ALTER TABLE posts ADD COLUMN {_col} TEXT")
         print(f"  ✅ Колонка {_col} добавлена")

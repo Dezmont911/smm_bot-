@@ -2735,6 +2735,50 @@ async def _post_after_ad(bot, channel_id: str, delay_seconds: int):
 
 
 # ============================================================
+# Relay-референсы: ловим медиа, пересланное юзерботом в ЛС бота
+# ============================================================
+
+async def handle_userbot_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Юзербот пересылает медиа-посты доноров в ЛС бота (обычный форвард). Здесь
+    достаём file_id и привязываем к ожидающей записи буфера (status=awaiting_media)
+    по ключу topic = 'ref:донор:msg_id'. Файл на диск НЕ пишем — храним file_id.
+    """
+    from buffer_manager import buffer
+    from reference_importer import ref_topic
+
+    msg = update.effective_message
+    if not msg:
+        return
+
+    # Должно быть переслано из канала-донора (forward_from_* в PTB 20.7)
+    src_chat = getattr(msg, "forward_from_chat", None)
+    src_id = getattr(msg, "forward_from_message_id", None)
+    donor = getattr(src_chat, "username", None) if src_chat else None
+    if not donor or not src_id:
+        return  # не форвард из канала с username — матчить нечем
+
+    # Достаём file_id и тип (порядок важен: animation проверяем до document)
+    file_id = media_type = None
+    if msg.photo:
+        file_id, media_type = msg.photo[-1].file_id, "photo"
+    elif getattr(msg, "animation", None):
+        file_id, media_type = msg.animation.file_id, "animation"
+    elif msg.video:
+        file_id, media_type = msg.video.file_id, "video"
+    elif msg.document:
+        file_id, media_type = msg.document.file_id, "document"
+    if not file_id:
+        return
+
+    topic = ref_topic(donor, src_id)
+    if buffer.attach_reference_media(topic, file_id, media_type):
+        logger.info(f"Relay: привязал {media_type} к {topic} → ready")
+    else:
+        logger.debug(f"Relay: нет awaiting_media для {topic} (уже привязано/чужой форвард)")
+
+
+# ============================================================
 # Публикация поста в канал
 # ============================================================
 
@@ -2962,6 +3006,9 @@ def main():
     import os
     proxy_url = os.getenv("PROXY_URL", "")
     builder = Application.builder().token(cfg.BOT_TOKEN)
+    # Обрабатываем апдейты параллельно: один медленный хендлер (напр. импорт
+    # референсов через Telethon) не должен морозить всю очередь команд.
+    builder = builder.concurrent_updates(True)
     if proxy_url:
         builder = builder.proxy_url(proxy_url).get_updates_proxy_url(proxy_url)
         logger.info(f"Используется прокси: {proxy_url}")
@@ -3078,6 +3125,14 @@ def main():
     # --- Кнопки: управление каналами ---
     app.add_handler(CallbackQueryHandler(handle_channel_actions, pattern="^(removech|confirmremove|cancelremove|settopic):"))
 
+    # --- Relay-референсы: медиа, пересланное юзерботом в ЛС бота ---
+    # ВАЖНО: регистрируем ДО handle_photo_for_post, иначе форварднутое фото
+    # перехватит обработчик «картинка для поста».
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & filters.FORWARDED,
+        handle_userbot_forward,
+    ))
+
     # --- Текстовые сообщения от админа (URL картинки / новая тема канала) ---
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND,
@@ -3086,7 +3141,7 @@ def main():
 
     # --- Фото от админа (картинка для поста) ---
     app.add_handler(MessageHandler(
-        filters.PHOTO & filters.ChatType.PRIVATE,
+        filters.PHOTO & filters.ChatType.PRIVATE & ~filters.FORWARDED,
         handle_photo_for_post,
     ))
 
@@ -3139,6 +3194,20 @@ def main():
             max_instances=1,
         )
 
+        # Чистка зависших relay-референсов: записи awaiting_media, к которым так
+        # и не пришло медиа от юзербота (удаляем, чтобы пост можно было взять заново).
+        async def _cleanup_awaiting():
+            from buffer_manager import buffer
+            buffer.cleanup_awaiting(older_than_minutes=60)
+
+        scheduler.add_job(
+            _cleanup_awaiting,
+            CronTrigger(minute=15),
+            id="cleanup_awaiting",
+            name="Чистка зависших awaiting_media",
+            misfire_grace_time=300,
+        )
+
         scheduler.start()
         application.bot_data["scheduler"] = scheduler
 
@@ -3146,7 +3215,8 @@ def main():
             "Планировщик запущен:\n"
             "  • Постер: каждый час (:00)\n"
             "  • Ступенчатая генерация: каждый час (:30), только просевшие каналы\n"
-            "  • Импорт референсов: раз в день (08:00 UTC)"
+            "  • Импорт референсов: раз в день (08:00 UTC)\n"
+            "  • Чистка awaiting_media: каждый час (:15)"
         )
 
     async def on_shutdown(application):

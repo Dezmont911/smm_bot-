@@ -75,8 +75,9 @@ class Database:
                     image_url    TEXT,                   -- URL картинки (из RSS или Unsplash) или NULL
                     parse_mode   TEXT DEFAULT 'Markdown', -- Markdown / HTML (для WB-постов)
                     embedding    BLOB,                    -- вектор поста (float32) для семантич. дедупа
-                    media_path   TEXT,                    -- локальный файл медиа (референс «как есть») или NULL
-                    media_type   TEXT,                    -- photo / video / NULL
+                    media_path   TEXT,                    -- локальный файл медиа (легаси-референс) или NULL
+                    media_type   TEXT,                    -- photo / video / document / animation / NULL
+                    tg_file_id   TEXT,                    -- file_id медиа в Telegram (relay-референс, без скачивания)
                     generated_at TEXT NOT NULL,          -- ISO timestamp
                     published_at TEXT,                   -- ISO timestamp или NULL
                     FOREIGN KEY (channel_id) REFERENCES channels(tg_handle)

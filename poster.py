@@ -292,6 +292,25 @@ class Poster:
     # Публикация поста
     # --------------------------------------------------------
 
+    async def _send_by_file_id(self, channel_id, file_id, media_type, caption, parse_mode) -> bool:
+        """Публикует relay-референс по file_id (медиа уже на серверах Telegram).
+        Без скачивания и без лимита 50 МБ. Пробует оба parse_mode."""
+        cap = caption or None
+        for pm in (parse_mode, None):
+            try:
+                if media_type == "video":
+                    await self.bot.send_video(chat_id=channel_id, video=file_id, caption=cap, parse_mode=pm)
+                elif media_type == "animation":
+                    await self.bot.send_animation(chat_id=channel_id, animation=file_id, caption=cap, parse_mode=pm)
+                elif media_type == "document":
+                    await self.bot.send_document(chat_id=channel_id, document=file_id, caption=cap, parse_mode=pm)
+                else:
+                    await self.bot.send_photo(chat_id=channel_id, photo=file_id, caption=cap, parse_mode=pm)
+                return True
+            except Exception as e:
+                logger.warning(f"send by file_id [{media_type}, parse={pm}] в {channel_id}: {e}")
+        return False
+
     async def _send_local_media(self, channel_id, path, media_type, caption, parse_mode) -> bool:
         """Отправляет локальный медиа-файл (референс «как есть»): фото или видео.
         Пробует оба parse_mode. Подпись может быть пустой."""
@@ -334,9 +353,17 @@ class Poster:
         image_url = post.get("image_url")
         post_parse_mode = post.get("parse_mode", "Markdown")
 
-        # ---- Референс-пост с готовым медиа-файлом (фото/видео «как есть») ----
-        media_path = post.get("media_path")
         media_type = post.get("media_type")
+
+        # ---- Relay-референс: публикуем по file_id (без скачивания, любой размер) ----
+        tg_file_id = post.get("tg_file_id")
+        if tg_file_id:
+            if await self._send_by_file_id(channel_id, tg_file_id, media_type, content, post_parse_mode):
+                return {"success": True, "used_image": True}
+            logger.warning(f"Не отправил по file_id [{channel_id}] — пробую как текст")
+
+        # ---- Легаси-референс с локальным медиа-файлом (фото/видео «как есть») ----
+        media_path = post.get("media_path")
         if media_path:
             import os
             if os.path.exists(media_path):

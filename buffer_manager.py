@@ -55,8 +55,8 @@ class BufferManager:
         with db.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO posts (id, channel_id, content, format, topic, status, generated_at, image_url, parse_mode, embedding, media_path, media_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO posts (id, channel_id, content, format, topic, status, generated_at, image_url, parse_mode, embedding, media_path, media_type, tg_file_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     post_id,
@@ -71,6 +71,7 @@ class BufferManager:
                     post.get("embedding_blob"),
                     post.get("media_path"),
                     post.get("media_type"),
+                    post.get("tg_file_id"),
                 ),
             )
 
@@ -88,6 +89,61 @@ class BufferManager:
             ids.append(post_id)
         logger.info(f"Добавлено {len(ids)} постов в буфер для {posts[0]['channel_id']}")
         return ids
+
+    def attach_reference_media(self, topic: str, file_id: str, media_type: str) -> bool:
+        """
+        Привязывает file_id к ожидающей записи (relay-референс).
+
+        Бот получил пересланное медиа в ЛС, вытащил file_id — записываем его в
+        пост со статусом 'awaiting_media' (матчим по topic = ref:донор:msg_id) и
+        переводим пост в 'ready' (готов к публикации по расписанию).
+        Возвращает True, если нашлась и обновилась ожидающая запись.
+        """
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM posts WHERE topic = ? AND status = 'awaiting_media' "
+                "ORDER BY generated_at ASC LIMIT 1",
+                (topic,),
+            ).fetchone()
+            if not row:
+                return False
+            conn.execute(
+                "UPDATE posts SET tg_file_id = ?, media_type = ?, status = 'ready' WHERE id = ?",
+                (file_id, media_type, row["id"]),
+            )
+        return True
+
+    def cleanup_awaiting(self, older_than_minutes: int = 60) -> int:
+        """
+        Удаляет зависшие записи 'awaiting_media' (медиа так и не пришло от юзербота).
+        Удаление, а не пометка — чтобы пост можно было импортировать заново
+        (дедуп по topic иначе навсегда бы его заблокировал). Возвращает число удалённых.
+        """
+        from datetime import datetime, timezone, timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=older_than_minutes)).isoformat()
+        with db.connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM posts WHERE status = 'awaiting_media' AND generated_at < ?",
+                (cutoff,),
+            )
+            n = cur.rowcount
+        if n:
+            logger.info(f"Очистка зависших awaiting_media: удалено {n}")
+        return n
+
+    def source_exists(self, channel_id: str, topic: str) -> bool:
+        """
+        Импортировали ли мы это исходное сообщение РАНЕЕ (в любом статусе)?
+
+        Для референсов topic = 'reference @донор #<msg_id>' — однозначный ключ
+        исходного сообщения. Защита от дублей при листании архива/повторных сборах.
+        """
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM posts WHERE channel_id = ? AND topic = ? LIMIT 1",
+                (channel_id, topic),
+            ).fetchone()
+        return row is not None
 
     # --------------------------------------------------------
     # Получение постов
