@@ -49,7 +49,7 @@ async def generate_image(
         logger.warning("Не удалось построить промпт для генерации")
         return None
 
-    logger.info(f"Генерация картинки | промпт: '{prompt[:80]}'")
+    logger.info(f"Картинка (FLUX): пост «{(topic or '')[:60]}…» → промпт '{prompt[:80]}'")
 
     # Шаг 2: запускаем FLUX через fal.ai
     try:
@@ -116,12 +116,18 @@ async def _build_image_prompt(
             "Avoid abstract concepts. Keep it under 50 words."
         )
 
+        # Передаём ВЕСЬ пост, но просим иллюстрировать его ЦЕНТРАЛЬНУЮ тему и
+        # игнорировать разговорную «воду» (приветствия, эмоции, мнения) — иначе
+        # эмоциональный крючок в начале уводит картинку не в тему.
         user_msg = (
             f"{context}"
-            f"Write an image generation prompt for this post topic: '{topic}'\n\n"
+            f"Below is a social-media post (may be in Russian, with conversational filler — "
+            f"greetings, emotions, opinions). Identify its CENTRAL concrete subject and write "
+            f"an image prompt illustrating THAT subject. Ignore the filler.\n\n"
+            f"Post:\n'{topic}'\n\n"
             f"Requirements:\n"
             f"- Photorealistic or high-quality digital art style\n"
-            f"- Relevant to the topic\n"
+            f"- Depicts the main subject of the post (not the emotional intro)\n"
             f"- No text, logos, watermarks in the image\n"
             f"- Return ONLY the prompt, nothing else"
         )

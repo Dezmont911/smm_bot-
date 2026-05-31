@@ -119,7 +119,7 @@ async def fetch_image_url(
     if anchor and anchor.lower() not in query.lower():
         query = f"{anchor} {query}"
 
-    logger.debug(f"Ищу картинку | запрос: '{query}'")
+    logger.info(f"Картинка (сток): пост «{(topic or '')[:60]}…» → запрос '{query}'")
 
     if cfg.PEXELS_API_KEY:
         url = await _search_pexels(query)
@@ -274,8 +274,10 @@ async def _build_english_query(topic: str, channel_topic: str = "") -> str:
         if re.match(r"^[a-zA-Z0-9\s]+$", ch_first):
             channel_context = ch_first.lower().split()[0]
 
-    # Берём только заголовок (до первой точки)
-    title = topic.split(".")[0].strip()[:120]
+    # ВЕСЬ текст поста — основа. title (первое предложение) оставляем только
+    # для фоллбэка, если Claude недоступен.
+    content = (topic or "").strip()
+    title = content.split(".")[0].strip()[:120]
 
     # Определяем язык заголовка
     latin_ratio = len(re.findall(r"[a-zA-Z]", title)) / max(len(title), 1)
@@ -315,53 +317,40 @@ async def _build_english_query(topic: str, channel_topic: str = "") -> str:
             "retro game console",
         ],
     }
-    # Для нишевых тематик (игры и др.) — сначала пробуем Claude для точного запроса.
-    # Например "Топ-5 модов для выживания" + "minecraft" → "minecraft survival mods gameplay"
-    # GAMING_QUERIES используем только как запасной вариант если Claude недоступен.
+    # ── ПЕРВИЧНО: определяем ГЛАВНЫЙ визуальный субъект по ВСЕМУ посту ──
+    # Раньше брали только первое предложение (title) — а с живым тоном это
+    # обычно эмоциональный крючок без визуального субъекта, отсюда нерелевант.
+    # Claude читает весь пост (любой язык), игнорирует «воду» и даёт визуальные
+    # ключи. Старая логика по first sentence — только фоллбэк.
+    try:
+        visual_query = await _extract_visual_keywords(content, channel_context)
+        if visual_query:
+            # Для игровых каналов принудительно держим название игры в запросе
+            # ("rate my house" → "minecraft house", а не "house interior").
+            if channel_context in GAMING_QUERIES and channel_context not in visual_query.lower():
+                visual_query = f"{channel_context} {visual_query}"
+            return visual_query
+    except Exception as e:
+        logger.debug(f"Claude visual extraction не удался: {e}")
+
+    # ── ФОЛЛБЭК (Claude недоступен): старая логика по первому предложению ──
     if channel_context in GAMING_QUERIES:
-        try:
-            visual_query = await _extract_visual_keywords(title, channel_context)
-            if visual_query:
-                # Принудительно добавляем название игры если Claude его потерял.
-                # Без этого "rate my house" → "house interior" вместо "minecraft house"
-                if channel_context not in visual_query.lower():
-                    visual_query = f"{channel_context} {visual_query}"
-                logger.debug(f"Claude gaming query: '{title[:50]}' → '{visual_query}'")
-                return visual_query
-        except Exception as e:
-            logger.debug(f"Claude gaming visual extraction не удался: {e}")
-        # Фоллбэк: рандомный вариант из списка
         return random.choice(GAMING_QUERIES[channel_context])
 
     if is_english:
-        # Заголовок на английском — просим Claude извлечь визуальные ключевые слова.
-        # Простая фильтрация стоп-слов давала мусор: "rate house" → финансовые фото
-        # вместо Minecraft. Claude понимает контекст и даёт правильный запрос.
-        try:
-            visual_query = await _extract_visual_keywords(title, channel_context)
-            if visual_query:
-                logger.debug(f"Claude visual query: '{title[:50]}' → '{visual_query}'")
-                return visual_query
-        except Exception as e:
-            logger.debug(f"Claude visual extraction не удался: {e}")
-
-        # Фоллбэк: старая логика если Claude недоступен
         words = re.findall(r"[a-zA-Z]+", title.lower())
         keywords = [w for w in words if w not in EN_STOP and len(w) > 3]
         title_part = " ".join(keywords[:2])
         if channel_context and title_part:
             return f"{channel_context} {title_part}"
-        return title_part or channel_context or "gaming"
+        return title_part or channel_context or "lifestyle"
     else:
-        # Заголовок на русском — переводим через Claude
         clean = re.sub(r"[^\w\s]", " ", title.lower())
         words = clean.split()
         keywords = [w for w in words if w not in _RU_STOP and len(w) > 2]
         ru_query = " ".join(keywords[:3]) or channel_topic.split(",")[0].strip()
-
         if not ru_query:
             return channel_context or "lifestyle"
-
         try:
             translated = await _translate_with_claude(ru_query)
             if translated:
@@ -370,33 +359,35 @@ async def _build_english_query(topic: str, channel_topic: str = "") -> str:
                 return translated
         except Exception as e:
             logger.debug(f"Claude перевод не удался: {e}")
-
         return channel_context or "lifestyle technology"
 
 
-async def _extract_visual_keywords(en_title: str, channel_context: str = "") -> str | None:
+async def _extract_visual_keywords(post_text: str, channel_context: str = "") -> str | None:
     """
-    Извлекает 2-3 визуальных ключевых слова из заголовка через Claude.
-    Учитывает контекст канала чтобы запрос был релевантным теме.
+    Определяет ГЛАВНЫЙ визуальный субъект по ВСЕМУ тексту поста через Claude и
+    возвращает 2-4 английских ключевых слова для поиска/генерации картинки.
+
+    Работает с любым языком и игнорирует «воду» живого тона (приветствия, эмоции,
+    мнения, призывы), беря то, что реально можно сфотографировать/нарисовать.
 
     Например:
-      "rate my house that I made in creative mode" + "minecraft"
-      → "minecraft house building creative"
-
-      "Top 5 survival mods" + "minecraft"
-      → "minecraft survival gameplay mods"
+      "Честно, я не верил… но этот мод на выживание в майнкрафте меняет всё"
+      + "minecraft" → "minecraft survival gameplay"
     """
-    context_hint = f'This is for a "{channel_context}" themed channel. ' if channel_context else ""
+    context_hint = f'The channel theme is "{channel_context}". ' if channel_context else ""
     prompt = (
         f"{context_hint}"
-        f"Generate 2-4 English keywords for a stock photo search that would visually illustrate this post title. "
-        f"The keywords must be specific and visual (things you can photograph or render). "
-        f"Return ONLY the keywords as a short phrase (max 4 words), no explanations, no punctuation: {en_title}"
+        "Below is a social-media post. It may be in Russian and contain conversational "
+        "filler — greetings, emotions, opinions, jokes, calls to action. IGNORE the filler "
+        "and identify the SINGLE main concrete subject of the post that can be photographed "
+        "or rendered. Return ONLY 2-4 English keywords for an image search — specific and "
+        "visual, no punctuation, no explanations.\n\nPost:\n"
+        f"{post_text[:600]}"
     )
 
     raw = await claude_text(
-        model="claude-haiku-4-5-20251001",  # Haiku — быстро и дёшево для 4 слов
-        max_tokens=20,
+        model="claude-haiku-4-5-20251001",  # Haiku — быстро и дёшево
+        max_tokens=30,
         messages=[{"role": "user", "content": prompt}],
     )
     if not raw:
