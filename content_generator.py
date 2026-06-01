@@ -598,6 +598,10 @@ class ContentGenerator:
             if "evergreen" not in sources_used:
                 sources_used.append("evergreen")
 
+        # --- Отсев тем с ЯВНЫМИ запретными словами ДО генерации ---
+        # (имплицитные Claude отсекает сам, мета-ответ ловит детектор отказов)
+        topics = self._drop_forbidden_topics(channel_id, topics)
+
         # --- Гейт релевантности: отсев off-topic тем ДО генерации (эмбеддинги) ---
         # Бьёт по дрейфу: Reddit/новости иногда дают темы не в тему канала.
         # evergreen/fallback не трогаем (они по построению на-тему). Если отсев
@@ -641,6 +645,29 @@ class ContentGenerator:
         )
 
         return topics, sources_used
+
+    def _drop_forbidden_topics(self, channel_id: str, topics: list[dict]) -> list[dict]:
+        """Убирает темы с ЯВНЫМИ запретными словами (политика/война/ЛГБТ/Украина и пр.)
+        до генерации — чтобы Claude не получал их и не выдавал мета-отказ."""
+        try:
+            from ai_client import DEFAULT_FORBIDDEN_TOPICS
+        except Exception:
+            return topics
+        terms = [t.strip().lower() for t in DEFAULT_FORBIDDEN_TOPICS if t.strip()]
+        kept, dropped = [], 0
+        for t in topics:
+            # синтез-резерв (fallback) по теме канала не трогаем
+            if t.get("source") == "fallback":
+                kept.append(t)
+                continue
+            text = (t.get("topic") or "").lower()
+            if any(term in text for term in terms):
+                dropped += 1
+                continue
+            kept.append(t)
+        if dropped:
+            logger.info(f"Запретные темы отсеяны [{channel_id}]: {dropped}")
+        return kept
 
     # Порог косинуса: тема считается «в теме канала», если близость к профилю ≥ порога.
     RELEVANCE_MIN = 0.28

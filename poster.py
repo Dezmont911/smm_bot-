@@ -542,6 +542,16 @@ class Poster:
         if await _send_text():
             return {"success": True, "used_image": False}
 
+        # Пост нечем публиковать (медиа-файл пропал, нет file_id/URL/текста) —
+        # помечаем skipped, чтобы не долбиться им каждый тик.
+        dead = (not (content or "").strip() and not image_url
+                and not post.get("tg_file_id")
+                and (not media_path or not __import__("os").path.exists(media_path)))
+        if dead:
+            buffer.mark_skipped(post["id"])
+            logger.warning(f"Пост [{channel_id}] нечем публиковать (медиа пропало/пусто) → skipped")
+            return {"success": False, "used_image": False}
+
         logger.error(f"Все попытки публикации в {channel_id} провалились")
         return {"success": False, "used_image": False}
 
