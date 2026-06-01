@@ -78,6 +78,8 @@ ADD_CHOOSE_METHOD, ADD_WAITING_EXPORT, ADD_EXPORT_HANDLE, ADD_EXPORT_CONFIRM, AD
 ADD_IMAGE_SOURCE, ADD_REDDIT_SUBS, ADD_WB_CATEGORIES = range(22, 25)
 # Добавление по @username через Telethon-юзербота (авто-анализ)
 ADD_USERNAME, ADD_USERNAME_CONFIRM = range(25, 27)
+# Массовое добавление: список @username за раз (тот же авто-анализ для каждого)
+ADD_BULK = 27
 
 
 # ============================================================
@@ -297,6 +299,7 @@ async def cmd_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔍 По ссылке / @username (авто)", callback_data="addmethod:username")],
+        [InlineKeyboardButton("📋 Списком (много сразу)",         callback_data="addmethod:bulk")],
         [InlineKeyboardButton("✏️ Описать вручную",              callback_data="addmethod:manual")],
         [InlineKeyboardButton("📂 Загрузить экспорт Telegram",   callback_data="addmethod:export")],
     ])
@@ -773,6 +776,20 @@ async def handle_add_method_choice(update: Update, context: ContextTypes.DEFAULT
         )
         return ADD_USERNAME
 
+    if method == "bulk":
+        await query.edit_message_text(
+            "📋 <b>Массовое добавление</b>\n\n"
+            "Пришли список публичных каналов — по одному в строке "
+            "(или через запятую). До <b>20</b> за раз.\n\n"
+            "Например:\n"
+            "<code>@channel1\n@channel2\nhttps://t.me/channel3</code>\n\n"
+            "Бот прочитает каждый юзерботом, сам определит тему/стиль/источники "
+            "и создаст карточки. Автопубликация у всех будет выключена.\n\n"
+            "/cancel — отменить",
+            parse_mode=ParseMode.HTML,
+        )
+        return ADD_BULK
+
     if method == "export":
         await query.edit_message_text(
             "📂 <b>Загрузка экспорта</b>\n\n"
@@ -1235,6 +1252,92 @@ async def handle_username_confirm(update: Update, context: ContextTypes.DEFAULT_
             [InlineKeyboardButton("◀️ В меню",                     callback_data="ui:main")],
         ]),
         parse_mode=ParseMode.HTML,
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def handle_add_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Массовое добавление: список @username за раз. Для каждого — тот же авто-пайплайн
+    (юзербот читает канал → анализ → карточка). Ошибки по каналу не рвут весь процесс.
+    """
+    from userbot_reader import read_channel, normalize_handle, UserbotNotAuthorized
+    from channel_analyzer import analyzer
+
+    raw = update.message.text or ""
+    # режем по строкам/запятым/пробелам, нормализуем, убираем дубли
+    tokens = raw.replace(",", "\n").split()
+    handles, seen = [], set()
+    for t in tokens:
+        h = normalize_handle(t)
+        if h and h != "@" and h.lower() not in seen:
+            seen.add(h.lower())
+            handles.append(h)
+
+    if not handles:
+        await update.message.reply_text(
+            "⚠️ Не нашёл ни одного @username. Пришли списком, по одному в строке.\n/cancel",
+        )
+        return ADD_BULK
+
+    MAX = 20
+    if len(handles) > MAX:
+        await update.message.reply_text(
+            f"⚠️ Прислано {len(handles)} — это много. Беру первые {MAX}, остальные пришли отдельно."
+        )
+        handles = handles[:MAX]
+
+    existing = {c["channel_id"].lower() for c in load_all_channels()}
+    progress = await update.message.reply_text(f"⏳ Обрабатываю {len(handles)} каналов…")
+
+    added, skipped = [], []
+    for i, handle in enumerate(handles, 1):
+        try:
+            if handle.lower() in existing:
+                skipped.append((handle, "уже добавлен"))
+            else:
+                data = await read_channel(handle, limit=50)
+                if data["post_count"] < 3:
+                    skipped.append((handle, f"мало постов ({data['post_count']})"))
+                else:
+                    analysis = await analyzer.analyze_posts(
+                        data["title"], data["posts"], about=data["about"]
+                    )
+                    await _create_channel_from_analysis(analysis, data["handle"], data["title"])
+                    existing.add(data["handle"].lower())
+                    added.append(data["handle"])
+        except UserbotNotAuthorized:
+            skipped.append((handle, "юзербот не авторизован — стоп"))
+            break  # без юзербота дальше смысла нет
+        except ValueError as e:
+            skipped.append((handle, str(e)[:60]))
+        except Exception as e:
+            logger.error(f"Массовое добавление {handle}: {e}")
+            skipped.append((handle, "ошибка чтения/анализа"))
+
+        try:
+            await progress.edit_text(
+                f"⏳ {i}/{len(handles)} … ✅ {len(added)}  ⏭ {len(skipped)}"
+            )
+        except Exception:
+            pass
+
+    lines = [f"📋 <b>Массовое добавление завершено</b>\n", f"✅ Добавлено: <b>{len(added)}</b>"]
+    if added:
+        lines.append("\n".join(f"  • {h}" for h in added))
+    if skipped:
+        lines.append(f"\n⏭ Пропущено: <b>{len(skipped)}</b>")
+        lines.append("\n".join(f"  • {h} — {r}" for h, r in skipped))
+    lines.append(
+        "\n⏸ Автопубликация у всех выключена — включи через /schedule.\n"
+        "⚠️ Добавь бота админом в каждый канал, чтобы он мог публиковать."
+    )
+    text = "\n".join(lines)
+    await progress.edit_text(
+        text[:4000],
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ В меню", callback_data="ui:main")]]),
     )
     context.user_data.clear()
     return ConversationHandler.END
@@ -3029,6 +3132,7 @@ def main():
             # Авто-добавление по @username (Telethon-юзербот)
             ADD_USERNAME:         [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_username)],
             ADD_USERNAME_CONFIRM: [CallbackQueryHandler(handle_username_confirm, pattern="^usernameconfirm:")],
+            ADD_BULK:             [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_bulk)],
 
             # Экспорт-флоу
             ADD_WAITING_EXPORT: [MessageHandler(filters.Document.ALL, handle_export_upload)],
