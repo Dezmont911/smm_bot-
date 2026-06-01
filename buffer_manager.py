@@ -192,6 +192,15 @@ class BufferManager:
             )
         return True
 
+    def has_pending_overlay(self, channel_id: str) -> bool:
+        """Есть ли у канала необработанное РСЯ-перекрытие (реклама поймана, пост ещё не вышел)?"""
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM processed_ads WHERE channel_id = ? AND status = 'detected' LIMIT 1",
+                (channel_id,),
+            ).fetchone()
+        return row is not None
+
     def get_due_ads(self, now_iso: str) -> list[dict]:
         """Перекрытия, которым пора публиковаться (status='detected', due_at <= now)."""
         with db.connect() as conn:

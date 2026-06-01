@@ -2741,14 +2741,23 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     channel_id = f"@{message.chat.username}" if message.chat.username else str(message.chat.id)
 
-    if not is_rsy_ad(message):
-        return  # обычный пост — ничего не делаем
-
-    # Проверяем что для этого канала включено перекрытие РСЯ
+    # Это наш канал? (бот видит channel_post только по каналам, где он админ)
     channels = load_all_channels()
     channel = next((c for c in channels if c["channel_id"] == channel_id), None)
-    if not channel or not channel.get("rsy_override", False):
-        return  # перекрытие выключено для этого канала
+    if not channel:
+        return  # не наш канал — игнор
+
+    if not is_rsy_ad(message):
+        # Обычный (ручной) пост админа — это публикация. Бот свои посты обратно
+        # как апдейт НЕ получает, значит это ручной пост → фиксируем время, чтобы
+        # ближайший плановый слот (в пределах MIN_GAP) не выдал дубль.
+        poster.record_published(channel_id)
+        logger.info(f"Ручной пост в {channel_id} — обновил last_published (слот рядом пропустится)")
+        return
+
+    # Реклама РСЯ. Перекрываем только если включено для канала.
+    if not channel.get("rsy_override", False):
+        return  # перекрытие выключено — плановый слот сам прикроет рекламу
 
     logger.info(f"📢 Обнаружена реклама РСЯ в {channel_id} | message_id: {message.message_id}")
 
@@ -2793,6 +2802,15 @@ async def process_due_ads(bot):
                 continue
         except Exception:
             pass
+
+        # Только что публиковали (< MIN_GAP)? Лента и так свежая — перекрытие не нужно,
+        # чтобы не было двух постов подряд. Реклама подождёт следующего окна.
+        from poster import MIN_PUBLISH_GAP_MIN
+        mins = poster.minutes_since_published(cid)
+        if mins is not None and mins < MIN_PUBLISH_GAP_MIN:
+            buffer.mark_ad_failed(ad_id, "skipped")
+            logger.info(f"РСЯ-перекрытие {cid} пропущено: публиковали {mins:.0f} мин назад")
+            continue
 
         try:
             # Буфер пуст — экстренно генерируем 1 пост

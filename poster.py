@@ -34,6 +34,12 @@ from image_fetcher import fetch_image_url
 from image_generator import generate_image as generate_ai_image
 
 
+# Минимальный интервал между публикациями в канале (минуты). Если с прошлой
+# публикации (плановой / РСЯ-перекрытия / ручного поста админа) прошло меньше —
+# ближайший слот пропускаем, чтобы не было двух постов подряд.
+MIN_PUBLISH_GAP_MIN = 40
+
+
 class Poster:
     """Публикует посты из буфера в Telegram-каналы."""
 
@@ -92,6 +98,22 @@ class Poster:
         if current_hour not in post_hours:
             return  # не время — пропускаем
 
+        # Правило 1: есть ожидающее РСЯ-перекрытие → слот пропускаем,
+        # перекрытие выйдет само (иначе был бы дубль: плановый + перекрытие рядом).
+        if buffer.has_pending_overlay(channel_id):
+            logger.info(f"Слот {channel_id} пропущен: ждёт РСЯ-перекрытие")
+            return
+
+        # Правило 2: только что публиковали (< MIN_GAP) → слот пропускаем,
+        # чтобы не было двух постов подряд (ручной пост / перекрытие / прошлый слот).
+        mins = self.minutes_since_published(channel_id)
+        if mins is not None and mins < MIN_PUBLISH_GAP_MIN:
+            logger.info(
+                f"Слот {channel_id} пропущен: публиковали {mins:.0f} мин назад "
+                f"(< {MIN_PUBLISH_GAP_MIN} мин)"
+            )
+            return
+
         # Берём следующий пост из буфера
         post = buffer.get_next(channel_id)
 
@@ -106,6 +128,7 @@ class Poster:
 
         if result["success"]:
             buffer.mark_published(post["id"])
+            self.record_published(channel_id)
             logger.success(
                 f"Опубликован пост в {channel_id} | "
                 f"формат: {post.get('format', '?')} | "
@@ -232,6 +255,39 @@ class Poster:
             except Exception:
                 continue
         return None
+
+    def record_published(self, channel_id: str):
+        """Запоминает время последней публикации в канале (в карточку JSON).
+        Используется для минимального интервала между постами (MIN_PUBLISH_GAP_MIN)."""
+        import json
+        from pathlib import Path
+        channels_dir = Path(__file__).parent / "channels"
+        now = datetime.now(timezone.utc).isoformat()
+        for jf in channels_dir.glob("*.json"):
+            try:
+                with open(jf, encoding="utf-8") as f:
+                    ch = json.load(f)
+                if ch.get("channel_id") == channel_id:
+                    ch["last_published_utc"] = now
+                    with open(jf, "w", encoding="utf-8") as wf:
+                        json.dump(ch, wf, ensure_ascii=False, indent=2)
+                    return
+            except Exception:
+                continue
+
+    def minutes_since_published(self, channel_id: str) -> float | None:
+        """Сколько минут прошло с последней публикации, или None если не было."""
+        ch = self._load_channel_by_id(channel_id)
+        ts = ch.get("last_published_utc") if ch else None
+        if not ts:
+            return None
+        try:
+            dt = datetime.fromisoformat(ts)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - dt).total_seconds() / 60
+        except Exception:
+            return None
 
     async def _regenerate_image(self, post: dict) -> str | None:
         """
@@ -627,6 +683,7 @@ class Poster:
         result = await self._publish(post)
         if result["success"]:
             buffer.mark_published(post["id"])
+            self.record_published(channel_id)
             return {"success": True, "post": post, "used_image": result["used_image"]}
         else:
             return {"success": False, "error": "Ошибка отправки в Telegram"}
