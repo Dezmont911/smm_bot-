@@ -59,6 +59,26 @@ def _msg_html(msg) -> str:
         return raw
 
 
+def _match_key(msg, donor_user: str):
+    """
+    Ключ, под которым БОТ увидит это сообщение в forward_from_chat/_message_id.
+    Если донор сам репостит из другого канала, Telegram сохраняет ИСХОДНЫЙ источник
+    (оригинальный канал + его msg_id) — матчить надо по нему, иначе ключи не сойдутся.
+    Возвращает (username_lower, msg_id). Пересылку всё равно делаем по id донора.
+    """
+    try:
+        f = msg.forward
+        if f is not None:
+            cp = getattr(f, "channel_post", None)
+            ch = getattr(f, "chat", None)
+            uname = getattr(ch, "username", None) if ch else None
+            if uname and cp:
+                return uname.lower(), int(cp)
+    except Exception:
+        pass
+    return donor_user.lower(), msg.id
+
+
 def _classify_and_check(msg, max_video_mb, max_video_sec, max_doc_mb):
     """
     Определяет тип медиа сообщения и проверяет лимиты для relay.
@@ -198,19 +218,24 @@ async def read_candidates(
                         skipped.append({"id": m.id, "reason": reason})
                         logger.info(f"Пропуск (член альбома) {real_username}/{m.id}: {reason}")
                         continue
-                    members.append({"id": m.id, "kind": kind})
+                    mu, mid = _match_key(m, real_username)
+                    # id — для пересылки (из донора); match_* — как увидит бот (источник)
+                    members.append({"id": m.id, "kind": kind, "match_user": mu, "match_id": mid})
                 if not members:
                     continue  # весь альбом не прошёл лимиты
                 if len(members) == 1:
-                    # остался один кадр — это обычное одиночное медиа, не альбом
-                    posts.append({"id": members[0]["id"], "text": text, "text_html": text_html, "media_kind": members[0]["kind"]})
+                    mm = members[0]
+                    posts.append({"id": mm["id"], "text": text, "text_html": text_html,
+                                  "media_kind": mm["kind"], "match_user": mm["match_user"], "match_id": mm["match_id"]})
                 else:
                     posts.append({
                         "id": members[0]["id"],     # якорь = первый годный кадр
                         "text": text,
                         "text_html": text_html,
                         "media_kind": "album",
-                        "members": members,         # [{id, kind}, ...] по порядку
+                        "members": members,
+                        "match_user": members[0]["match_user"],
+                        "match_id": members[0]["match_id"],
                     })
             else:
                 m = msgs[0]
@@ -221,7 +246,9 @@ async def read_candidates(
                     continue
                 if not text and not kind:
                     continue
-                posts.append({"id": m.id, "text": text, "text_html": text_html, "media_kind": kind})
+                mu, mid = _match_key(m, real_username)
+                posts.append({"id": m.id, "text": text, "text_html": text_html,
+                              "media_kind": kind, "match_user": mu, "match_id": mid})
 
         posts.reverse()  # от старых к новым
         if min_id is None:

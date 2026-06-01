@@ -116,7 +116,9 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
     """
     from ai_client import rephrase_text  # ленивый импорт (тяжёлая зависимость)
 
-    topic = ref_topic(handle, p["id"])
+    # Ключ — по ЭФФЕКТИВНОМУ источнику (что увидит бот в forward_from_*): если донор
+    # репостит из другого канала, это оригинальный канал+id. Иначе — сам донор+id.
+    topic = ref_topic(p.get("match_user") or handle, p.get("match_id") or p["id"])
     raw = p.get("text", "")
 
     # «Как есть» — HTML (со ссылками); перефраз — простой текст без формата
@@ -138,15 +140,17 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
         return None  # пустой пост без медиа
 
     if kind == "album":
-        member_ids = [m["id"] for m in p.get("members", [])]
+        # members в JSON — origin-id (как увидит бот), для пересылки — id донора
+        member_match_ids = [m.get("match_id", m["id"]) for m in p.get("members", [])]
+        forward_ids = [m["id"] for m in p.get("members", [])]
         buffer.add({
             "channel_id": channel_id, "content": content or "",
             "format": "reference", "topic": topic,
             "media_type": "album", "status": "awaiting_media",
             "parse_mode": parse_mode,
-            "tg_file_id": json.dumps({"members": member_ids, "items": {}}),
+            "tg_file_id": json.dumps({"members": member_match_ids, "items": {}}),
         })
-        return member_ids
+        return forward_ids
     elif kind:
         buffer.add({
             "channel_id": channel_id, "content": content or "",
@@ -214,7 +218,7 @@ async def import_for_channel(channel: dict, count: int = DEFAULT_TAKE) -> dict:
             stored = None
             while q["cands"]:
                 p = q["cands"].pop(0)
-                topic = ref_topic(q["handle"], p["id"])
+                topic = ref_topic(p.get("match_user") or q["handle"], p.get("match_id") or p["id"])
                 if buffer.source_exists(channel_id, topic):
                     skipped_dups += 1
                     continue
