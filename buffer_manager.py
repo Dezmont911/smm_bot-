@@ -262,6 +262,24 @@ class BufferManager:
             )
             return cur.rowcount
 
+    def set_draft_content(self, post_id: str, content: str) -> bool:
+        """Меняет текст/подпись черновика."""
+        with db.connect() as conn:
+            cur = conn.execute(
+                "UPDATE posts SET content = ? WHERE id = ? AND status = 'draft'",
+                (content, post_id),
+            )
+            return cur.rowcount > 0
+
+    def set_draft_media(self, post_id: str, file_id: str, media_type: str) -> bool:
+        """Меняет медиа черновика (по file_id)."""
+        with db.connect() as conn:
+            cur = conn.execute(
+                "UPDATE posts SET tg_file_id = ?, media_type = ? WHERE id = ? AND status = 'draft'",
+                (file_id, media_type, post_id),
+            )
+            return cur.rowcount > 0
+
     def delete_all_drafts(self, channel_id: str) -> int:
         """Удаляет все черновики канала. Возвращает число удалённых."""
         with db.connect() as conn:

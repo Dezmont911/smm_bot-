@@ -2654,6 +2654,12 @@ async def handle_image_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if await create_draft_from_message(update, context):
             return
 
+    # Правка черновика (текст/медиа)
+    if context.user_data.get("draft_edit") or context.user_data.get("draft_media"):
+        from ui import apply_draft_edit_message
+        if await apply_draft_edit_message(update, context):
+            return
+
     # Поиск канала (из «Мои каналы → 🔍 Поиск»)
     if context.user_data.pop("channel_search", False):
         from ui import screen_channels_search

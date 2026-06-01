@@ -1191,10 +1191,16 @@ async def _reply_draft_card(msg_obj, d: dict, num: str):
     cap = f"{num} <b>{_draft_type_label(d)}</b>\n{preview}"
     if len(cap) > 1024:
         cap = cap[:1020] + "…"
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("📤 В очередь", callback_data=f"ui:draft_q:{d['id']}"),
-        InlineKeyboardButton("🗑 Удалить",   callback_data=f"ui:draft_del:{d['id']}"),
-    ]])
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Текст", callback_data=f"ui:draft_edit:{d['id']}"),
+            InlineKeyboardButton("🖼 Медиа",  callback_data=f"ui:draft_media:{d['id']}"),
+        ],
+        [
+            InlineKeyboardButton("📤 В очередь", callback_data=f"ui:draft_q:{d['id']}"),
+            InlineKeyboardButton("🗑 Удалить",   callback_data=f"ui:draft_del:{d['id']}"),
+        ],
+    ])
     mt, fid = d.get("media_type"), d.get("tg_file_id")
     try:
         if mt == "album" and fid:
@@ -1261,6 +1267,22 @@ async def screen_drafts(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
     foot.append([InlineKeyboardButton("🗑 Очистить все черновики", callback_data=f"ui:draft_clear:{handle}")])
     foot.append([InlineKeyboardButton("↩️ Назад к каналу", callback_data=f"ui:ch:{handle}")])
     await msg_obj.reply_text("⬇️ Действия с черновиками:", reply_markup=InlineKeyboardMarkup(foot))
+
+
+async def action_draft_edit_text(qm, context: ContextTypes.DEFAULT_TYPE, post_id: str):
+    """Включает режим ввода нового текста/подписи для черновика."""
+    handle = buffer.get_post_channel(post_id)
+    context.user_data["draft_edit"] = post_id
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К черновикам", callback_data=f"ui:ch_draft:{handle}")]])
+    await _answer_or_send(qm, "✏️ Пришли <b>новый текст</b> (подпись) для этого черновика.", kb)
+
+
+async def action_draft_edit_media(qm, context: ContextTypes.DEFAULT_TYPE, post_id: str):
+    """Включает режим замены медиа черновика."""
+    handle = buffer.get_post_channel(post_id)
+    context.user_data["draft_media"] = post_id
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К черновикам", callback_data=f"ui:ch_draft:{handle}")]])
+    await _answer_or_send(qm, "🖼 Пришли <b>новое фото или видео</b> — заменю медиа черновика.", kb)
 
 
 async def action_draft_clear_confirm(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
@@ -1352,6 +1374,49 @@ async def create_draft_from_message(update: Update, context: ContextTypes.DEFAUL
         reply_markup=kb,
     )
     return True
+
+
+async def apply_draft_edit_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Применяет правку черновика (текст или медиа), если включён режим. True если обработано."""
+    msg = update.message
+    if not msg:
+        return False
+
+    pid = context.user_data.get("draft_edit")
+    if pid:
+        text = (msg.text or msg.caption or "").strip()
+        if not text:
+            await msg.reply_text("⚠️ Пришли текст.")
+            return True
+        context.user_data.pop("draft_edit", None)
+        handle = buffer.get_post_channel(pid)
+        buffer.set_draft_content(pid, text)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К черновикам", callback_data=f"ui:ch_draft:{handle}")]])
+        await msg.reply_text("✅ Текст черновика обновлён.", reply_markup=kb)
+        return True
+
+    pid = context.user_data.get("draft_media")
+    if pid:
+        file_id = media_type = None
+        if msg.photo:
+            file_id, media_type = msg.photo[-1].file_id, "photo"
+        elif getattr(msg, "animation", None):
+            file_id, media_type = msg.animation.file_id, "animation"
+        elif msg.video:
+            file_id, media_type = msg.video.file_id, "video"
+        elif msg.document:
+            file_id, media_type = msg.document.file_id, "document"
+        if not file_id:
+            await msg.reply_text("⚠️ Пришли фото или видео.")
+            return True
+        context.user_data.pop("draft_media", None)
+        handle = buffer.get_post_channel(pid)
+        buffer.set_draft_media(pid, file_id, media_type)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К черновикам", callback_data=f"ui:ch_draft:{handle}")]])
+        await msg.reply_text("✅ Медиа черновика заменено.", reply_markup=kb)
+        return True
+
+    return False
 
 
 async def action_draft_queue(qm, context: ContextTypes.DEFAULT_TYPE, post_id: str):
@@ -2133,6 +2198,12 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "draft_del" and len(parts) >= 3:
         await action_draft_delete(query, context, parts[2])
+
+    elif action == "draft_edit" and len(parts) >= 3:
+        await action_draft_edit_text(query, context, parts[2])
+
+    elif action == "draft_media" and len(parts) >= 3:
+        await action_draft_edit_media(query, context, parts[2])
 
     elif action == "draft_view" and len(parts) >= 3:
         await action_draft_view(query, context, parts[2])
