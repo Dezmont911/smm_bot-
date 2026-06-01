@@ -598,6 +598,12 @@ class ContentGenerator:
             if "evergreen" not in sources_used:
                 sources_used.append("evergreen")
 
+        # --- Гейт релевантности: отсев off-topic тем ДО генерации (эмбеддинги) ---
+        # Бьёт по дрейфу: Reddit/новости иногда дают темы не в тему канала.
+        # evergreen/fallback не трогаем (они по построению на-тему). Если отсев
+        # оставил мало — Источник 4 ниже доберёт резервом по теме канала.
+        topics = await self._filter_relevant(channel, topics, count)
+
         # --- Источник 4: АБСОЛЮТНЫЙ резерв — углы по теме самого канала ---
         # Срабатывает, только если все источники выше пусты (нет ни новостей, ни
         # вечнозелёных в карточке). Гарантирует, что буфер не останется пустым:
@@ -635,6 +641,59 @@ class ContentGenerator:
         )
 
         return topics, sources_used
+
+    # Порог косинуса: тема считается «в теме канала», если близость к профилю ≥ порога.
+    RELEVANCE_MIN = 0.28
+
+    async def _filter_relevant(self, channel: dict, topics: list[dict], count: int) -> list[dict]:
+        """
+        Отсев off-topic тем по эмбеддингам (reuse dedup). evergreen/fallback не трогаем.
+        In-scope fallback: не оставляем меньше floor — добираем лучших из отсеянных,
+        чтобы гейт никогда не приводил к пустому буферу. Порядок тем сохраняем.
+        """
+        if not topics or dedup.backend() != "embedding":
+            return topics  # без эмбеддингов гейт не работает — пропускаем как есть
+
+        channel_id = channel["channel_id"]
+        profile = " ".join(p for p in [
+            channel.get("topic", ""),
+            channel.get("name", ""),
+            ", ".join(channel.get("image_keywords", []) or []),
+        ] if p).strip()
+        if not profile:
+            return topics
+        prof_vec = await dedup.aembed(profile)
+        if prof_vec is None:
+            return topics
+
+        results, dropped = [], []
+        for t in topics:
+            if t.get("source") in ("evergreen", "fallback"):
+                results.append(t)
+                continue
+            vec = await dedup.aembed((t.get("topic") or "")[:300])
+            if vec is None:
+                results.append(t)
+                continue
+            sim = dedup.cosine(prof_vec, vec)
+            if sim >= self.RELEVANCE_MIN:
+                results.append(t)
+            else:
+                dropped.append((sim, t))
+
+        # Гарантируем минимум кандидатов: добираем лучших из отсеянных
+        floor = max(3, count // 2)
+        if len(results) < floor and dropped:
+            dropped.sort(key=lambda x: x[0], reverse=True)
+            results += [t for _, t in dropped[:floor - len(results)]]
+
+        if dropped:
+            ex = "; ".join(f"{sim:.2f} {t.get('topic','')[:35]}" for sim, t in dropped[:3])
+            logger.info(
+                f"Гейт релевантности [{channel_id}]: отсеяно off-topic {len(dropped)} "
+                f"(порог {self.RELEVANCE_MIN}), оставлено {len(results)} | примеры: {ex}"
+            )
+        return results
 
     def _pick_format(self, channel: dict, last_format: str | None) -> str:
         """
