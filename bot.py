@@ -362,7 +362,7 @@ async def cmd_add_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Проверяем нет ли уже такого канала
     existing = load_all_channels()
-    if any(ch["channel_id"] == handle for ch in existing):
+    if any(ch["channel_id"].lower() == handle.lower() for ch in existing):
         await update.message.reply_text(
             f"❌ Канал {handle} уже добавлен.\n/cancel — отменить"
         )
@@ -952,7 +952,7 @@ async def handle_export_handle(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # Проверяем дублирование
     existing = load_all_channels()
-    if any(ch["channel_id"] == handle for ch in existing):
+    if any(ch["channel_id"].lower() == handle.lower() for ch in existing):
         await update.message.reply_text(
             f"❌ Канал {handle} уже добавлен.\nПришли другой handle или /cancel"
         )
