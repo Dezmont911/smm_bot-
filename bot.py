@@ -353,7 +353,7 @@ async def cmd_add_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_channel"] = {"channel_id": handle}
     await update.message.reply_text(
         f"✅ Handle: <b>{handle}</b>\n\n"
-        f"Шаг 2/5: Как называется канал?\n"
+        f"Шаг 2/3: Как называется канал?\n"
         f"Например: <i>Финансы для людей</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=_add_cancel_kb(),
@@ -366,8 +366,9 @@ async def cmd_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_channel"]["name"] = update.message.text.strip()
     await update.message.reply_text(
         f"✅ Название сохранено.\n\n"
-        f"Шаг 3/5: <b>Тема канала</b> — о чём пишем?\n"
-        f"Например: <i>личные финансы, инвестиции, сбережения</i>",
+        f"Шаг 3/3: <b>Тема канала</b> — о чём пишем?\n"
+        f"Например: <i>личные финансы, инвестиции, сбережения</i>\n\n"
+        f"<i>Тон, источники тем и картинки настроятся автоматически.</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=_add_cancel_kb(),
     )
@@ -379,7 +380,7 @@ async def cmd_add_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_channel"]["topic"] = update.message.text.strip()
     await update.message.reply_text(
         "✅ Тема сохранена.\n\n"
-        "Шаг 3.5/5: <b>Тип канала</b>\n\n"
+        "Последний шаг: <b>Тип канала</b>\n\n"
         "📝 <b>Контент</b> — пишем посты: новости, советы, факты, разборы\n"
         "🛍 <b>Маркетплейс</b> — постим товары с WB/Ozon (цена, фото, ссылка)",
         parse_mode=ParseMode.HTML,
@@ -613,6 +614,12 @@ async def cmd_add_posts_count(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
 
     count = int(query.data.split(":")[1])
+    await _finalize_new_channel(query, context, count)
+    return ConversationHandler.END
+
+
+async def _finalize_new_channel(query, context: ContextTypes.DEFAULT_TYPE, count: int):
+    """Собирает карточку канала с дефолтами, авто-стилем и сохраняет."""
     ch = context.user_data["new_channel"]
     ch["daily_posts_count"] = count
 
@@ -1263,14 +1270,33 @@ async def handle_add_channel_type(update: Update, context: ContextTypes.DEFAULT_
         return ADD_WB_CATEGORIES
 
     else:
-        # Контент — продолжаем обычный флоу
+        # Контент — БОЛЬШЕ НЕ СПРАШИВАЕМ тон/запретки/RSS/картинки/кол-во.
+        # Всё ставится автоматически: тон единый (_HUMAN_VOICE), запреток нет,
+        # источники тем и стиль определяет Claude по теме, картинки = auto.
+        ch = context.user_data["new_channel"]
+        ch.setdefault("forbidden_topics", [])
+        ch.setdefault("image_source", "auto")   # единое правило: RSS→сток→FLUX
+        ch.setdefault("use_images", True)
+
         await query.edit_message_text(
-            "✅ Тип сохранён.\n\n"
-            "Шаг 4/5: <b>Тон общения</b> с аудиторией?\n"
-            "Например: <i>дружелюбный эксперт, без снобизма, с юмором</i>",
-            parse_mode=ParseMode.HTML,
+            "⏳ Настраиваю канал: подбираю источники тем, вечнозелёные темы и стиль…"
         )
-        return ADD_TONE
+
+        from ai_client import suggest_rss_sources, suggest_evergreen_topics
+        try:
+            ch["rss_sources"] = await suggest_rss_sources(ch["topic"], ch.get("name", ""))
+        except Exception as e:
+            logger.warning(f"Авто-RSS не удалось [{ch['channel_id']}]: {e}")
+            ch.setdefault("rss_sources", [])
+        try:
+            ch["evergreen_topics"] = await suggest_evergreen_topics(ch["topic"], count=8)
+        except Exception as e:
+            logger.warning(f"Авто-evergreen не удалось [{ch['channel_id']}]: {e}")
+            ch.setdefault("evergreen_topics", [])
+
+        # Кол-во постов в день по умолчанию (меняется в карточке канала)
+        await _finalize_new_channel(query, context, count=10)
+        return ConversationHandler.END
 
 
 async def handle_add_wb_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
