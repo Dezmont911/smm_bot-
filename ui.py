@@ -199,54 +199,137 @@ async def screen_main(qm, context: ContextTypes.DEFAULT_TYPE):
 CHANNELS_PAGE_SIZE = 10
 
 
+def _toggle_icon(ch: dict) -> str:
+    """Тумблер состояния канала: 🔵 публикует по расписанию, ⚪ на паузе/без расписания."""
+    if ch.get("schedule_disabled") or not ch.get("post_times_utc"):
+        return "⚪️"
+    return "🔵"
+
+
+def _channel_button(ch: dict) -> InlineKeyboardButton:
+    """Строка-кнопка канала с тумблером состояния."""
+    name = ch.get("name") or ch["channel_id"]
+    return InlineKeyboardButton(f"{_toggle_icon(ch)} {name}", callback_data=f"ui:ch:{ch['channel_id']}")
+
+
 async def screen_channels(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
-    """Список каналов с иконками статуса, постранично по 10."""
-    channels = _load_channels(include_inactive=True)
+    """Список активных каналов: сверху действия, тумблеры состояния, пагинация по 10."""
+    channels = [c for c in _load_channels(include_inactive=True) if c.get("active", True)]
+
+    # Верхние кнопки-действия (как в референсе)
+    top = [
+        InlineKeyboardButton("➕ Добавить",   callback_data="add_start"),
+        InlineKeyboardButton("🔍 Поиск",      callback_data="ui:ch_search"),
+        InlineKeyboardButton("🗑 Удалённые",  callback_data="ui:ch_deleted:0"),
+    ]
 
     if not channels:
-        text = "📋 <b>Мои каналы</b>\n\nКаналов пока нет."
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Добавить канал", callback_data="add_start")],
-            [InlineKeyboardButton("◀️ Назад",          callback_data="ui:main")],
-        ])
-        await _answer_or_send(qm, text, kb)
+        kb = InlineKeyboardMarkup([top, [InlineKeyboardButton("◀️ Меню", callback_data="ui:main")]])
+        await _answer_or_send(qm, "📋 <b>Мои каналы</b>\n\nАктивных каналов нет.", kb)
         return
 
     total = len(channels)
     pages = (total + CHANNELS_PAGE_SIZE - 1) // CHANNELS_PAGE_SIZE
     page = max(0, min(page, pages - 1))
-    start = page * CHANNELS_PAGE_SIZE
-    chunk = channels[start:start + CHANNELS_PAGE_SIZE]
+    chunk = channels[page * CHANNELS_PAGE_SIZE:(page + 1) * CHANNELS_PAGE_SIZE]
 
-    buttons = []
+    buttons = [top]
     for ch in chunk:
-        icon = _channel_status_icon(ch)
-        lvl  = buffer.get_level(ch["channel_id"])
-        name = ch.get("name") or ch["channel_id"]
-        label = f"{icon} {name} · {lvl} постов"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"ui:ch:{ch['channel_id']}")])
+        buttons.append([_channel_button(ch)])
 
-    # Навигация по страницам (только если каналов больше одной страницы)
     if pages > 1:
         nav = []
         if page > 0:
-            nav.append(InlineKeyboardButton("◀️ Назад 10", callback_data=f"ui:channels:{page - 1}"))
+            nav.append(InlineKeyboardButton("◀️", callback_data=f"ui:channels:{page - 1}"))
         if page < pages - 1:
-            nav.append(InlineKeyboardButton("Ещё 10 ▶️", callback_data=f"ui:channels:{page + 1}"))
-        if nav:
-            buttons.append(nav)
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"ui:channels:{page + 1}"))
+        buttons.append(nav)
 
-    buttons.append([InlineKeyboardButton("➕ Добавить канал", callback_data="add_start")])
-    buttons.append([InlineKeyboardButton("◀️ Меню",          callback_data="ui:main")])
+    buttons.append([InlineKeyboardButton("◀️ Меню", callback_data="ui:main")])
 
     header = f"📋 <b>Мои каналы</b> ({total})"
     if pages > 1:
         header += f" · стр. {page + 1}/{pages}"
+    await _answer_or_send(qm, f"{header}\n\n🔵 публикует · ⚪️ на паузе", InlineKeyboardMarkup(buttons))
+
+
+async def screen_channels_deleted(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+    """Удалённые (неактивные) каналы — с возможностью восстановить."""
+    deleted = [c for c in _load_channels(include_inactive=True) if not c.get("active", True)]
+
+    if not deleted:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К каналам", callback_data="ui:channels")]])
+        await _answer_or_send(qm, "🗑 <b>Удалённые каналы</b>\n\nПусто.", kb)
+        return
+
+    total = len(deleted)
+    pages = (total + CHANNELS_PAGE_SIZE - 1) // CHANNELS_PAGE_SIZE
+    page = max(0, min(page, pages - 1))
+    chunk = deleted[page * CHANNELS_PAGE_SIZE:(page + 1) * CHANNELS_PAGE_SIZE]
+
+    buttons = []
+    for ch in chunk:
+        name = ch.get("name") or ch["channel_id"]
+        buttons.append([InlineKeyboardButton(f"♻️ Восстановить «{name}»",
+                                             callback_data=f"ui:ch_restore:{ch['channel_id']}")])
+
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀️", callback_data=f"ui:ch_deleted:{page - 1}"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"ui:ch_deleted:{page + 1}"))
+        buttons.append(nav)
+
+    buttons.append([InlineKeyboardButton("◀️ К каналам", callback_data="ui:channels")])
+    header = f"🗑 <b>Удалённые каналы</b> ({total})"
+    if pages > 1:
+        header += f" · стр. {page + 1}/{pages}"
+    await _answer_or_send(qm, f"{header}\n\nНажми, чтобы восстановить:", InlineKeyboardMarkup(buttons))
+
+
+async def action_channel_restore(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
+    """Восстанавливает удалённый канал (active=True)."""
+    ch = _load_channel(handle)
+    if ch:
+        ch["active"] = True
+        _save_channel(ch)
+        from telegram import CallbackQuery
+        if isinstance(qm, CallbackQuery):
+            await qm.answer(f"♻️ {handle} восстановлен")
+        logger.info(f"Канал {handle} восстановлен")
+    await screen_channels_deleted(qm, context, 0)
+
+
+async def prompt_channel_search(qm, context: ContextTypes.DEFAULT_TYPE):
+    """Просит прислать запрос для поиска канала."""
+    context.user_data["channel_search"] = True
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К каналам", callback_data="ui:channels")]])
     await _answer_or_send(
         qm,
-        f"{header}\n\nВыбери канал для управления:",
-        InlineKeyboardMarkup(buttons),
+        "🔍 <b>Поиск канала</b>\n\nПришли часть названия или @username — покажу совпадения.",
+        kb,
     )
+
+
+async def screen_channels_search(qm, context: ContextTypes.DEFAULT_TYPE, query: str):
+    """Показывает каналы, совпавшие с запросом (по названию или @username)."""
+    q = (query or "").strip().lower().lstrip("@")
+    channels = [c for c in _load_channels(include_inactive=True) if c.get("active", True)]
+    matched = [
+        c for c in channels
+        if q in (c.get("name", "") or "").lower() or q in c["channel_id"].lower().lstrip("@")
+    ][:20]
+
+    buttons = [[_channel_button(c)] for c in matched]
+    buttons.append([InlineKeyboardButton("🔍 Искать ещё", callback_data="ui:ch_search")])
+    buttons.append([InlineKeyboardButton("◀️ К каналам", callback_data="ui:channels")])
+
+    if matched:
+        text = f"🔍 Найдено по «{query}»: <b>{len(matched)}</b>"
+    else:
+        text = f"🔍 По «{query}» ничего не найдено."
+    await _answer_or_send(qm, text, InlineKeyboardMarkup(buttons))
 
 
 async def screen_channel_card(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
@@ -1744,6 +1827,16 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "channels":
         page = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 0
         await screen_channels(query, context, page)
+
+    elif action == "ch_search":
+        await prompt_channel_search(query, context)
+
+    elif action == "ch_deleted":
+        page = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 0
+        await screen_channels_deleted(query, context, page)
+
+    elif action == "ch_restore" and len(parts) >= 3:
+        await action_channel_restore(query, context, parts[2])
 
     elif action == "status":
         await screen_status(query, context)

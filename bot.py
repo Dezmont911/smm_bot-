@@ -2602,6 +2602,12 @@ async def handle_image_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
 
+    # Поиск канала (из «Мои каналы → 🔍 Поиск»)
+    if context.user_data.pop("channel_search", False):
+        from ui import screen_channels_search
+        await screen_channels_search(update.message, context, update.message.text or "")
+        return
+
     # Сначала пробуем обработать как ввод настроек (ui.py)
     if context.user_data.get("editing"):
         handled = await handle_settings_text_input(update, context)
