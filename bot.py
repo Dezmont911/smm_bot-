@@ -2603,6 +2603,13 @@ async def handle_post_actions(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("❌ Ошибка публикации", callback_data="done")
             ]]))
+            await query.message.reply_text(
+                f"❌ <b>Не удалось опубликовать в {post_data.get('channel_id', '')}</b>\n\n"
+                f"Самая частая причина — <b>бот не добавлен админом</b> в канал.\n"
+                f"Добавь бота администратором (с правом публикации постов) и попробуй снова.\n"
+                f"Подробности — в логах.",
+                parse_mode=ParseMode.HTML,
+            )
 
     elif action == "done":
         pass  # уже обработано, ничего не делаем
