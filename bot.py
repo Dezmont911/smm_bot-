@@ -210,8 +210,8 @@ def save_channel_card(channel: dict):
             """INSERT OR REPLACE INTO channels
                (tg_handle, name, topic, tone, config_json, active)
                VALUES (?, ?, ?, ?, ?, 1)""",
-            (channel["channel_id"], channel["name"],
-             channel["topic"], channel["tone"],
+            (channel["channel_id"], channel.get("name", channel["channel_id"]),
+             channel.get("topic", ""), channel.get("tone", ""),
              json.dumps(channel, ensure_ascii=False)),
         )
 
@@ -638,6 +638,9 @@ async def _finalize_new_channel(query, context: ContextTypes.DEFAULT_TYPE, count
         "use_emoji": True,
         "active": True,
         "example_posts": [],
+        # tone — легаси-поле (в промпт не идёт, тон единый _HUMAN_VOICE), но нужно
+        # для записи в БД. Контент-флоу его больше не спрашивает → ставим дефолт.
+        "tone": "",
         # Новый канал НЕ постит по умолчанию — расписание включается вручную
         # через /schedule @channel on (или установкой часов). Так нет «дефолтных»
         # 09/12/16/20, которые раньше включались сами.
