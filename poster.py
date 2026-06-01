@@ -449,18 +449,23 @@ class Poster:
         image_url = post.get("image_url")
         post_parse_mode = post.get("parse_mode", "Markdown")
 
+        # Цель публикации: числовой chat_id (переживает смену @username и приватность),
+        # иначе @handle. channel_id оставляем для логов/буфера.
+        _card = self._load_channel_by_id(channel_id) or {}
+        target = _card.get("chat_id_num") or channel_id
+
         media_type = post.get("media_type")
 
         # ---- Relay-референс: альбом (media_group) ----
         tg_file_id = post.get("tg_file_id")
         if media_type == "album" and tg_file_id:
-            if await self._send_album(channel_id, tg_file_id, content, post_parse_mode):
+            if await self._send_album(target, tg_file_id, content, post_parse_mode):
                 return {"success": True, "used_image": True}
             logger.warning(f"Не отправил альбом [{channel_id}] — пробую как текст")
 
         # ---- Relay-референс: одиночное медиа по file_id (без скачивания, любой размер) ----
         elif tg_file_id:
-            if await self._send_by_file_id(channel_id, tg_file_id, media_type, content, post_parse_mode):
+            if await self._send_by_file_id(target, tg_file_id, media_type, content, post_parse_mode):
                 return {"success": True, "used_image": True}
             logger.warning(f"Не отправил по file_id [{channel_id}] — пробую как текст")
 
@@ -470,7 +475,7 @@ class Poster:
             import os
             if os.path.exists(media_path):
                 sent = await self._send_local_media(
-                    channel_id, media_path, media_type, content, post_parse_mode
+                    target, media_path, media_type, content, post_parse_mode
                 )
                 if sent:
                     try:
@@ -501,7 +506,7 @@ class Poster:
                     else:
                         photo = image_url
                     await self.bot.send_photo(
-                        chat_id=channel_id, photo=photo, caption=content, parse_mode=pm
+                        chat_id=target, photo=photo, caption=content, parse_mode=pm
                     )
                     return True
                 except Exception as e:
@@ -511,7 +516,7 @@ class Poster:
         async def _send_text() -> bool:
             for pm in (post_parse_mode, None):
                 try:
-                    await self.bot.send_message(chat_id=channel_id, text=content, parse_mode=pm)
+                    await self.bot.send_message(chat_id=target, text=content, parse_mode=pm)
                     return True
                 except Exception as e:
                     logger.warning(f"send_message [parse={pm}] в {channel_id} не удалась: {e}")

@@ -356,6 +356,14 @@ async def read_channel(username: str, limit: int = 40) -> dict:
             if len(txt) >= 30:  # отсекаем подписи/эмодзи-однострочники
                 posts.append(txt)
 
+        # Числовой chat_id в форме Bot API (-100…) — устойчив к смене @username/приватности
+        chat_id_num = None
+        try:
+            from telethon.utils import get_peer_id
+            chat_id_num = get_peer_id(entity)
+        except Exception:
+            pass
+
         logger.info(f"Юзербот прочитал @{real_username}: постов с текстом {len(posts)}")
         return {
             "handle": "@" + real_username,
@@ -363,6 +371,7 @@ async def read_channel(username: str, limit: int = 40) -> dict:
             "about": about,
             "posts": posts,
             "post_count": len(posts),
+            "chat_id_num": chat_id_num,
         }
     finally:
         await client.disconnect()

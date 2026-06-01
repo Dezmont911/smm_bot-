@@ -1092,7 +1092,8 @@ async def handle_export_confirm(update: Update, context: ContextTypes.DEFAULT_TY
 # /add — авто-добавление по @username через Telethon-юзербота
 # ============================================================
 
-async def _create_channel_from_analysis(analysis: dict, channel_id: str, display_name: str) -> tuple[dict, list]:
+async def _create_channel_from_analysis(analysis: dict, channel_id: str, display_name: str,
+                                        chat_id_num: int | None = None) -> tuple[dict, list]:
     """Собирает и сохраняет карточку канала из результата анализа.
     Общая логика для экспорт- и username-пути. Возвращает (карточка, rss_urls)."""
     from ai_client import suggest_rss_sources
@@ -1129,6 +1130,9 @@ async def _create_channel_from_analysis(analysis: dict, channel_id: str, display
         "image_keywords": [],
         # Новый канал не постит по умолчанию — расписание включается через /schedule
         "schedule_disabled": True,
+        # Числовой chat_id (устойчивость к смене @username/приватности) + текущий handle
+        "chat_id_num": chat_id_num,
+        "username": channel_id,
     }
     if channel_type == "marketplace":
         card["post_formats"] = ["wb_product"]
@@ -1204,6 +1208,7 @@ async def handle_add_username(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data["uname_analysis"] = analysis
     context.user_data["uname_handle"] = real_handle
     context.user_data["uname_title"] = data["title"]
+    context.user_data["uname_chat_id"] = data.get("chat_id_num")
 
     ch_type_label = (
         "🛍 Маркетплейс (WB/Ozon)" if analysis.get("channel_type") == "marketplace"
@@ -1253,7 +1258,9 @@ async def handle_username_confirm(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("❌ Данные устарели, начни заново: /add")
         return ConversationHandler.END
 
-    card, rss_urls = await _create_channel_from_analysis(analysis, handle, title)
+    card, rss_urls = await _create_channel_from_analysis(
+        analysis, handle, title, chat_id_num=context.user_data.get("uname_chat_id")
+    )
 
     ch_type_label = "🛍 Маркетплейс" if card.get("channel_type") == "marketplace" else "📝 Контент"
     meta_line = ""
@@ -1333,7 +1340,9 @@ async def handle_add_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     analysis = await analyzer.analyze_posts(
                         data["title"], data["posts"], about=data["about"]
                     )
-                    await _create_channel_from_analysis(analysis, data["handle"], data["title"])
+                    await _create_channel_from_analysis(
+                        analysis, data["handle"], data["title"], chat_id_num=data.get("chat_id_num")
+                    )
                     existing.add(data["handle"].lower())
                     added.append(data["handle"])
         except UserbotNotAuthorized:
@@ -2842,6 +2851,42 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.debug(f"РСЯ {channel_id}/{message.message_id} уже обрабатывается — пропускаю")
 
 
+async def refresh_channel_identities(bot):
+    """
+    Подтягивает числовой chat_id и текущий @username каждого канала через get_chat
+    (бот должен быть админом). Делает постинг устойчивым к смене @username/приватности
+    (постим по chat_id_num) и самолечит отображаемый @username, если канал переименовали.
+    """
+    updated = 0
+    for ch in load_all_channels():
+        cid = ch["channel_id"]
+        ref = ch.get("chat_id_num") or cid
+        try:
+            chat = await bot.get_chat(ref)
+        except Exception as e:
+            logger.debug(f"refresh identity [{cid}]: {e}")
+            continue
+        changed = False
+        if getattr(chat, "id", None) and ch.get("chat_id_num") != chat.id:
+            ch["chat_id_num"] = chat.id
+            changed = True
+        new_uname = ("@" + chat.username) if getattr(chat, "username", None) else None
+        if new_uname and ch.get("username") != new_uname:
+            old = ch.get("username") or cid
+            ch["username"] = new_uname
+            changed = True
+            if old.lower() != new_uname.lower():
+                logger.info(f"Канал {cid}: @username изменился {old} → {new_uname} (постим по chat_id)")
+        if changed:
+            try:
+                save_channel_card(ch)
+                updated += 1
+            except Exception as e:
+                logger.warning(f"refresh identity [{cid}] сохранение: {e}")
+    if updated:
+        logger.info(f"Идентичность каналов обновлена: {updated}")
+
+
 async def process_due_ads(bot):
     """
     Публикует «дозревшие» РСЯ-перекрытия (вызывается планировщиком раз в минуту).
@@ -3435,8 +3480,25 @@ def main():
             max_instances=1,
         )
 
+        # Идентичность каналов: числовой chat_id + текущий @username (бот-админ).
+        # Делает постинг устойчивым к смене @username/приватности, самолечит handle.
+        async def _refresh_identities():
+            await refresh_channel_identities(application.bot)
+
+        scheduler.add_job(
+            _refresh_identities,
+            CronTrigger(hour=7, minute=10),  # раз в день
+            id="refresh_identities",
+            name="Обновление chat_id/username каналов",
+            misfire_grace_time=3600,
+        )
+
         scheduler.start()
         application.bot_data["scheduler"] = scheduler
+
+        # Разовый прогон на старте (фоном, чтобы не задерживать запуск): подтянуть
+        # chat_id_num для каналов, где его ещё нет (бэкфилл после переезда/обновления).
+        asyncio.create_task(refresh_channel_identities(application.bot))
 
         # Реконсиляция на старте: ВСЕ awaiting_media на момент старта — сироты
         # (форвард медиа был в уже умершем процессе, а backlog апдейтов дропается
@@ -3455,7 +3517,8 @@ def main():
             "  • Ступенчатая генерация: каждый час (:30), только просевшие каналы\n"
             "  • Импорт референсов: раз в день (08:00 UTC)\n"
             "  • Чистка awaiting_media: каждый час (:15)\n"
-            "  • РСЯ-перекрытия: каждую минуту (персистентно)"
+            "  • РСЯ-перекрытия: каждую минуту (персистентно)\n"
+            "  • Обновление chat_id/username: раз в день (+ на старте)"
         )
 
     async def on_shutdown(application):
