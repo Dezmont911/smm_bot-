@@ -196,8 +196,11 @@ async def screen_main(qm, context: ContextTypes.DEFAULT_TYPE):
     await _answer_or_send(qm, text, kb)
 
 
-async def screen_channels(qm, context: ContextTypes.DEFAULT_TYPE):
-    """Список каналов с иконками статуса."""
+CHANNELS_PAGE_SIZE = 10
+
+
+async def screen_channels(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+    """Список каналов с иконками статуса, постранично по 10."""
     channels = _load_channels(include_inactive=True)
 
     if not channels:
@@ -209,20 +212,39 @@ async def screen_channels(qm, context: ContextTypes.DEFAULT_TYPE):
         await _answer_or_send(qm, text, kb)
         return
 
+    total = len(channels)
+    pages = (total + CHANNELS_PAGE_SIZE - 1) // CHANNELS_PAGE_SIZE
+    page = max(0, min(page, pages - 1))
+    start = page * CHANNELS_PAGE_SIZE
+    chunk = channels[start:start + CHANNELS_PAGE_SIZE]
+
     buttons = []
-    for ch in channels:
+    for ch in chunk:
         icon = _channel_status_icon(ch)
         lvl  = buffer.get_level(ch["channel_id"])
         name = ch.get("name") or ch["channel_id"]
         label = f"{icon} {name} · {lvl} постов"
         buttons.append([InlineKeyboardButton(label, callback_data=f"ui:ch:{ch['channel_id']}")])
 
-    buttons.append([InlineKeyboardButton("➕ Добавить канал", callback_data="add_start")])
-    buttons.append([InlineKeyboardButton("◀️ Назад",          callback_data="ui:main")])
+    # Навигация по страницам (только если каналов больше одной страницы)
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀️ Назад 10", callback_data=f"ui:channels:{page - 1}"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Ещё 10 ▶️", callback_data=f"ui:channels:{page + 1}"))
+        if nav:
+            buttons.append(nav)
 
+    buttons.append([InlineKeyboardButton("➕ Добавить канал", callback_data="add_start")])
+    buttons.append([InlineKeyboardButton("◀️ Меню",          callback_data="ui:main")])
+
+    header = f"📋 <b>Мои каналы</b> ({total})"
+    if pages > 1:
+        header += f" · стр. {page + 1}/{pages}"
     await _answer_or_send(
         qm,
-        "📋 <b>Мои каналы</b>\n\nВыбери канал для управления:",
+        f"{header}\n\nВыбери канал для управления:",
         InlineKeyboardMarkup(buttons),
     )
 
@@ -1720,7 +1742,8 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await screen_main(query, context)
 
     elif action == "channels":
-        await screen_channels(query, context)
+        page = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 0
+        await screen_channels(query, context, page)
 
     elif action == "status":
         await screen_status(query, context)
