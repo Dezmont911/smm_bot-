@@ -262,6 +262,15 @@ class BufferManager:
             )
             return cur.rowcount
 
+    def delete_all_drafts(self, channel_id: str) -> int:
+        """Удаляет все черновики канала. Возвращает число удалённых."""
+        with db.connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM posts WHERE channel_id = ? AND status = 'draft'",
+                (channel_id,),
+            )
+            return cur.rowcount
+
     def get_post_channel(self, post_id: str) -> str | None:
         """channel_id поста по его id (для коротких callback без handle)."""
         with db.connect() as conn:

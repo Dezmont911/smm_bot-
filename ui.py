@@ -1168,44 +1168,82 @@ async def action_ref_import(qm, context, handle: str, count: int = 10):
 
 # ── Черновик: ручные посты админа (текст/фото/видео), не в очереди ──────────
 
-def _draft_preview(d: dict) -> str:
-    """Короткое описание черновика для кнопки."""
+_NUM_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+
+
+def _draft_type_label(d: dict) -> str:
+    """Тип черновика для списка: '📸 Фото + текст', '🎬 Видео', '📝 Текст' и т.п."""
     mt = d.get("media_type")
-    icon = {"photo": "🖼", "video": "🎬", "document": "📎", "animation": "🎞", "album": "🖼×"}.get(mt, "📝")
-    txt = (d.get("content") or "").strip().replace("\n", " ")
-    label = txt[:30] if txt else ("(медиа без подписи)" if mt else "(пусто)")
-    return f"{icon} {label}"
+    has_text = bool((d.get("content") or "").strip())
+    base = {
+        "photo": "📸 Фото", "video": "🎬 Видео", "animation": "🎞 Гиф",
+        "document": "📎 Документ", "album": "🖼 Альбом",
+    }.get(mt)
+    if not base:
+        return "📝 Текст"
+    return f"{base} + текст" if has_text else base
 
 
 async def screen_drafts(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
-    """Черновики канала: список + создать новый + отправить в очередь."""
+    """Черновики канала: нумерованный список + действия по каждому и массовые."""
     ch = _load_channel(handle)
     if not ch:
         await _answer_or_send(qm, f"❌ Канал {handle} не найден.", None)
         return
     drafts = buffer.get_drafts(handle)
+    name = ch.get("name", handle)
 
-    rows = [[InlineKeyboardButton("➕ Создать пост", callback_data=f"ui:draft_new:{handle}")]]
-    for d in drafts:
-        pid = d["id"]  # без handle в callback — иначе вылезаем за лимит Telegram 64 байта
-        rows.append([
-            InlineKeyboardButton(_draft_preview(d)[:40], callback_data=f"ui:draft_view:{pid}"),
+    if not drafts:
+        text = (
+            f"🔥 <b>Черновики</b> — {name}\n\n"
+            f"Пусто. Нажми «➕ Создать пост» и пришли текст, фото или видео."
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Создать пост", callback_data=f"ui:draft_new:{handle}")],
+            [InlineKeyboardButton("↩️ Назад к каналу", callback_data=f"ui:ch:{handle}")],
         ])
+        await _answer_or_send(qm, text, kb)
+        return
+
+    # Текст: нумерованный список с типом и превью
+    lines = [f"🔥 <b>Черновики</b> — {name}\n", f"📌 Сейчас в черновиках: <b>{len(drafts)}</b>\n"]
+    rows = []
+    for i, d in enumerate(drafts):
+        num = _NUM_EMOJI[i] if i < len(_NUM_EMOJI) else f"{i+1}."
+        preview = (d.get("content") or "").strip().replace("\n", " ")
+        preview = preview[:60] + ("…" if len(preview) > 60 else "") if preview else "(без подписи)"
+        lines.append(f"{num} {_draft_type_label(d)}\n   {preview}\n")
         rows.append([
-            InlineKeyboardButton("⬆️ В очередь", callback_data=f"ui:draft_q:{pid}"),
-            InlineKeyboardButton("🗑 Удалить",   callback_data=f"ui:draft_del:{pid}"),
+            InlineKeyboardButton(f"{num} 📤 В очередь", callback_data=f"ui:draft_q:{d['id']}"),
+            InlineKeyboardButton("🗑", callback_data=f"ui:draft_del:{d['id']}"),
         ])
+
+    rows.append([InlineKeyboardButton("➕ Создать пост", callback_data=f"ui:draft_new:{handle}")])
     if len(drafts) > 1:
-        rows.append([InlineKeyboardButton(f"⬆️ Все в очередь ({len(drafts)})",
-                                          callback_data=f"ui:draft_qall:{handle}")])
-    rows.append([InlineKeyboardButton("◀️ К каналу", callback_data=f"ui:ch:{handle}")])
+        rows.append([InlineKeyboardButton(f"📤 Все в очередь ({len(drafts)})", callback_data=f"ui:draft_qall:{handle}")])
+    rows.append([InlineKeyboardButton("🗑 Очистить все черновики", callback_data=f"ui:draft_clear:{handle}")])
+    rows.append([InlineKeyboardButton("↩️ Назад к каналу", callback_data=f"ui:ch:{handle}")])
 
-    text = (
-        f"✍️ <b>Черновик</b> — {ch.get('name', handle)}\n\n"
-        f"Черновиков: <b>{len(drafts)}</b> (в очередь не попадут, пока не отправишь)\n\n"
-        f"«➕ Создать пост» → пришли <b>текст</b>, <b>фото</b> (можно с подписью) или <b>видео</b>."
-    )
-    await _answer_or_send(qm, text, InlineKeyboardMarkup(rows))
+    await _answer_or_send(qm, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+async def action_draft_clear_confirm(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
+    """Подтверждение очистки всех черновиков."""
+    n = buffer.count_drafts(handle)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"✅ Да, удалить {n}", callback_data=f"ui:draft_clearok:{handle}")],
+        [InlineKeyboardButton("◀️ Отмена", callback_data=f"ui:ch_draft:{handle}")],
+    ])
+    await _answer_or_send(qm, f"🗑 Удалить <b>все {n}</b> черновиков? Это необратимо.", kb)
+
+
+async def action_draft_clear_ok(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
+    """Удаляет все черновики канала."""
+    n = buffer.delete_all_drafts(handle)
+    from telegram import CallbackQuery
+    if isinstance(qm, CallbackQuery):
+        await qm.answer(f"🗑 Удалено: {n}")
+    await screen_drafts(qm, context, handle)
 
 
 async def action_draft_new(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
@@ -2040,6 +2078,12 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "draft_qall" and len(parts) >= 3:
         await action_draft_queue_all(query, context, parts[2])
+
+    elif action == "draft_clear" and len(parts) >= 3:
+        await action_draft_clear_confirm(query, context, parts[2])
+
+    elif action == "draft_clearok" and len(parts) >= 3:
+        await action_draft_clear_ok(query, context, parts[2])
 
     elif action == "draft_del" and len(parts) >= 3:
         await action_draft_delete(query, context, parts[2])
