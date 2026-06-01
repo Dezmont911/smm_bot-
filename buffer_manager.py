@@ -167,6 +167,53 @@ class BufferManager:
             logger.info(f"Очистка зависших awaiting_media: удалено {n}")
         return n
 
+    # --------------------------------------------------------
+    # РСЯ-перекрытия (персистентно — переживают рестарт сервиса)
+    # --------------------------------------------------------
+
+    def record_pending_ad(self, channel_id: str, ad_message_id: int, due_at_iso: str) -> bool:
+        """
+        Запоминает обнаруженную рекламу РСЯ и время, когда нужно опубликовать
+        перекрывающий пост. Дедуп по (channel_id, ad_message_id). Возвращает
+        True если записали (новая реклама), False если уже была.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with db.connect() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM processed_ads WHERE channel_id = ? AND ad_message_id = ? LIMIT 1",
+                (channel_id, ad_message_id),
+            ).fetchone()
+            if exists:
+                return False
+            conn.execute(
+                "INSERT INTO processed_ads (id, channel_id, ad_message_id, detected_at, due_at, status) "
+                "VALUES (?, ?, ?, ?, ?, 'detected')",
+                (str(uuid.uuid4()), channel_id, ad_message_id, now, due_at_iso),
+            )
+        return True
+
+    def get_due_ads(self, now_iso: str) -> list[dict]:
+        """Перекрытия, которым пора публиковаться (status='detected', due_at <= now)."""
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM processed_ads WHERE status = 'detected' "
+                "AND due_at IS NOT NULL AND due_at <= ? ORDER BY due_at ASC",
+                (now_iso,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_ad_published(self, ad_id: str, response_post_id: str | None):
+        now = datetime.now(timezone.utc).isoformat()
+        with db.connect() as conn:
+            conn.execute(
+                "UPDATE processed_ads SET status = 'published', response_post_id = ?, published_at = ? WHERE id = ?",
+                (response_post_id, now, ad_id),
+            )
+
+    def mark_ad_failed(self, ad_id: str, status: str = "failed"):
+        with db.connect() as conn:
+            conn.execute("UPDATE processed_ads SET status = ? WHERE id = ?", (status, ad_id))
+
     def source_exists(self, channel_id: str, topic: str) -> bool:
         """
         Есть ли у нас этот исходный пост СЕЙЧАС (в очереди или уже опубликован)?

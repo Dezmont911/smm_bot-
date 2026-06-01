@@ -91,6 +91,13 @@ for _col in ('media_path', 'media_type', 'tg_file_id'):
         print(f"  ✅ Колонка {_col} добавлена")
     else:
         print(f"  ℹ️  {_col} уже есть")
+# processed_ads.due_at — для персистентного РСЯ-перекрытия (переживает рестарт)
+pcols = [r[1] for r in conn.execute("PRAGMA table_info(processed_ads)").fetchall()]
+if 'due_at' not in pcols:
+    conn.execute("ALTER TABLE processed_ads ADD COLUMN due_at TEXT")
+    print("  ✅ processed_ads.due_at добавлена")
+else:
+    print("  ℹ️  processed_ads.due_at уже есть")
 updated = conn.execute(
     "UPDATE posts SET parse_mode = 'HTML' WHERE (parse_mode IS NULL OR parse_mode = 'Markdown') AND content LIKE '%<b>%' AND status IN ('ready', 'pending_review')"
 ).rowcount

@@ -91,9 +91,10 @@ class Database:
                     channel_id       TEXT NOT NULL,      -- @mychannel
                     ad_message_id    INTEGER NOT NULL,   -- ID сообщения в Telegram
                     detected_at      TEXT NOT NULL,      -- ISO timestamp
+                    due_at           TEXT,               -- когда публиковать перекрытие (ISO, переживает рестарт)
                     response_post_id TEXT,               -- какой пост опубликовали в ответ
                     published_at     TEXT,               -- ISO timestamp или NULL
-                    status           TEXT DEFAULT 'detected'  -- detected/published/failed
+                    status           TEXT DEFAULT 'detected'  -- detected/published/failed/expired
                 );
 
                 -- --------------------------------------------------------

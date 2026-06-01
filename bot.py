@@ -25,7 +25,7 @@ import json
 import re
 import warnings
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # Заглушаем информационное предупреждение PTB про per_message=False
 # (не влияет на работу — наши ConversationHandler-ы работают корректно)
@@ -2631,133 +2631,90 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     logger.info(f"📢 Обнаружена реклама РСЯ в {channel_id} | message_id: {message.message_id}")
 
-    # Проверяем что у нас есть посты для этого канала
-    ready_count = buffer.get_ready_count(channel_id)
-    if ready_count == 0:
-        logger.warning(f"Реклама в {channel_id}, но буфер пуст — запускаю экстренную генерацию!")
-        await context.bot.send_message(
-            chat_id=cfg.ADMIN_CHAT_ID,
-            text=(
-                f"📢 <b>Реклама РСЯ в {channel_id}</b>\n"
-                f"⚠️ Буфер пуст — запускаю генерацию и публикую автоматически..."
-            ),
-            parse_mode=ParseMode.HTML,
-        )
-        # Генерируем пост и сразу публикуем — не ждём пользователя
-        asyncio.create_task(
-            _generate_and_post_after_ad(context.bot, channel_id)
-        )
-        return
-
-    # Случайная задержка 5–15 минут — имитируем живого редактора
+    # Случайная задержка 5–15 минут — имитируем живого редактора.
+    # ПЕРСИСТЕНТНО: запись в БД, а не asyncio.Task — переживает рестарт сервиса.
+    # Публикацию выполнит планировщик (process_due_ads) когда придёт due_at.
     import random
     delay_seconds = random.randint(cfg.POST_DELAY_MIN, cfg.POST_DELAY_MAX)
-    delay_minutes = delay_seconds // 60
+    due_at = (datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)).isoformat()
 
-    logger.info(f"Публикую ответный пост в {channel_id} через {delay_minutes} мин.")
-
-    # Планируем отложенную публикацию
-    asyncio.create_task(
-        _post_after_ad(context.bot, channel_id, delay_seconds)
-    )
-
-
-async def _generate_and_post_after_ad(bot, channel_id: str):
-    """
-    Когда реклама РСЯ пришла а буфер пуст:
-    1. Генерируем 1 пост через Claude
-    2. Сразу публикуем его
-    3. Отправляем отчёт администратору
-    """
-    try:
-        # Генерируем 1 пост для канала
-        from content_generator import generator
-        channels = load_all_channels()
-        channel = next((c for c in channels if c["channel_id"] == channel_id), None)
-        if not channel:
-            await bot.send_message(
-                chat_id=cfg.ADMIN_CHAT_ID,
-                text=f"❌ Канал {channel_id} не найден в карточках — не могу сгенерировать пост.",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-        result = await generator.run_for_channel(channel, target_count=1, force=True)
-        generated = result.get("generated", 0)
-
-        if generated == 0:
-            reason = result.get("reason", "нет тем")
-            logger.error(f"Экстренная генерация для {channel_id} не дала постов: {reason}")
-            await bot.send_message(
-                chat_id=cfg.ADMIN_CHAT_ID,
-                text=(
-                    f"❌ <b>Не смог перекрыть рекламу в {channel_id}</b>\n"
-                    f"Генерация не дала постов: {reason}\n"
-                    f"Запусти /generate {channel_id} вручную."
-                ),
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-        # Пост сгенерирован — публикуем сразу
-        pub_result = await poster.post_now(channel_id)
-        if pub_result["success"]:
-            post = pub_result["post"]
-            logger.success(f"✅ Экстренный пост опубликован в {channel_id} после рекламы РСЯ")
-            await bot.send_message(
-                chat_id=cfg.ADMIN_CHAT_ID,
-                text=(
-                    f"✅ <b>Реклама РСЯ перекрыта!</b>\n"
-                    f"Канал: {channel_id}\n"
-                    f"Формат: {post.get('format', '?')}\n"
-                    f"Буфер был пуст — сгенерировал и опубликовал автоматически.\n\n"
-                    f"💡 Рекомендую запустить /generate {channel_id} чтобы пополнить буфер."
-                ),
-                parse_mode=ParseMode.HTML,
-            )
-        else:
-            await bot.send_message(
-                chat_id=cfg.ADMIN_CHAT_ID,
-                text=(
-                    f"⚠️ <b>Пост сгенерирован, но не опубликован в {channel_id}</b>\n"
-                    f"Причина: {pub_result['error']}\n"
-                    f"Пост сохранён в буфере — попробуй /post_now {channel_id}"
-                ),
-                parse_mode=ParseMode.HTML,
-            )
-
-    except Exception as e:
-        logger.error(f"Ошибка экстренной генерации+публикации [{channel_id}]: {e}")
-        await bot.send_message(
-            chat_id=cfg.ADMIN_CHAT_ID,
-            text=f"❌ Ошибка при экстренной генерации для {channel_id}: {e}",
-            parse_mode=ParseMode.HTML,
-        )
-
-
-async def _post_after_ad(bot, channel_id: str, delay_seconds: int):
-    """Ждёт нужное время и публикует пост после рекламы."""
-    import asyncio as _asyncio
-    await _asyncio.sleep(delay_seconds)
-
-    result = await poster.post_now(channel_id)
-
-    if result["success"]:
-        post = result["post"]
-        logger.success(
-            f"✅ Пост опубликован после рекламы РСЯ в {channel_id} | "
-            f"формат: {post.get('format', '?')}"
+    if buffer.record_pending_ad(channel_id, message.message_id, due_at):
+        logger.info(
+            f"РСЯ-перекрытие {channel_id} запланировано через ~{delay_seconds // 60} мин "
+            f"(в БД, переживёт рестарт)"
         )
     else:
-        logger.error(f"❌ Не удалось опубликовать после рекламы в {channel_id}: {result['error']}")
-        await bot.send_message(
-            chat_id=cfg.ADMIN_CHAT_ID,
-            text=(
-                f"❌ <b>Не смог перекрыть рекламу в {channel_id}</b>\n"
-                f"Причина: {result['error']}"
-            ),
-            parse_mode=ParseMode.HTML,
-        )
+        logger.debug(f"РСЯ {channel_id}/{message.message_id} уже обрабатывается — пропускаю")
+
+
+async def process_due_ads(bot):
+    """
+    Публикует «дозревшие» РСЯ-перекрытия (вызывается планировщиком раз в минуту).
+    Переживает рестарт: задачи лежат в БД (processed_ads), а не в памяти.
+    """
+    now = datetime.now(timezone.utc)
+    due = buffer.get_due_ads(now.isoformat())
+    if not due:
+        return
+
+    for ad in due:
+        cid = ad["channel_id"]
+        ad_id = ad["id"]
+
+        # Если просрочено сильно (бот лежал > 2ч) — поздно перекрывать, помечаем expired
+        try:
+            due_dt = datetime.fromisoformat(ad["due_at"])
+            if due_dt.tzinfo is None:
+                due_dt = due_dt.replace(tzinfo=timezone.utc)
+            if (now - due_dt).total_seconds() > 2 * 3600:
+                buffer.mark_ad_failed(ad_id, "expired")
+                logger.warning(f"РСЯ-перекрытие {cid} просрочено (>2ч) — пропускаю")
+                continue
+        except Exception:
+            pass
+
+        try:
+            # Буфер пуст — экстренно генерируем 1 пост
+            if buffer.get_ready_count(cid) == 0:
+                channels = load_all_channels()
+                channel = next((c for c in channels if c["channel_id"] == cid), None)
+                if channel:
+                    from content_generator import generator
+                    logger.info(f"РСЯ {cid}: буфер пуст — экстренная генерация")
+                    await generator.run_for_channel(channel, target_count=1, force=True)
+
+            result = await poster.post_now(cid)
+            if result.get("success"):
+                post = result.get("post", {})
+                buffer.mark_ad_published(ad_id, post.get("id"))
+                logger.success(f"✅ Реклама РСЯ перекрыта в {cid}")
+                await bot.send_message(
+                    chat_id=cfg.ADMIN_CHAT_ID,
+                    text=f"✅ <b>Реклама РСЯ перекрыта</b> в {cid}\nФормат: {post.get('format', '?')}",
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                buffer.mark_ad_failed(ad_id)
+                logger.error(f"❌ Не перекрыл рекламу в {cid}: {result.get('error')}")
+                await bot.send_message(
+                    chat_id=cfg.ADMIN_CHAT_ID,
+                    text=(
+                        f"❌ <b>Не смог перекрыть рекламу в {cid}</b>\n"
+                        f"Причина: {result.get('error')}\nПопробуй /post_now {cid}"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+        except Exception as e:
+            buffer.mark_ad_failed(ad_id)
+            logger.error(f"Ошибка перекрытия РСЯ [{cid}]: {e}")
+            try:
+                await bot.send_message(
+                    chat_id=cfg.ADMIN_CHAT_ID,
+                    text=f"❌ Ошибка перекрытия РСЯ для {cid}: {e}",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
 
 
 # ============================================================
@@ -3250,6 +3207,20 @@ def main():
             misfire_grace_time=300,
         )
 
+        # РСЯ-перекрытия: раз в минуту проверяем «дозревшие» (персистентно в БД).
+        # Переживает рестарт: после перезапуска задача подхватит отложенные перекрытия.
+        async def _process_rsy_overlays():
+            await process_due_ads(application.bot)
+
+        scheduler.add_job(
+            _process_rsy_overlays,
+            CronTrigger(second=0),   # каждую минуту
+            id="rsy_overlays",
+            name="Публикация РСЯ-перекрытий",
+            misfire_grace_time=120,
+            max_instances=1,
+        )
+
         scheduler.start()
         application.bot_data["scheduler"] = scheduler
 
@@ -3258,7 +3229,8 @@ def main():
             "  • Постер: каждый час (:00)\n"
             "  • Ступенчатая генерация: каждый час (:30), только просевшие каналы\n"
             "  • Импорт референсов: раз в день (08:00 UTC)\n"
-            "  • Чистка awaiting_media: каждый час (:15)"
+            "  • Чистка awaiting_media: каждый час (:15)\n"
+            "  • РСЯ-перекрытия: каждую минуту (персистентно)"
         )
 
     async def on_shutdown(application):
