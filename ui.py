@@ -404,6 +404,10 @@ async def screen_channel_card(qm, context: ContextTypes.DEFAULT_TYPE, handle: st
             InlineKeyboardButton("⚡ Генерить",  callback_data=f"ui:ch_generate:{channel_id}"),
             InlineKeyboardButton("📤 Постнуть",  callback_data=f"ui:ch_postnow:{channel_id}"),
         ],
+        [
+            InlineKeyboardButton("🔗 Референсы",  callback_data=f"ui:ch_refs:{channel_id}"),
+            InlineKeyboardButton("✍️ Черновик",   callback_data=f"ui:ch_draft:{channel_id}"),
+        ],
         [InlineKeyboardButton("📜 История публикаций", callback_data=f"ui:ch_history:{channel_id}")],
         [InlineKeyboardButton("🧹 Очистить буфер",    callback_data=f"ui:ch_clear:{channel_id}")],
         [
@@ -1162,6 +1166,184 @@ async def action_ref_import(qm, context, handle: str, count: int = 10):
     )
 
 
+# ── Черновик: ручные посты админа (текст/фото/видео), не в очереди ──────────
+
+def _draft_preview(d: dict) -> str:
+    """Короткое описание черновика для кнопки."""
+    mt = d.get("media_type")
+    icon = {"photo": "🖼", "video": "🎬", "document": "📎", "animation": "🎞", "album": "🖼×"}.get(mt, "📝")
+    txt = (d.get("content") or "").strip().replace("\n", " ")
+    label = txt[:30] if txt else ("(медиа без подписи)" if mt else "(пусто)")
+    return f"{icon} {label}"
+
+
+async def screen_drafts(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
+    """Черновики канала: список + создать новый + отправить в очередь."""
+    ch = _load_channel(handle)
+    if not ch:
+        await _answer_or_send(qm, f"❌ Канал {handle} не найден.", None)
+        return
+    drafts = buffer.get_drafts(handle)
+
+    rows = [[InlineKeyboardButton("➕ Создать пост", callback_data=f"ui:draft_new:{handle}")]]
+    for d in drafts:
+        pid = d["id"]
+        rows.append([
+            InlineKeyboardButton(_draft_preview(d)[:40], callback_data=f"ui:draft_view:{handle}:{pid}"),
+        ])
+        rows.append([
+            InlineKeyboardButton("⬆️ В очередь", callback_data=f"ui:draft_q:{handle}:{pid}"),
+            InlineKeyboardButton("🗑 Удалить",   callback_data=f"ui:draft_del:{handle}:{pid}"),
+        ])
+    if len(drafts) > 1:
+        rows.append([InlineKeyboardButton(f"⬆️ Все в очередь ({len(drafts)})",
+                                          callback_data=f"ui:draft_qall:{handle}")])
+    rows.append([InlineKeyboardButton("◀️ К каналу", callback_data=f"ui:ch:{handle}")])
+
+    text = (
+        f"✍️ <b>Черновик</b> — {ch.get('name', handle)}\n\n"
+        f"Черновиков: <b>{len(drafts)}</b> (в очередь не попадут, пока не отправишь)\n\n"
+        f"«➕ Создать пост» → пришли <b>текст</b>, <b>фото</b> (можно с подписью) или <b>видео</b>."
+    )
+    await _answer_or_send(qm, text, InlineKeyboardMarkup(rows))
+
+
+async def action_draft_new(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
+    """Включает режим приёма следующего сообщения как черновика."""
+    if not _load_channel(handle):
+        return
+    context.user_data["draft_compose"] = handle
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data=f"ui:ch_draft:{handle}")]])
+    await _answer_or_send(
+        qm,
+        "✍️ <b>Новый пост в черновик</b>\n\n"
+        "Пришли одним сообщением:\n"
+        "• <b>текст</b> — будет текстовый пост\n"
+        "• <b>фото</b> (можно с подписью) — фото-пост\n"
+        "• <b>видео</b> (можно с подписью) — видео-пост\n\n"
+        "Что пришлёшь — то и ляжет в черновик.",
+        kb,
+    )
+
+
+async def create_draft_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Создаёт черновик из присланного админом сообщения (текст/фото/видео/документ).
+    Медиа храним по file_id (без скачивания). Возвращает True, если черновик создан.
+    """
+    handle = context.user_data.get("draft_compose")
+    if not handle:
+        return False
+    msg = update.message
+    if not msg:
+        return False
+
+    caption = (msg.caption or msg.text or "").strip()
+    file_id = media_type = None
+    if msg.photo:
+        file_id, media_type = msg.photo[-1].file_id, "photo"
+    elif getattr(msg, "animation", None):
+        file_id, media_type = msg.animation.file_id, "animation"
+    elif msg.video:
+        file_id, media_type = msg.video.file_id, "video"
+    elif msg.document:
+        file_id, media_type = msg.document.file_id, "document"
+
+    if not file_id and not caption:
+        await msg.reply_text("⚠️ Пусто. Пришли текст, фото или видео.")
+        return True  # остаёмся в режиме compose
+
+    context.user_data.pop("draft_compose", None)
+    post = {
+        "channel_id": handle,
+        "content": caption,
+        "format": "manual",
+        "topic": "manual draft",
+        "status": "draft",
+        "parse_mode": None,  # ручной текст — без разметки, чтобы не ловить parse-ошибки
+    }
+    if file_id:
+        post["tg_file_id"] = file_id
+        post["media_type"] = media_type
+    buffer.add(post)
+
+    kind = {"photo": "фото", "video": "видео", "document": "документ", "animation": "гиф"}.get(media_type, "текст")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬆️ Сразу в очередь", callback_data=f"ui:draft_qlast:{handle}")],
+        [InlineKeyboardButton("➕ Ещё пост",         callback_data=f"ui:draft_new:{handle}")],
+        [InlineKeyboardButton("✍️ К черновикам",     callback_data=f"ui:ch_draft:{handle}")],
+    ])
+    await msg.reply_text(
+        f"✅ Черновик создан ({kind}). Лежит в черновике, в очередь пока не попал.",
+        reply_markup=kb,
+    )
+    return True
+
+
+async def action_draft_queue(qm, context: ContextTypes.DEFAULT_TYPE, handle: str, post_id: str):
+    """Отправляет один черновик в очередь."""
+    ok = buffer.draft_to_ready(post_id)
+    from telegram import CallbackQuery
+    if isinstance(qm, CallbackQuery):
+        await qm.answer("⬆️ В очереди" if ok else "Уже не черновик")
+    await screen_drafts(qm, context, handle)
+
+
+async def action_draft_queue_last(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
+    """Отправляет в очередь самый свежий черновик (после создания)."""
+    drafts = buffer.get_drafts(handle)
+    from telegram import CallbackQuery
+    if drafts:
+        buffer.draft_to_ready(drafts[-1]["id"])
+        if isinstance(qm, CallbackQuery):
+            await qm.answer("⬆️ В очереди")
+    await screen_drafts(qm, context, handle)
+
+
+async def action_draft_queue_all(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
+    """Отправляет ВСЕ черновики канала в очередь."""
+    n = buffer.drafts_to_ready_all(handle)
+    from telegram import CallbackQuery
+    if isinstance(qm, CallbackQuery):
+        await qm.answer(f"⬆️ В очередь: {n}")
+    await screen_drafts(qm, context, handle)
+
+
+async def action_draft_delete(qm, context: ContextTypes.DEFAULT_TYPE, handle: str, post_id: str):
+    """Удаляет черновик."""
+    buffer.delete_draft(post_id)
+    from telegram import CallbackQuery
+    if isinstance(qm, CallbackQuery):
+        await qm.answer("🗑 Удалён")
+    await screen_drafts(qm, context, handle)
+
+
+async def action_draft_view(qm, context: ContextTypes.DEFAULT_TYPE, handle: str, post_id: str):
+    """Показывает черновик так, как он будет выглядеть (реальным сообщением)."""
+    from telegram import CallbackQuery
+    if isinstance(qm, CallbackQuery):
+        await qm.answer()
+    d = next((x for x in buffer.get_drafts(handle) if x["id"] == post_id), None)
+    if not d:
+        return
+    chat_id = qm.message.chat_id if isinstance(qm, CallbackQuery) else qm.chat_id
+    cap = (d.get("content") or "") or None
+    fid, mt = d.get("tg_file_id"), d.get("media_type")
+    try:
+        if mt == "photo":
+            await context.bot.send_photo(chat_id, fid, caption=cap)
+        elif mt == "video":
+            await context.bot.send_video(chat_id, fid, caption=cap)
+        elif mt == "animation":
+            await context.bot.send_animation(chat_id, fid, caption=cap)
+        elif mt == "document":
+            await context.bot.send_document(chat_id, fid, caption=cap)
+        else:
+            await context.bot.send_message(chat_id, cap or "(пустой пост)")
+    except Exception as e:
+        await context.bot.send_message(chat_id, f"⚠️ Не показать превью: {e}")
+
+
 async def action_rss_add_prompt(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
     """Просит прислать URL для добавления."""
     context.user_data["editing"] = {"handle": handle, "field": "rss"}
@@ -1837,6 +2019,28 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "ch_restore" and len(parts) >= 3:
         await action_channel_restore(query, context, parts[2])
+
+    # ── Черновик ──
+    elif action == "ch_draft" and len(parts) >= 3:
+        await screen_drafts(query, context, parts[2])
+
+    elif action == "draft_new" and len(parts) >= 3:
+        await action_draft_new(query, context, parts[2])
+
+    elif action == "draft_q" and len(parts) >= 4:
+        await action_draft_queue(query, context, parts[2], parts[3])
+
+    elif action == "draft_qlast" and len(parts) >= 3:
+        await action_draft_queue_last(query, context, parts[2])
+
+    elif action == "draft_qall" and len(parts) >= 3:
+        await action_draft_queue_all(query, context, parts[2])
+
+    elif action == "draft_del" and len(parts) >= 4:
+        await action_draft_delete(query, context, parts[2], parts[3])
+
+    elif action == "draft_view" and len(parts) >= 4:
+        await action_draft_view(query, context, parts[2], parts[3])
 
     elif action == "status":
         await screen_status(query, context)

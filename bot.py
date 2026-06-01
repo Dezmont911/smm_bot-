@@ -2605,6 +2605,12 @@ async def handle_image_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
 
+    # Создание черновика (из «Канал → ✍️ Черновик → ➕ Создать пост»)
+    if context.user_data.get("draft_compose"):
+        from ui import create_draft_from_message
+        if await create_draft_from_message(update, context):
+            return
+
     # Поиск канала (из «Мои каналы → 🔍 Поиск»)
     if context.user_data.pop("channel_search", False):
         from ui import screen_channels_search
@@ -3276,10 +3282,17 @@ def main():
         handle_image_url,
     ))
 
-    # --- Фото от админа (картинка для поста) ---
+    # --- Фото от админа (картинка для поста / черновик) ---
     app.add_handler(MessageHandler(
         filters.PHOTO & filters.ChatType.PRIVATE & ~filters.FORWARDED,
         handle_photo_for_post,
+    ))
+
+    # --- Видео/гиф/документ от админа (для черновика) ---
+    app.add_handler(MessageHandler(
+        (filters.VIDEO | filters.ANIMATION | filters.Document.ALL)
+        & filters.ChatType.PRIVATE & ~filters.FORWARDED,
+        handle_photo_for_post,  # делегирует в handle_image_url (там ловится draft_compose)
     ))
 
     # --- Посты в каналах (детектор рекламы РСЯ) ---

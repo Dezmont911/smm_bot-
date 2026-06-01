@@ -223,6 +223,53 @@ class BufferManager:
         with db.connect() as conn:
             conn.execute("UPDATE processed_ads SET status = ? WHERE id = ?", (status, ad_id))
 
+    # --------------------------------------------------------
+    # Черновики (ручные посты админа — не в очереди, пока не отправят)
+    # --------------------------------------------------------
+
+    def get_drafts(self, channel_id: str) -> list[dict]:
+        """Черновики канала (status='draft'), от старых к новым."""
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM posts WHERE channel_id = ? AND status = 'draft' "
+                "ORDER BY generated_at ASC",
+                (channel_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_drafts(self, channel_id: str) -> int:
+        with db.connect() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM posts WHERE channel_id = ? AND status = 'draft'",
+                (channel_id,),
+            ).fetchone()[0]
+
+    def draft_to_ready(self, post_id: str) -> bool:
+        """Переводит один черновик в очередь (draft → ready)."""
+        with db.connect() as conn:
+            cur = conn.execute(
+                "UPDATE posts SET status = 'ready' WHERE id = ? AND status = 'draft'",
+                (post_id,),
+            )
+            return cur.rowcount > 0
+
+    def drafts_to_ready_all(self, channel_id: str) -> int:
+        """Все черновики канала → в очередь. Возвращает число перенесённых."""
+        with db.connect() as conn:
+            cur = conn.execute(
+                "UPDATE posts SET status = 'ready' WHERE channel_id = ? AND status = 'draft'",
+                (channel_id,),
+            )
+            return cur.rowcount
+
+    def delete_draft(self, post_id: str) -> bool:
+        with db.connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM posts WHERE id = ? AND status = 'draft'",
+                (post_id,),
+            )
+            return cur.rowcount > 0
+
     def source_exists(self, channel_id: str, topic: str) -> bool:
         """
         Есть ли у нас этот исходный пост СЕЙЧАС (в очереди или уже опубликован)?
