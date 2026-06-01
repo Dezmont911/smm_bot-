@@ -130,7 +130,9 @@ reference_importer.import_all `08:00`; чистка `awaiting_media` `:15`; **pr
 Ключевые поля: `channel_id` (@handle), `name`, `topic`, `tone` (легаси, в промпт НЕ идёт),
 `channel_type` (content|marketplace), `archetype`, `topic_source` (search|rss),
 `post_times_utc` (часы UTC; пусто = нет расписания), `schedule_disabled` (true = автопубл. выкл),
-`last_published_utc` (для MIN_GAP плавающих слотов), `daily_posts_count`, `post_length`,
+`chat_id_num` (числовой -100… id — постим по нему, устойчиво к смене @username/приватности),
+`username` (текущий @handle, самолечится), `last_published_utc` (для MIN_GAP плавающих слотов),
+`daily_posts_count`, `post_length`,
 `image_source` (auto|stock|ai|rss|none — ЕДИНОЕ правило картинки), `image_keywords`,
 `rss_sources`, `web_sources`, `evergreen_topics`, `rsy_override` (перекрытие РСЯ вкл),
 `reference_channels` ([{handle, rephrase, take_media, skip_ads, `max_imported_id`,
@@ -165,6 +167,9 @@ reference_importer.import_all `08:00`; чистка `awaiting_media` `:15`; **pr
 - **РСЯ-перекрытие — персистентно** (`processed_ads.due_at`), переживает рестарт; публикуется
   ВСЕГДА при наступлении срока. Перекрытие НЕ зависит от паузы расписания (`schedule_disabled`
   глушит только плановые слоты; `rsy_override` — отдельно).
+- **Устойчивость к смене @username/приватности:** постим по `chat_id_num` (числовой id,
+  не меняется), фолбэк на @handle. `refresh_channel_identities` (старт + раз в день, get_chat)
+  бэкфиллит `chat_id_num` и самолечит `username`. Бот должен быть админом канала.
 - **Плавающие слоты:** любой пост пишет `last_published_utc`; плановый слот пропускается, если
   публиковали < `MIN_PUBLISH_GAP_MIN`=40 мин назад или ждёт перекрытие. Ручной пост админа бот
   ловит как `channel_post` (свои посты обратно не получает) → тоже двигает слот.
