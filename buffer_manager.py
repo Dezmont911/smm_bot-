@@ -102,6 +102,7 @@ class BufferManager:
         with db.connect() as conn:
             row = conn.execute(
                 "SELECT id FROM posts WHERE topic = ? AND status = 'awaiting_media' "
+                "AND (media_type IS NULL OR media_type != 'album') "
                 "ORDER BY generated_at ASC LIMIT 1",
                 (topic,),
             ).fetchone()
@@ -112,6 +113,41 @@ class BufferManager:
                 (file_id, media_type, row["id"]),
             )
         return True
+
+    def attach_album_member(self, topic_prefix: str, member_id: int, file_id: str, media_type: str) -> bool:
+        """
+        Привязывает file_id к одному кадру альбома (relay).
+
+        Альбомная запись (media_type='album', status='awaiting_media') хранит в
+        tg_file_id JSON: {"members":[id,...], "items":{"id":{"file_id","type"}}}.
+        Ищем ожидающий альбом донора (topic LIKE 'ref:донор:%'), у которого этот
+        member_id есть в members и ещё не заполнен. Заполняем; когда собраны все
+        кадры — переводим в 'ready'. Возвращает True, если member привязан.
+        """
+        import json
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, tg_file_id FROM posts WHERE status = 'awaiting_media' "
+                "AND media_type = 'album' AND topic LIKE ?",
+                (topic_prefix + "%",),
+            ).fetchall()
+            for r in rows:
+                try:
+                    data = json.loads(r["tg_file_id"] or "{}")
+                except Exception:
+                    continue
+                members = data.get("members", [])
+                items = data.get("items", {})
+                if member_id in members and str(member_id) not in items:
+                    items[str(member_id)] = {"file_id": file_id, "type": media_type}
+                    data["items"] = items
+                    done = len(items) >= len(members)
+                    conn.execute(
+                        "UPDATE posts SET tg_file_id = ?, status = ? WHERE id = ?",
+                        (json.dumps(data), "ready" if done else "awaiting_media", r["id"]),
+                    )
+                    return True
+        return False
 
     def cleanup_awaiting(self, older_than_minutes: int = 60) -> int:
         """

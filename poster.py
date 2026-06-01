@@ -311,6 +311,46 @@ class Poster:
                 logger.warning(f"send by file_id [{media_type}, parse={pm}] в {channel_id}: {e}")
         return False
 
+    async def _send_album(self, channel_id, album_json, caption, parse_mode) -> bool:
+        """Публикует альбом (media_group) по списку file_id. Подпись — на первом кадре.
+        Telegram разрешает до 10 элементов в группе."""
+        import json
+        from telegram import InputMediaPhoto, InputMediaVideo
+        try:
+            data = json.loads(album_json or "{}")
+        except Exception:
+            return False
+        members = data.get("members", [])
+        items = data.get("items", {})
+        cap = caption or None
+
+        for pm in (parse_mode, None):
+            media = []
+            for i, mid in enumerate(members[:10]):  # лимит Telegram — 10
+                it = items.get(str(mid))
+                if not it:
+                    continue
+                c = cap if i == 0 else None  # подпись только на первом
+                if it.get("type") == "video":
+                    media.append(InputMediaVideo(it["file_id"], caption=c, parse_mode=pm))
+                else:
+                    media.append(InputMediaPhoto(it["file_id"], caption=c, parse_mode=pm))
+            if not media:
+                return False
+            # send_media_group требует 2..10 элементов; если остался один — шлём как одиночное
+            if len(media) == 1:
+                only = members[:10][0]
+                it = items.get(str(only)) if members else None
+                if it:
+                    return await self._send_by_file_id(channel_id, it["file_id"], it.get("type"), caption, parse_mode)
+                return False
+            try:
+                await self.bot.send_media_group(chat_id=channel_id, media=media)
+                return True
+            except Exception as e:
+                logger.warning(f"send_media_group [parse={pm}] в {channel_id}: {e}")
+        return False
+
     async def _send_local_media(self, channel_id, path, media_type, caption, parse_mode) -> bool:
         """Отправляет локальный медиа-файл (референс «как есть»): фото или видео.
         Пробует оба parse_mode. Подпись может быть пустой."""
@@ -355,9 +395,15 @@ class Poster:
 
         media_type = post.get("media_type")
 
-        # ---- Relay-референс: публикуем по file_id (без скачивания, любой размер) ----
+        # ---- Relay-референс: альбом (media_group) ----
         tg_file_id = post.get("tg_file_id")
-        if tg_file_id:
+        if media_type == "album" and tg_file_id:
+            if await self._send_album(channel_id, tg_file_id, content, post_parse_mode):
+                return {"success": True, "used_image": True}
+            logger.warning(f"Не отправил альбом [{channel_id}] — пробую как текст")
+
+        # ---- Relay-референс: одиночное медиа по file_id (без скачивания, любой размер) ----
+        elif tg_file_id:
             if await self._send_by_file_id(channel_id, tg_file_id, media_type, content, post_parse_mode):
                 return {"success": True, "used_image": True}
             logger.warning(f"Не отправил по file_id [{channel_id}] — пробую как текст")

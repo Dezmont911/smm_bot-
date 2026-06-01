@@ -136,7 +136,12 @@ async def read_candidates(
 
         max_id = after_id
         min_id = before_id or None
-        posts, skipped = [], []
+
+        # Сообщения альбома идут как N отдельных сообщений с общим grouped_id.
+        # Группируем их в одну логическую запись (ключ = grouped_id, иначе сам id).
+        # limit считаем по ЛОГИЧЕСКИМ постам, а не по сообщениям.
+        groups: dict = {}   # key -> [msgs]
+        order: list = []    # порядок ключей (для лимита и стабильности)
         async for msg in client.iter_messages(entity, **iter_kwargs):
             if after_id and msg.id <= after_id:
                 break
@@ -144,21 +149,62 @@ async def read_candidates(
                 max_id = msg.id
             if min_id is None or msg.id < min_id:
                 min_id = msg.id
-            if len(posts) >= limit:
-                break
 
-            text = (msg.message or "").strip()
-            kind, ok, reason = _classify_and_check(msg, max_video_mb, max_video_sec, max_doc_mb)
+            key = msg.grouped_id or f"s:{msg.id}"
+            if key not in groups:
+                if len(order) >= limit:
+                    break  # достигли лимита логических постов — новые группы не начинаем
+                groups[key] = []
+                order.append(key)
+            groups[key].append(msg)
 
-            if not ok:
-                skipped.append({"id": msg.id, "reason": reason})
-                logger.info(f"Пропуск {real_username}/{msg.id}: {reason}")
-                continue
-            # совсем пустые (ни текста, ни медиа) — мимо
-            if not text and not kind:
-                continue
+        posts, skipped = [], []
+        for key in order:
+            msgs = sorted(groups[key], key=lambda m: m.id)  # порядок альбома по возрастанию
+            is_album = len(msgs) > 1 or getattr(msgs[0], "grouped_id", None)
 
-            posts.append({"id": msg.id, "text": text, "media_kind": kind})
+            # Подпись — из первого сообщения, где есть текст (обычно первый кадр)
+            text = ""
+            for m in msgs:
+                t = (m.message or "").strip()
+                if t:
+                    text = t
+                    break
+
+            if is_album:
+                # Собираем годные медиа-члены альбома (тяжёлые пропускаем)
+                members = []
+                for m in msgs:
+                    kind, ok, reason = _classify_and_check(m, max_video_mb, max_video_sec, max_doc_mb)
+                    if not kind:
+                        continue  # текст без медиа внутри альбома — игнор
+                    if not ok:
+                        skipped.append({"id": m.id, "reason": reason})
+                        logger.info(f"Пропуск (член альбома) {real_username}/{m.id}: {reason}")
+                        continue
+                    members.append({"id": m.id, "kind": kind})
+                if not members:
+                    continue  # весь альбом не прошёл лимиты
+                if len(members) == 1:
+                    # остался один кадр — это обычное одиночное медиа, не альбом
+                    posts.append({"id": members[0]["id"], "text": text, "media_kind": members[0]["kind"]})
+                else:
+                    posts.append({
+                        "id": members[0]["id"],     # якорь = первый годный кадр
+                        "text": text,
+                        "media_kind": "album",
+                        "members": members,         # [{id, kind}, ...] по порядку
+                    })
+            else:
+                m = msgs[0]
+                kind, ok, reason = _classify_and_check(m, max_video_mb, max_video_sec, max_doc_mb)
+                if not ok:
+                    skipped.append({"id": m.id, "reason": reason})
+                    logger.info(f"Пропуск {real_username}/{m.id}: {reason}")
+                    continue
+                if not text and not kind:
+                    continue
+                posts.append({"id": m.id, "text": text, "media_kind": kind})
 
         posts.reverse()  # от старых к новым
         if min_id is None:

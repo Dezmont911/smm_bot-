@@ -167,8 +167,23 @@ async def import_for_channel(channel: dict, count: int = DEFAULT_TAKE) -> dict:
             if not content and not kind:
                 continue  # пустой пост без медиа
 
-            if kind:
-                # Медиа: запись ждёт file_id от юзербота → бот привяжет и переведёт в ready
+            if kind == "album":
+                # Альбом: ОДНА запись, ждёт file_id всех кадров. Публикуется
+                # как media_group. members хранит порядок и типы кадров.
+                members = p.get("members", [])
+                member_ids = [m["id"] for m in members]
+                buffer.add({
+                    "channel_id": channel_id,
+                    "content": content or "",
+                    "format": "reference",
+                    "topic": topic,
+                    "media_type": "album",
+                    "status": "awaiting_media",
+                    "tg_file_id": json.dumps({"members": member_ids, "items": {}}),
+                })
+                media_to_forward.extend(member_ids)  # пересылаем все кадры
+            elif kind:
+                # Одиночное медиа: запись ждёт file_id → бот привяжет и переведёт в ready
                 buffer.add({
                     "channel_id": channel_id,
                     "content": content or "",

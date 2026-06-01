@@ -2771,6 +2771,11 @@ async def handle_userbot_forward(update: Update, context: ContextTypes.DEFAULT_T
     if not file_id:
         return
 
+    # Сначала пробуем как кадр альбома (media_group), иначе — одиночное медиа
+    topic_prefix = f"ref:{donor.lower()}:"
+    if buffer.attach_album_member(topic_prefix, src_id, file_id, media_type):
+        logger.info(f"Relay: кадр альбома {donor}/{src_id} привязан")
+        return
     topic = ref_topic(donor, src_id)
     if buffer.attach_reference_media(topic, file_id, media_type):
         logger.info(f"Relay: привязал {media_type} к {topic} → ready")
