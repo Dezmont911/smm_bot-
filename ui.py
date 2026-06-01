@@ -1184,8 +1184,44 @@ def _draft_type_label(d: dict) -> str:
     return f"{base} + текст" if has_text else base
 
 
+async def _reply_draft_card(msg_obj, d: dict, num: str):
+    """Отправляет одну карточку черновика: реальное медиа (по file_id) + кнопки."""
+    preview = (d.get("content") or "").strip()
+    preview = preview if preview else "<i>(без подписи)</i>"
+    cap = f"{num} <b>{_draft_type_label(d)}</b>\n{preview}"
+    if len(cap) > 1024:
+        cap = cap[:1020] + "…"
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📤 В очередь", callback_data=f"ui:draft_q:{d['id']}"),
+        InlineKeyboardButton("🗑 Удалить",   callback_data=f"ui:draft_del:{d['id']}"),
+    ]])
+    mt, fid = d.get("media_type"), d.get("tg_file_id")
+    try:
+        if mt == "album" and fid:
+            data = json.loads(fid or "{}")
+            members, items = data.get("members", []), data.get("items", {})
+            first = items.get(str(members[0])) if members else None
+            if first:
+                send = msg_obj.reply_video if first.get("type") == "video" else msg_obj.reply_photo
+                await send(first["file_id"], caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+                return
+        elif fid and mt == "video":
+            await msg_obj.reply_video(fid, caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb); return
+        elif fid and mt == "animation":
+            await msg_obj.reply_animation(fid, caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb); return
+        elif fid and mt == "document":
+            await msg_obj.reply_document(fid, caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb); return
+        elif fid:
+            await msg_obj.reply_photo(fid, caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb); return
+    except Exception as e:
+        logger.debug(f"draft card media fail: {e}")
+    # текст или фолбэк
+    await msg_obj.reply_text(cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
 async def screen_drafts(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
-    """Черновики канала: нумерованный список + действия по каждому и массовые."""
+    """Черновики канала: каждая — карточка с медиа + кнопки, снизу массовые действия."""
+    from telegram import CallbackQuery
     ch = _load_channel(handle)
     if not ch:
         await _answer_or_send(qm, f"❌ Канал {handle} не найден.", None)
@@ -1194,37 +1230,37 @@ async def screen_drafts(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
     name = ch.get("name", handle)
 
     if not drafts:
-        text = (
-            f"🔥 <b>Черновики</b> — {name}\n\n"
-            f"Пусто. Нажми «➕ Создать пост» и пришли текст, фото или видео."
-        )
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Создать пост", callback_data=f"ui:draft_new:{handle}")],
             [InlineKeyboardButton("↩️ Назад к каналу", callback_data=f"ui:ch:{handle}")],
         ])
-        await _answer_or_send(qm, text, kb)
+        await _answer_or_send(qm, f"🔥 <b>Черновики</b> — {name}\n\nПусто. «➕ Создать пост» → пришли текст, фото или видео.", kb)
         return
 
-    # Текст: нумерованный список с типом и превью
-    lines = [f"🔥 <b>Черновики</b> — {name}\n", f"📌 Сейчас в черновиках: <b>{len(drafts)}</b>\n"]
-    rows = []
+    msg_obj = qm.message if isinstance(qm, CallbackQuery) else qm
+    if isinstance(qm, CallbackQuery):
+        await qm.answer()
+        try:
+            await qm.edit_message_text(
+                f"🔥 <b>Черновики</b> — {name}\n📌 Сейчас в черновиках: <b>{len(drafts)}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            await msg_obj.reply_text(f"🔥 <b>Черновики</b> — {name}\n📌 Сейчас в черновиках: <b>{len(drafts)}</b>", parse_mode=ParseMode.HTML)
+
+    # Карточки черновиков
     for i, d in enumerate(drafts):
         num = _NUM_EMOJI[i] if i < len(_NUM_EMOJI) else f"{i+1}."
-        preview = (d.get("content") or "").strip().replace("\n", " ")
-        preview = preview[:60] + ("…" if len(preview) > 60 else "") if preview else "(без подписи)"
-        lines.append(f"{num} {_draft_type_label(d)}\n   {preview}\n")
-        rows.append([
-            InlineKeyboardButton(f"{num} 📤 В очередь", callback_data=f"ui:draft_q:{d['id']}"),
-            InlineKeyboardButton("🗑", callback_data=f"ui:draft_del:{d['id']}"),
-        ])
+        await _reply_draft_card(msg_obj, d, num)
 
-    rows.append([InlineKeyboardButton("➕ Создать пост", callback_data=f"ui:draft_new:{handle}")])
+    # Массовые действия снизу
+    foot = []
     if len(drafts) > 1:
-        rows.append([InlineKeyboardButton(f"📤 Все в очередь ({len(drafts)})", callback_data=f"ui:draft_qall:{handle}")])
-    rows.append([InlineKeyboardButton("🗑 Очистить все черновики", callback_data=f"ui:draft_clear:{handle}")])
-    rows.append([InlineKeyboardButton("↩️ Назад к каналу", callback_data=f"ui:ch:{handle}")])
-
-    await _answer_or_send(qm, "\n".join(lines), InlineKeyboardMarkup(rows))
+        foot.append([InlineKeyboardButton(f"📤 Все в очередь ({len(drafts)})", callback_data=f"ui:draft_qall:{handle}")])
+    foot.append([InlineKeyboardButton("➕ Создать пост", callback_data=f"ui:draft_new:{handle}")])
+    foot.append([InlineKeyboardButton("🗑 Очистить все черновики", callback_data=f"ui:draft_clear:{handle}")])
+    foot.append([InlineKeyboardButton("↩️ Назад к каналу", callback_data=f"ui:ch:{handle}")])
+    await msg_obj.reply_text("⬇️ Действия с черновиками:", reply_markup=InlineKeyboardMarkup(foot))
 
 
 async def action_draft_clear_confirm(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
@@ -1319,14 +1355,17 @@ async def create_draft_from_message(update: Update, context: ContextTypes.DEFAUL
 
 
 async def action_draft_queue(qm, context: ContextTypes.DEFAULT_TYPE, post_id: str):
-    """Отправляет один черновик в очередь (handle берём из самого поста)."""
-    handle = buffer.get_post_channel(post_id)
+    """Отправляет один черновик в очередь. Правит кнопки этой карточки на месте."""
     ok = buffer.draft_to_ready(post_id)
     from telegram import CallbackQuery
     if isinstance(qm, CallbackQuery):
         await qm.answer("⬆️ В очереди" if ok else "Уже не черновик")
-    if handle:
-        await screen_drafts(qm, context, handle)
+        try:
+            await qm.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ В очереди", callback_data="ui:noop")]])
+            )
+        except Exception:
+            pass
 
 
 async def action_draft_queue_last(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
@@ -1350,14 +1389,17 @@ async def action_draft_queue_all(qm, context: ContextTypes.DEFAULT_TYPE, handle:
 
 
 async def action_draft_delete(qm, context: ContextTypes.DEFAULT_TYPE, post_id: str):
-    """Удаляет черновик."""
-    handle = buffer.get_post_channel(post_id)
+    """Удаляет черновик. Правит кнопки этой карточки на месте."""
     buffer.delete_draft(post_id)
     from telegram import CallbackQuery
     if isinstance(qm, CallbackQuery):
         await qm.answer("🗑 Удалён")
-    if handle:
-        await screen_drafts(qm, context, handle)
+        try:
+            await qm.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Удалён", callback_data="ui:noop")]])
+            )
+        except Exception:
+            pass
 
 
 async def action_draft_view(qm, context: ContextTypes.DEFAULT_TYPE, post_id: str):
@@ -2045,6 +2087,10 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data  # например: "ui:ch:@hagenezykas"
     parts = data.split(":")  # ["ui", "ch", "@hagenezykas"]
     action = parts[1] if len(parts) > 1 else ""
+
+    if action == "noop":
+        await query.answer()
+        return
 
     if action == "main":
         await screen_main(query, context)
