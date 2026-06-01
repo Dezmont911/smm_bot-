@@ -262,6 +262,14 @@ class BufferManager:
             )
             return cur.rowcount
 
+    def get_post_channel(self, post_id: str) -> str | None:
+        """channel_id поста по его id (для коротких callback без handle)."""
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT channel_id FROM posts WHERE id = ? LIMIT 1", (post_id,)
+            ).fetchone()
+        return row["channel_id"] if row else None
+
     def delete_draft(self, post_id: str) -> bool:
         with db.connect() as conn:
             cur = conn.execute(

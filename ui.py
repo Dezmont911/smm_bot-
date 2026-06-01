@@ -1187,13 +1187,13 @@ async def screen_drafts(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
 
     rows = [[InlineKeyboardButton("➕ Создать пост", callback_data=f"ui:draft_new:{handle}")]]
     for d in drafts:
-        pid = d["id"]
+        pid = d["id"]  # без handle в callback — иначе вылезаем за лимит Telegram 64 байта
         rows.append([
-            InlineKeyboardButton(_draft_preview(d)[:40], callback_data=f"ui:draft_view:{handle}:{pid}"),
+            InlineKeyboardButton(_draft_preview(d)[:40], callback_data=f"ui:draft_view:{pid}"),
         ])
         rows.append([
-            InlineKeyboardButton("⬆️ В очередь", callback_data=f"ui:draft_q:{handle}:{pid}"),
-            InlineKeyboardButton("🗑 Удалить",   callback_data=f"ui:draft_del:{handle}:{pid}"),
+            InlineKeyboardButton("⬆️ В очередь", callback_data=f"ui:draft_q:{pid}"),
+            InlineKeyboardButton("🗑 Удалить",   callback_data=f"ui:draft_del:{pid}"),
         ])
     if len(drafts) > 1:
         rows.append([InlineKeyboardButton(f"⬆️ Все в очередь ({len(drafts)})",
@@ -1280,13 +1280,15 @@ async def create_draft_from_message(update: Update, context: ContextTypes.DEFAUL
     return True
 
 
-async def action_draft_queue(qm, context: ContextTypes.DEFAULT_TYPE, handle: str, post_id: str):
-    """Отправляет один черновик в очередь."""
+async def action_draft_queue(qm, context: ContextTypes.DEFAULT_TYPE, post_id: str):
+    """Отправляет один черновик в очередь (handle берём из самого поста)."""
+    handle = buffer.get_post_channel(post_id)
     ok = buffer.draft_to_ready(post_id)
     from telegram import CallbackQuery
     if isinstance(qm, CallbackQuery):
         await qm.answer("⬆️ В очереди" if ok else "Уже не черновик")
-    await screen_drafts(qm, context, handle)
+    if handle:
+        await screen_drafts(qm, context, handle)
 
 
 async def action_draft_queue_last(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
@@ -1309,21 +1311,24 @@ async def action_draft_queue_all(qm, context: ContextTypes.DEFAULT_TYPE, handle:
     await screen_drafts(qm, context, handle)
 
 
-async def action_draft_delete(qm, context: ContextTypes.DEFAULT_TYPE, handle: str, post_id: str):
+async def action_draft_delete(qm, context: ContextTypes.DEFAULT_TYPE, post_id: str):
     """Удаляет черновик."""
+    handle = buffer.get_post_channel(post_id)
     buffer.delete_draft(post_id)
     from telegram import CallbackQuery
     if isinstance(qm, CallbackQuery):
         await qm.answer("🗑 Удалён")
-    await screen_drafts(qm, context, handle)
+    if handle:
+        await screen_drafts(qm, context, handle)
 
 
-async def action_draft_view(qm, context: ContextTypes.DEFAULT_TYPE, handle: str, post_id: str):
+async def action_draft_view(qm, context: ContextTypes.DEFAULT_TYPE, post_id: str):
     """Показывает черновик так, как он будет выглядеть (реальным сообщением)."""
     from telegram import CallbackQuery
     if isinstance(qm, CallbackQuery):
         await qm.answer()
-    d = next((x for x in buffer.get_drafts(handle) if x["id"] == post_id), None)
+    handle = buffer.get_post_channel(post_id)
+    d = next((x for x in buffer.get_drafts(handle) if x["id"] == post_id), None) if handle else None
     if not d:
         return
     chat_id = qm.message.chat_id if isinstance(qm, CallbackQuery) else qm.chat_id
@@ -2027,8 +2032,8 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "draft_new" and len(parts) >= 3:
         await action_draft_new(query, context, parts[2])
 
-    elif action == "draft_q" and len(parts) >= 4:
-        await action_draft_queue(query, context, parts[2], parts[3])
+    elif action == "draft_q" and len(parts) >= 3:
+        await action_draft_queue(query, context, parts[2])
 
     elif action == "draft_qlast" and len(parts) >= 3:
         await action_draft_queue_last(query, context, parts[2])
@@ -2036,11 +2041,11 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "draft_qall" and len(parts) >= 3:
         await action_draft_queue_all(query, context, parts[2])
 
-    elif action == "draft_del" and len(parts) >= 4:
-        await action_draft_delete(query, context, parts[2], parts[3])
+    elif action == "draft_del" and len(parts) >= 3:
+        await action_draft_delete(query, context, parts[2])
 
-    elif action == "draft_view" and len(parts) >= 4:
-        await action_draft_view(query, context, parts[2], parts[3])
+    elif action == "draft_view" and len(parts) >= 3:
+        await action_draft_view(query, context, parts[2])
 
     elif action == "status":
         await screen_status(query, context)
