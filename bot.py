@@ -3158,7 +3158,14 @@ def main():
         """Запускается после старта бота — инициализируем постер и планировщик."""
         poster.set_bot(application.bot)
 
-        scheduler = AsyncIOScheduler(timezone="UTC")
+        # job_defaults применяются ко ВСЕМ задачам — защита от рестартов/простоя:
+        #   coalesce=True       — после простоя пропущенные запуски схлопываются в один
+        #                         (нет burst-догонки, напр. постер не выстрелит 5 раз подряд)
+        #   max_instances=1     — задача не наложится сама на себя (нет дублей/гонок)
+        scheduler = AsyncIOScheduler(
+            timezone="UTC",
+            job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 300},
+        )
 
         # Постер — каждый час проверяет все каналы
         scheduler.add_job(
@@ -3223,6 +3230,17 @@ def main():
 
         scheduler.start()
         application.bot_data["scheduler"] = scheduler
+
+        # Реконсиляция на старте: ВСЕ awaiting_media на момент старта — сироты
+        # (форвард медиа был в уже умершем процессе, а backlog апдейтов дропается
+        # при старте), media к ним уже не придёт. Чистим все → их можно взять заново.
+        try:
+            from buffer_manager import buffer as _buf
+            n_cleaned = _buf.cleanup_awaiting(older_than_minutes=0)
+            if n_cleaned:
+                logger.info(f"Старт: подчищено зависших awaiting_media: {n_cleaned}")
+        except Exception as e:
+            logger.warning(f"Старт: реконсиляция awaiting_media не удалась: {e}")
 
         logger.success(
             "Планировщик запущен:\n"
