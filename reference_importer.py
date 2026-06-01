@@ -106,37 +106,91 @@ async def _notify_admin(text: str):
         logger.warning(f"Не смог отправить алёрт админу: {e}")
 
 
-async def import_for_channel(channel: dict, count: int = DEFAULT_TAKE) -> dict:
+async def _store_reference_post(channel: dict, channel_id: str, handle: str,
+                                p: dict, do_rephrase: bool):
     """
-    Добирает `count` постов для всех референсов одного канала (relay-режим).
+    Создаёт запись(и) в буфере для одного поста донора.
 
-    Дедуп — по РЕАЛЬНОМУ наличию: сканируем донора от свежих к старым и берём
-    только то, чего у нас ещё нет (buffer.source_exists). Опубликованные и
-    лежащие в очереди — пропускаем; удалённые/очищенные — снова доступны
-    (их строк в БД нет, значит можно взять заново). Никаких меток-окон.
-
-    Возвращает статистику: added / skipped_dups / skipped_limits / refs.
+    Возвращает список msg_id для пересылки боту (медиа), пустой список для
+    текстового поста, или None если пост пустой (не добавлен).
     """
     from ai_client import rephrase_text  # ленивый импорт (тяжёлая зависимость)
 
+    topic = ref_topic(handle, p["id"])
+    raw = p.get("text", "")
+
+    # «Как есть» — HTML (со ссылками); перефраз — простой текст без формата
+    if do_rephrase and raw:
+        try:
+            content = await rephrase_text(raw, channel)
+        except Exception as e:
+            logger.warning(f"Перефраз {handle}/{p['id']} не удался: {e} — беру оригинал")
+            content = raw
+        parse_mode = None
+    else:
+        content = p.get("text_html") or raw
+        parse_mode = "HTML"
+
+    content = _strip_filtered_sentences(content)  # вырезаем «MAX» и пр.
+
+    kind = p.get("media_kind")
+    if not content and not kind:
+        return None  # пустой пост без медиа
+
+    if kind == "album":
+        member_ids = [m["id"] for m in p.get("members", [])]
+        buffer.add({
+            "channel_id": channel_id, "content": content or "",
+            "format": "reference", "topic": topic,
+            "media_type": "album", "status": "awaiting_media",
+            "parse_mode": parse_mode,
+            "tg_file_id": json.dumps({"members": member_ids, "items": {}}),
+        })
+        return member_ids
+    elif kind:
+        buffer.add({
+            "channel_id": channel_id, "content": content or "",
+            "format": "reference", "topic": topic,
+            "media_type": kind, "status": "awaiting_media",
+            "parse_mode": parse_mode,
+        })
+        return [p["id"]]
+    else:
+        buffer.add({
+            "channel_id": channel_id, "content": content,
+            "format": "reference", "topic": topic,
+            "status": "ready", "parse_mode": parse_mode,
+        })
+        return []
+
+
+async def import_for_channel(channel: dict, count: int = DEFAULT_TAKE) -> dict:
+    """
+    Добирает `count` постов СУММАРНО для канала, равномерно распределяя между
+    всеми донорами (round-robin: по одному с каждого по кругу — лента идёт
+    вперемешку, а не блоками).
+
+    Дедуп — по РЕАЛЬНОМУ наличию: берём только то, чего у нас ещё нет
+    (buffer.source_exists). Опубликованные/в очереди — пропускаем; удалённые
+    и очищенные — снова доступны. Никаких меток-окон.
+
+    Возвращает статистику: added / skipped_dups / skipped_limits / refs.
+    """
     refs = channel.get("reference_channels", [])
     channel_id = channel["channel_id"]
     if not refs:
         return {"channel_id": channel_id, "added": 0, "refs": 0}
 
-    added_total = 0
     skipped_dups = 0
     skipped_limits = 0
 
+    # --- Фаза 1: очередь свежих кандидатов с КАЖДОГО донора ---
+    queues = []
+    pool = max(count * 10, 60)
     for ref in refs:
         handle = normalize_handle(ref.get("handle", ""))
         if not handle:
             continue
-        do_rephrase = ref.get("rephrase", True)
-        skip_ads = ref.get("skip_ads", True)
-
-        # Берём пул свежих кандидатов с запасом — из него отфильтруем уже взятые
-        pool = max(count * 10, 60)
         try:
             data = await read_candidates(handle, limit=pool)
         except Exception as e:
@@ -144,84 +198,62 @@ async def import_for_channel(channel: dict, count: int = DEFAULT_TAKE) -> dict:
             await _notify_admin(f"❌ <b>Импорт референса</b> {handle} → {channel_id}\n<code>{e}</code>")
             continue
         skipped_limits += len(data.get("skipped", []))
+        queues.append({
+            "ref": ref, "handle": handle,
+            "cands": list(reversed(data["posts"])),  # от свежих к старым
+            "media": [], "added": 0,
+        })
 
-        media_to_forward = []   # msg_id для пересылки боту (медиа)
-        added_ref = 0
-        # posts идут старые→новые; берём от СВЕЖИХ (reversed)
-        for p in reversed(data["posts"]):
-            if added_ref >= count:
+    # --- Фаза 2: round-robin — по одному с каждого донора, пока не наберём `count` ВСЕГО ---
+    added_total = 0
+    while added_total < count and any(q["cands"] for q in queues):
+        progressed = False
+        for q in queues:
+            if added_total >= count:
                 break
-            topic = ref_topic(handle, p["id"])
+            stored = None
+            while q["cands"]:
+                p = q["cands"].pop(0)
+                topic = ref_topic(q["handle"], p["id"])
+                if buffer.source_exists(channel_id, topic):
+                    skipped_dups += 1
+                    continue
+                raw = p.get("text", "")
+                if q["ref"].get("skip_ads", True) and raw and _is_ad(raw):
+                    logger.debug(f"Референс {q['handle']}: пропуск рекламы (id={p['id']})")
+                    continue
+                media_ids = await _store_reference_post(
+                    channel, channel_id, q["handle"], p, q["ref"].get("rephrase", True)
+                )
+                if media_ids is None:
+                    continue  # пустой пост — берём следующего
+                stored = media_ids
+                break
+            if stored is None:
+                continue  # у этого донора годных кандидатов не осталось
+            q["media"].extend(stored)
+            q["added"] += 1
+            added_total += 1
+            progressed = True
+        if not progressed:
+            break  # ни один донор больше не может добавить
 
-            # уже есть у нас (в очереди/опубликовано) — пропускаем; удалённого нет в БД
-            if buffer.source_exists(channel_id, topic):
-                skipped_dups += 1
-                continue
-
-            raw = p.get("text", "")
-            if skip_ads and raw and _is_ad(raw):
-                logger.debug(f"Референс {handle}: пропуск рекламы (id={p['id']})")
-                continue
-
-            # «Как есть» — HTML (со ссылками); перефраз — простой текст без формата
-            if do_rephrase and raw:
-                try:
-                    content = await rephrase_text(raw, channel)
-                except Exception as e:
-                    logger.warning(f"Перефраз {handle}/{p['id']} не удался: {e} — беру оригинал")
-                    content = raw
-                parse_mode = None
-            else:
-                content = p.get("text_html") or raw
-                parse_mode = "HTML"
-
-            # Вырезаем предложения со словами-фильтрами (напр. промо «MAX»)
-            content = _strip_filtered_sentences(content)
-
-            kind = p.get("media_kind")
-            if not content and not kind:
-                continue  # пустой пост без медиа
-
-            if kind == "album":
-                member_ids = [m["id"] for m in p.get("members", [])]
-                buffer.add({
-                    "channel_id": channel_id, "content": content or "",
-                    "format": "reference", "topic": topic,
-                    "media_type": "album", "status": "awaiting_media",
-                    "parse_mode": parse_mode,
-                    "tg_file_id": json.dumps({"members": member_ids, "items": {}}),
-                })
-                media_to_forward.extend(member_ids)
-            elif kind:
-                buffer.add({
-                    "channel_id": channel_id, "content": content or "",
-                    "format": "reference", "topic": topic,
-                    "media_type": kind, "status": "awaiting_media",
-                    "parse_mode": parse_mode,
-                })
-                media_to_forward.append(p["id"])
-            else:
-                buffer.add({
-                    "channel_id": channel_id, "content": content,
-                    "format": "reference", "topic": topic,
-                    "status": "ready", "parse_mode": parse_mode,
-                })
-            added_ref += 1
-
-        # Пересылаем медиа боту (записи awaiting_media уже созданы → нет гонки)
-        if media_to_forward:
+    # --- Фаза 3: пересылаем медиа боту, отдельно по каждому донору ---
+    for q in queues:
+        if q["media"]:
             try:
-                await forward_to_bot(handle, media_to_forward)
+                await forward_to_bot(q["handle"], q["media"])
             except Exception as e:
-                logger.error(f"Пересылка медиа {handle} → бот: {e}")
+                logger.error(f"Пересылка медиа {q['handle']} → бот: {e}")
                 await _notify_admin(
-                    f"⚠️ <b>Пересылка медиа</b> {handle} → {channel_id}\n<code>{e}</code>\n"
+                    f"⚠️ <b>Пересылка медиа</b> {q['handle']} → {channel_id}\n<code>{e}</code>\n"
                     f"Текстовые посты импортированы, медиа-посты подвиснут как awaiting_media."
                 )
+        if q["added"]:
+            logger.info(f"Референс {q['handle']} → {channel_id}: +{q['added']}")
 
-        added_total += added_ref
-        logger.info(f"Референс {handle} → {channel_id}: +{added_ref} (дубли {skipped_dups}, лимиты {skipped_limits})")
-
+    logger.info(f"Импорт референсов → {channel_id}: всего +{added_total} с {len(queues)} донор(ов) "
+                f"(дубли {skipped_dups}, лимиты {skipped_limits})")
     return {
         "channel_id": channel_id, "added": added_total, "refs": len(refs),
         "skipped_dups": skipped_dups, "skipped_limits": skipped_limits,
