@@ -57,12 +57,13 @@ loguru, paramiko, feedparser, fal-client, sentence-transformers + torch (CPU), t
   `_looks_like_refusal`/`PostGenerationError`; `FIELD_LIMITS`/`sanitize_field`.
 - `claude_helper.py` — единый `AsyncAnthropic` + `claude_text(...)` (ретраи, безопасный extract,
   параметр temperature). ВСЕ вызовы Claude идут через него (async, не блокирует loop).
-- `content_generator.py` — дирижёр: `run_for_channel` (собирает ПУЛ кандидатов
-  `min(max(target*3,10),target+25)`, генерит до target, картинка по image_source),
-  `run_top_up_cycle`, `run_emergency`. `_collect_topics` (search → RSS → web_scraper → evergreen),
-  `_get_used_topics` (published+ready+**skipped**, против повторов после очистки),
-  `_is_duplicate` (семантич. дедуп). Картинка подбирается по СОДЕРЖАНИЮ поста (`image_basis`),
-  не по сырому заголовку темы.
+- `content_generator.py` — дирижёр: `run_for_channel`, `run_top_up_cycle`, `run_emergency`.
+  `_collect_topics`: search → RSS → web_scraper → evergreen → **гейт релевантности**
+  (`_filter_relevant`: косинус кандидат-темы к профилю канала ≥ `RELEVANCE_MIN`=0.28,
+  отсев off-topic ДО генерации; evergreen/fallback не трогает; floor `max(3,count//2)` —
+  не пустить буфер; без эмбеддингов прозрачно пропускает) → **Источник 4** (синтез-резерв
+  «{тема}: угол», только если всё пусто). `_get_used_topics` (published+ready+skipped),
+  `_is_duplicate` (семантич. дедуп). Картинка — по СОДЕРЖАНИЮ поста (`image_basis`).
 - `content_router.py` / `archetypes.py` — стиль/«личность» канала по архетипу (default,
   gaming_esports, gaming_casual, anime, news, auto, celeb_drama, finance): style, format_bias,
   temperature, hooks. `resolve()`, `pick_format()`, `pick_hook()`.
@@ -71,50 +72,79 @@ loguru, paramiko, feedparser, fal-client, sentence-transformers + torch (CPU), t
 - `dedup.py` — локальные эмбеддинги (paraphrase-multilingual-MiniLM-L12-v2, 384-dim, ленивая загрузка).
 
 **Публикация и медиа**
-- `poster.py` — `tick()` (ежечасно публикует по `post_times_utc`), `_publish` (медиа-файл →
-  WB-картинка → URL → текст; self-heal картинки через FLUX), `_send_local_media` (фото/видео
-  из файла для референсов), `_download_wb_image` (WB CDN через прокси).
-- `image_fetcher.py` — Reddit → Pexels → Unsplash; запрос строит Claude. Якорь к теме канала
-  только если короткий (не предложение-описание).
-- `image_generator.py` — FLUX через fal.ai (`fal-ai/flux/schnell`, ~$0.003).
+- `poster.py` — `tick()`→`_process_channel` (ежечасно по `post_times_utc`). `_publish`:
+  **relay-медиа по `tg_file_id`** (`_send_by_file_id`: photo/video/doc/anim) → **альбом**
+  (`_send_album`: media_group по JSON `{members,items}`) → WB-картинка → image_url → текст;
+  self-heal картинки через FLUX. **Плавающие слоты:** `_process_channel` пропускает слот,
+  если есть ожидающее РСЯ-перекрытие (`buffer.has_pending_overlay`) ИЛИ публиковали
+  < `MIN_PUBLISH_GAP_MIN`=40 мин назад. `record_published`/`minutes_since_published`
+  (пишет `last_published_utc` в карточку при КАЖДОЙ публикации). `process_due_ads` (в bot.py)
+  — публикует дозревшие РСЯ-перекрытия (всегда, реклама важнее).
+- `image_fetcher.py` — Reddit → Pexels → Unsplash; запрос строит Claude по ВСЕМУ посту
+  (`_extract_visual_keywords` — главный визуальный субъект, игнор «воды»), лог `info`.
+- `image_generator.py` — FLUX через fal.ai (`fal-ai/flux/schnell`, ~$0.003). ⚠️ НЕ умеет
+  текст на картинке (в т.ч. русский) — для канала-открыток только референсы/ручные посты.
 
 **Каналы / Telethon / БД**
 - `channel_analyzer.py` — `analyze_export`, `analyze_posts(name, posts, about)` (для @username),
   `classify_channel`, `normalize_meta`. Анализ игнорирует рекламные посты.
-- `userbot_reader.py` — Telethon-юзербот: `read_channel(username)` (для авто-/add),
-  `read_new_posts(username, after_id, limit, with_media, media_dir)` (для референсов, скачивает медиа).
-- `reference_importer.py` — импорт постов доноров: `import_for_channel`/`import_all`,
-  лёгкий фильтр рекламы (AD_MARKERS), перефраз по флагу.
-- `buffer_manager.py` — очередь постов (`add`, `get_next`, `mark_published`, evergreen).
-- `database.py` — схема (`posts` с image_url/parse_mode/embedding/**media_path/media_type**,
-  channels, topic_cache, evergreen_topics, processed_ads, error_log). `init()` идемпотентен.
-- `config.py` — `cfg` (dataclass из .env). CLAUDE_MODEL=claude-haiku-4-5-20251001 и пр.
-- `ui.py` — inline-меню (карточка канала, настройки, очередь, расписание, картинки-тумблер,
-  источники тем, референс-каналы).
-- `wb_parser.py` / `wb_partner_parser.py` — маркетплейс WB (отдельный пайплайн).
-- `scripts/` — рабочие хелперы и `_*`/тест-скрипты (одноразовые с префиксом `_`).
+- `userbot_reader.py` — Telethon-юзербот (лимиты подключения, не виснет). `read_channel`
+  (для /add). **Referenсы — RELAY, без скачивания:** `read_candidates` (читает донора,
+  группирует альбомы по `grouped_id`, проверяет лимиты видео ≤100МБ/≤5мин и док ≤100МБ,
+  отдаёт `text`/`text_html`/`media_kind`/`members`) + `forward_to_bot` (форвардит медиа
+  В ЛС бота, обычный форвард — чтобы сохранился `forward_from_*` для матчинга).
+- `reference_importer.py` — `import_for_channel(count)`: **round-robin** по донорам (N всего,
+  по одному с каждого), дедуп по `buffer.source_exists` (взятым считается ready/awaiting/
+  pending/published — НЕ skipped и НЕ удалённые → их можно взять заново), фильтр рекламы,
+  фильтр слов `FILTER_WORDS` («Max» — вырезает предложение), HTML-ссылки сохраняются. Текст →
+  `ready`; медиа → запись `awaiting_media` (file_id привяжет хендлер бота). `ref_topic`=ключ.
+- `buffer_manager.py` — очередь + черновики + РСЯ-перекрытия. Статусы: `ready`/`pending_review`/
+  `published`/`skipped`/`draft`/`awaiting_media`. Методы: relay (`attach_reference_media`,
+  `attach_album_member`, `cleanup_awaiting`), черновики (`get_drafts`, `draft_to_ready`,
+  `drafts_to_ready_all`, `set_draft_content/media`, `delete[_all]_draft(s)`), РСЯ
+  (`record_pending_ad`, `get_due_ads`, `mark_ad_published/failed`, `has_pending_overlay`).
+- `database.py` — `posts` (+ `tg_file_id` relay-медиа), `processed_ads` (+ `due_at` —
+  персистентное РСЯ-перекрытие), channels, topic_cache, evergreen_topics, error_log.
+- `config.py` — `cfg` (dataclass из .env). CLAUDE_MODEL=claude-haiku-4-5-20251001.
+- `ui.py` — inline-меню. «Мои каналы»: верх (➕ Добавить · 🔍 Поиск · 🗑 Удалённые),
+  тумблеры 🔵/⚪, пагинация по 10. Карточка: Генерить/Постнуть/🔗 Референсы/✍️ Черновик/
+  Настройки. **Черновик** = ручные посты (текст/фото/видео, карточки с медиа, ✏️ текст/
+  🖼 медиа, в очередь по одному/все, очистить). Референсы: «📥 Взять» → выбор N (5/10/20/50
+  или число, кап 50).
+- `wb_parser.py` — маркетплейс WB (ЕДИНСТВЕННЫЙ парсер; `wb_partner_parser` удалён).
+  Кэш артикулов `cards/wb_ids_cache.json` (`/wb_refresh` раз в 1-2 нед), данные товара
+  тянутся ЖИВЫМ запросом `card.wb.ru` через прокси при каждой генерации. Пост — HTML
+  (`parse_mode=HTML`, кликабельная ссылка на товар).
+- `scripts/` — локальные хелперы/тест-скрипты. **В .gitignore** (содержат IP, не в деплое).
 
-**Планировщик (bot.py on_startup, UTC):** poster.tick `:00`; run_top_up_cycle `:30`
-(только просевшие каналы); reference_importer.import_all раз в день `08:00`.
+**Планировщик (bot.py on_startup, UTC; `job_defaults`: coalesce + max_instances=1 —
+после простоя нет burst-догонки/наложений):** poster.tick `:00`; run_top_up_cycle `:30`;
+reference_importer.import_all `08:00`; чистка `awaiting_media` `:15`; **process_due_ads
+каждую минуту** (РСЯ-перекрытия, персистентно). На старте — реконсиляция: чистка осиротевших
+`awaiting_media`. РСЯ-перекрытие переживает рестарт (лежит в `processed_ads`, не в asyncio.Task).
 
 ---
 
 ## Модель карточки канала (channels/*.json)
 
-Ключевые поля: `channel_id` (@handle), `name`, `topic`, `channel_type` (content|marketplace),
-`archetype`, `topic_source` (search|rss), `post_times_utc` (часы UTC; пусто = нет расписания),
-`schedule_disabled` (true = автопубликация выкл), `daily_posts_count`, `post_length`
-(«20-30» = слова), `image_source` (auto|stock|ai|rss|none — ЕДИНОЕ правило выбора картинки),
-`use_images` (легаси, логикой больше НЕ управляет), `rss_sources`, `web_sources`,
-`evergreen_topics`, `reference_channels` ([{handle, rephrase, take_media, skip_ads, last_id}]).
+Ключевые поля: `channel_id` (@handle), `name`, `topic`, `tone` (легаси, в промпт НЕ идёт),
+`channel_type` (content|marketplace), `archetype`, `topic_source` (search|rss),
+`post_times_utc` (часы UTC; пусто = нет расписания), `schedule_disabled` (true = автопубл. выкл),
+`last_published_utc` (для MIN_GAP плавающих слотов), `daily_posts_count`, `post_length`,
+`image_source` (auto|stock|ai|rss|none — ЕДИНОЕ правило картинки), `image_keywords`,
+`rss_sources`, `web_sources`, `evergreen_topics`, `rsy_override` (перекрытие РСЯ вкл),
+`reference_channels` ([{handle, rephrase, take_media, skip_ads, `max_imported_id`,
+`min_imported_id`}] — относятся к relay-окну; легаси `last_id`/`oldest_id` ещё читаются).
 
 ---
 
 ## Важные решения и конвенции (не нарушать без причины)
 
-- **Тон постов — единый человечный** (`_HUMAN_VOICE`): без шаблонных крючков
-  («Знаете ли вы, что N%…»), канцелярита, выдуманной статистики. Per-channel «тон» из UI
-  убран; в промпт не подаётся.
+- **Тон постов — единый человечный** (`_HUMAN_VOICE`, ai_client): применяется ко ВСЕМ каналам
+  (новым и старым) автоматически в каждом промпте. Per-channel `tone` в промпт НЕ идёт.
+- **Глобальные запретки** (`DEFAULT_FORBIDDEN_TOPICS` в ai_client): политика/18+/наркотики/
+  азартные/порно/война/скам/мошенничество/ЛГБТ/ракеты/дроны/Украина — для всех каналов;
+  per-channel `forbidden_topics` добавляется сверху.
 - **Картинка гарантирована** для контент-каналов: image_source auto/stock/ai → если сток
   промахнулся, дорисовываем FLUX. Картинку подбираем по тексту поста.
 - **Расписание:** новый канал создаётся `schedule_disabled=true` (не постит, пока не включат
@@ -126,8 +156,23 @@ loguru, paramiko, feedparser, fal-client, sentence-transformers + torch (CPU), t
   Синтез-резерв в `_collect_topics` (Источник 4, «{тема}: угол») — СПЯЩАЯ страховка
   на самый крайний случай (срабатывает, только если и дискавери ничего не вернёт, и
   evergreen пуст); в обычной жизни не запускается. Не считать его основным источником.
-- **Референсы:** режим «как есть» основной — медиа 1:1, текст перефраз или как есть. Вотермарки
-  НЕ снимаем (нет надёжного способа): либо как есть, либо ручная замена картинки на посте.
+- **Референсы — RELAY через file_id** (НЕ скачиваем на диск): юзербот форвардит медиа в ЛС
+  бота → хендлер `handle_userbot_forward` достаёт `file_id`, привязывает к записи буфера
+  (по `ref:донор:msg_id`), удаляет служебное сообщение из ЛС → бот публикует `send_*(file_id)`.
+  Юзербот НИГДЕ не админ (мультитенант: чужие добавляют только бота). Альбомы — склеиваем
+  в media_group. Защищённые доноры (ChatForwardsRestrictedError) — пропуск с алёртом.
+  Дедуп по наличию: удалённые/skipped посты можно взять заново. Берём N round-robin по донорам.
+- **РСЯ-перекрытие — персистентно** (`processed_ads.due_at`), переживает рестарт; публикуется
+  ВСЕГДА при наступлении срока. Перекрытие НЕ зависит от паузы расписания (`schedule_disabled`
+  глушит только плановые слоты; `rsy_override` — отдельно).
+- **Плавающие слоты:** любой пост пишет `last_published_utc`; плановый слот пропускается, если
+  публиковали < `MIN_PUBLISH_GAP_MIN`=40 мин назад или ждёт перекрытие. Ручной пост админа бот
+  ловит как `channel_post` (свои посты обратно не получает) → тоже двигает слот.
+- **Черновики (`draft`):** ручные посты в меню канала, в очередь не идут, пока не отправишь.
+- **/add сокращён** до 3 шагов (handle→название→тема→тип); тон/запретки/RSS/картинки/кол-во —
+  автодефолты. Есть `/bulk_add` (списком), выход в меню. Картинки нового канала = `image_source=auto`.
+- **callback_data ≤ 64 байт** — не класть @handle+UUID вместе (используем только post_id, канал
+  ищем по нему). Иначе Telegram молча роняет кнопку.
 - **Защита от инъекций:** поля канала идут в `<профиль_канала>` как данные; лимиты `FIELD_LIMITS`.
 - **Безопасность:** секреты (TELEGRAM_API_*, 2FA, токены, ключи Pexels/FAL/прокси) — только в
   `.env` (на VPS и локально), НЕ в git и НЕ в память. `*.session` в .gitignore.
