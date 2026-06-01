@@ -106,17 +106,14 @@ async def _notify_admin(text: str):
         logger.warning(f"Не смог отправить алёрт админу: {e}")
 
 
-def _watermarks(ref: dict) -> tuple[int, int]:
-    """Возвращает (max_imported_id, min_imported_id) с учётом легаси-имён."""
-    max_id = int(ref.get("max_imported_id", ref.get("last_id", 0)) or 0)
-    min_id = int(ref.get("min_imported_id", ref.get("oldest_id", 0)) or 0)
-    return max_id, min_id
-
-
 async def import_for_channel(channel: dict, count: int = DEFAULT_TAKE) -> dict:
     """
     Добирает `count` постов для всех референсов одного канала (relay-режим).
-    Стратегия на каждого донора: сначала новые, если их мало — добираем старые.
+
+    Дедуп — по РЕАЛЬНОМУ наличию: сканируем донора от свежих к старым и берём
+    только то, чего у нас ещё нет (buffer.source_exists). Опубликованные и
+    лежащие в очереди — пропускаем; удалённые/очищенные — снова доступны
+    (их строк в БД нет, значит можно взять заново). Никаких меток-окон.
 
     Возвращает статистику: added / skipped_dups / skipped_limits / refs.
     """
@@ -130,63 +127,53 @@ async def import_for_channel(channel: dict, count: int = DEFAULT_TAKE) -> dict:
     added_total = 0
     skipped_dups = 0
     skipped_limits = 0
-    changed = False
 
     for ref in refs:
         handle = normalize_handle(ref.get("handle", ""))
         if not handle:
             continue
-        max_id, min_id = _watermarks(ref)
         do_rephrase = ref.get("rephrase", True)
         skip_ads = ref.get("skip_ads", True)
 
-        # --- Фаза 1: новые (id > max_id). Первый импорт (max_id=0) тоже сюда. ---
+        # Берём пул свежих кандидатов с запасом — из него отфильтруем уже взятые
+        pool = max(count * 10, 60)
         try:
-            new_data = await read_candidates(handle, after_id=max_id, limit=count)
+            data = await read_candidates(handle, limit=pool)
         except Exception as e:
-            logger.warning(f"Референс {handle} [{channel_id}] чтение новых: {e}")
-            await _notify_admin(f"❌ <b>Импорт референса</b> {handle} → {channel_id}\nЧтение новых: <code>{e}</code>")
+            logger.warning(f"Референс {handle} [{channel_id}] чтение: {e}")
+            await _notify_admin(f"❌ <b>Импорт референса</b> {handle} → {channel_id}\n<code>{e}</code>")
             continue
+        skipped_limits += len(data.get("skipped", []))
 
-        candidates = list(new_data["posts"])
-        skipped_limits += len(new_data.get("skipped", []))
-        scan_max = new_data["max_id"]
-        scan_min = new_data["min_id"]
-
-        # --- Фаза 2: если новых мало — добираем старые (id < min_id) ---
-        if len(candidates) < count and min_id > 0:
-            need = count - len(candidates)
-            try:
-                old_data = await read_candidates(handle, before_id=min_id, limit=need)
-                candidates += old_data["posts"]
-                skipped_limits += len(old_data.get("skipped", []))
-                scan_min = min(scan_min, old_data["min_id"]) if scan_min else old_data["min_id"]
-            except Exception as e:
-                logger.warning(f"Референс {handle} [{channel_id}] чтение архива: {e}")
-                await _notify_admin(f"❌ <b>Импорт референса</b> {handle} → {channel_id}\nЧтение архива: <code>{e}</code>")
-
-        # --- Обрабатываем кандидатов: дедуп, реклама, создаём записи ---
-        media_to_forward = []   # msg_id, которые нужно переслать боту (медиа)
+        media_to_forward = []   # msg_id для пересылки боту (медиа)
         added_ref = 0
-        for p in candidates:
+        # posts идут старые→новые; берём от СВЕЖИХ (reversed)
+        for p in reversed(data["posts"]):
+            if added_ref >= count:
+                break
             topic = ref_topic(handle, p["id"])
 
+            # уже есть у нас (в очереди/опубликовано) — пропускаем; удалённого нет в БД
             if buffer.source_exists(channel_id, topic):
                 skipped_dups += 1
                 continue
 
-            text = p["text"]
-            if skip_ads and text and _is_ad(text):
+            raw = p.get("text", "")
+            if skip_ads and raw and _is_ad(raw):
                 logger.debug(f"Референс {handle}: пропуск рекламы (id={p['id']})")
                 continue
 
-            content = text
-            if do_rephrase and text:
+            # «Как есть» — HTML (со ссылками); перефраз — простой текст без формата
+            if do_rephrase and raw:
                 try:
-                    content = await rephrase_text(text, channel)
+                    content = await rephrase_text(raw, channel)
                 except Exception as e:
                     logger.warning(f"Перефраз {handle}/{p['id']} не удался: {e} — беру оригинал")
-                    content = text
+                    content = raw
+                parse_mode = None
+            else:
+                content = p.get("text_html") or raw
+                parse_mode = "HTML"
 
             # Вырезаем предложения со словами-фильтрами (напр. промо «MAX»)
             content = _strip_filtered_sentences(content)
@@ -196,43 +183,32 @@ async def import_for_channel(channel: dict, count: int = DEFAULT_TAKE) -> dict:
                 continue  # пустой пост без медиа
 
             if kind == "album":
-                # Альбом: ОДНА запись, ждёт file_id всех кадров. Публикуется
-                # как media_group. members хранит порядок и типы кадров.
-                members = p.get("members", [])
-                member_ids = [m["id"] for m in members]
+                member_ids = [m["id"] for m in p.get("members", [])]
                 buffer.add({
-                    "channel_id": channel_id,
-                    "content": content or "",
-                    "format": "reference",
-                    "topic": topic,
-                    "media_type": "album",
-                    "status": "awaiting_media",
+                    "channel_id": channel_id, "content": content or "",
+                    "format": "reference", "topic": topic,
+                    "media_type": "album", "status": "awaiting_media",
+                    "parse_mode": parse_mode,
                     "tg_file_id": json.dumps({"members": member_ids, "items": {}}),
                 })
-                media_to_forward.extend(member_ids)  # пересылаем все кадры
+                media_to_forward.extend(member_ids)
             elif kind:
-                # Одиночное медиа: запись ждёт file_id → бот привяжет и переведёт в ready
                 buffer.add({
-                    "channel_id": channel_id,
-                    "content": content or "",
-                    "format": "reference",
-                    "topic": topic,
-                    "media_type": kind,
-                    "status": "awaiting_media",
+                    "channel_id": channel_id, "content": content or "",
+                    "format": "reference", "topic": topic,
+                    "media_type": kind, "status": "awaiting_media",
+                    "parse_mode": parse_mode,
                 })
                 media_to_forward.append(p["id"])
             else:
-                # Только текст: сразу готов к публикации
                 buffer.add({
-                    "channel_id": channel_id,
-                    "content": content,
-                    "format": "reference",
-                    "topic": topic,
-                    "status": "ready",
+                    "channel_id": channel_id, "content": content,
+                    "format": "reference", "topic": topic,
+                    "status": "ready", "parse_mode": parse_mode,
                 })
             added_ref += 1
 
-        # --- Пересылаем медиа боту (записи awaiting_media уже созданы → нет гонки) ---
+        # Пересылаем медиа боту (записи awaiting_media уже созданы → нет гонки)
         if media_to_forward:
             try:
                 await forward_to_bot(handle, media_to_forward)
@@ -243,21 +219,9 @@ async def import_for_channel(channel: dict, count: int = DEFAULT_TAKE) -> dict:
                     f"Текстовые посты импортированы, медиа-посты подвиснут как awaiting_media."
                 )
 
-        # --- Обновляем метки окна ---
-        if scan_max and scan_max > max_id:
-            ref["max_imported_id"] = scan_max
-            ref.pop("last_id", None)  # убираем легаси-имя
-            changed = True
-        if scan_min and (min_id == 0 or scan_min < min_id):
-            ref["min_imported_id"] = scan_min
-            ref.pop("oldest_id", None)
-            changed = True
-
         added_total += added_ref
         logger.info(f"Референс {handle} → {channel_id}: +{added_ref} (дубли {skipped_dups}, лимиты {skipped_limits})")
 
-    if changed:
-        _save_card(channel)
     return {
         "channel_id": channel_id, "added": added_total, "refs": len(refs),
         "skipped_dups": skipped_dups, "skipped_limits": skipped_limits,

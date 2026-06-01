@@ -169,14 +169,18 @@ class BufferManager:
 
     def source_exists(self, channel_id: str, topic: str) -> bool:
         """
-        Импортировали ли мы это исходное сообщение РАНЕЕ (в любом статусе)?
+        Есть ли у нас этот исходный пост СЕЙЧАС (в очереди или уже опубликован)?
 
-        Для референсов topic = 'reference @донор #<msg_id>' — однозначный ключ
-        исходного сообщения. Защита от дублей при листании архива/повторных сборах.
+        topic — однозначный ключ исходного сообщения (ref:донор:msg_id).
+        Считаем «взятым» только активные/опубликованные статусы. Статус 'skipped'
+        (удалён через /review) и удалённые строки (очистка буфера) НЕ блокируют —
+        такие посты можно взять заново (по факту они не публиковались).
         """
         with db.connect() as conn:
             row = conn.execute(
-                "SELECT 1 FROM posts WHERE channel_id = ? AND topic = ? LIMIT 1",
+                "SELECT 1 FROM posts WHERE channel_id = ? AND topic = ? "
+                "AND status IN ('ready', 'awaiting_media', 'pending_review', 'published') "
+                "LIMIT 1",
                 (channel_id, topic),
             ).fetchone()
         return row is not None

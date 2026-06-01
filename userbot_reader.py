@@ -45,6 +45,20 @@ def bot_user_id() -> int:
     return int(cfg.BOT_TOKEN.split(":")[0])
 
 
+def _msg_html(msg) -> str:
+    """
+    Текст сообщения как HTML — сохраняет ссылки/форматирование донора
+    (<a href>, <b> и т.п.), чтобы кликабельные ссылки не терялись при relay.
+    """
+    raw = (msg.message or "").strip()
+    try:
+        from telethon.extensions import html as _tg_html
+        out = _tg_html.unparse(msg.message or "", msg.entities or [])
+        return (out or "").strip()
+    except Exception:
+        return raw
+
+
 def _classify_and_check(msg, max_video_mb, max_video_sec, max_doc_mb):
     """
     Определяет тип медиа сообщения и проверяет лимиты для relay.
@@ -163,12 +177,14 @@ async def read_candidates(
             msgs = sorted(groups[key], key=lambda m: m.id)  # порядок альбома по возрастанию
             is_album = len(msgs) > 1 or getattr(msgs[0], "grouped_id", None)
 
-            # Подпись — из первого сообщения, где есть текст (обычно первый кадр)
-            text = ""
+            # Подпись — из первого сообщения, где есть текст (обычно первый кадр).
+            # text — сырой (для перефраза/фильтров), text_html — с ссылками (для «как есть»).
+            text, text_html = "", ""
             for m in msgs:
                 t = (m.message or "").strip()
                 if t:
                     text = t
+                    text_html = _msg_html(m)
                     break
 
             if is_album:
@@ -187,11 +203,12 @@ async def read_candidates(
                     continue  # весь альбом не прошёл лимиты
                 if len(members) == 1:
                     # остался один кадр — это обычное одиночное медиа, не альбом
-                    posts.append({"id": members[0]["id"], "text": text, "media_kind": members[0]["kind"]})
+                    posts.append({"id": members[0]["id"], "text": text, "text_html": text_html, "media_kind": members[0]["kind"]})
                 else:
                     posts.append({
                         "id": members[0]["id"],     # якорь = первый годный кадр
                         "text": text,
+                        "text_html": text_html,
                         "media_kind": "album",
                         "members": members,         # [{id, kind}, ...] по порядку
                     })
@@ -204,7 +221,7 @@ async def read_candidates(
                     continue
                 if not text and not kind:
                     continue
-                posts.append({"id": m.id, "text": text, "media_kind": kind})
+                posts.append({"id": m.id, "text": text, "text_html": text_html, "media_kind": kind})
 
         posts.reverse()  # от старых к новым
         if min_id is None:
