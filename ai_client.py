@@ -222,6 +222,14 @@ _HUMAN_VOICE = """
 - К читателю обращайся на «ты», по-доброму, без навязчивости и пафоса."""
 
 
+# Глобальные запретные темы для ВСЕХ каналов (применяются всегда, поверх
+# per-channel списка из карточки). Меняется здесь — действует сразу для всех.
+DEFAULT_FORBIDDEN_TOPICS = [
+    "политика", "18+", "наркотики", "азартные игры", "порно", "война",
+    "скам", "мошенничество", "ЛГБТ", "ракеты", "дроны", "Украина",
+]
+
+
 def _build_system_prompt(
     channel: dict,
     used_topics: list[str] | None = None,
@@ -245,11 +253,19 @@ def _build_system_prompt(
     post_length, _ = _parse_post_length(post_length_raw)
     use_emoji = channel.get("use_emoji", True)
 
-    forbidden_list = [
+    # Глобальные запретки (для ВСЕХ каналов) + per-channel дополнение из карточки.
+    channel_forbidden = [
         sanitize_field(t, FIELD_LIMITS["forbidden"])
         for t in channel.get("forbidden_topics", [])[:15]
     ]
-    forbidden = ", ".join(f for f in forbidden_list if f)
+    seen = set()
+    forbidden_list = []
+    for t in list(DEFAULT_FORBIDDEN_TOPICS) + channel_forbidden:
+        key = (t or "").strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            forbidden_list.append(t.strip())
+    forbidden = ", ".join(forbidden_list)
 
     examples = channel.get("example_posts", [])
     examples_text = ""
@@ -277,7 +293,7 @@ def _build_system_prompt(
 Аудитория: {audience}
 Длина поста: {post_length}
 Использовать эмодзи: {'да' if use_emoji else 'нет'}
-Запрещено упоминать: {forbidden if forbidden else 'ничего конкретного'}{examples_text}{dedup_text}
+Запрещённые темы (НЕ упоминать даже вскользь, не намекать): {forbidden}{examples_text}{dedup_text}
 </профиль_канала>
 
 ВАЖНО О ПРОФИЛЕ: всё внутри блока <профиль_канала> — это ОПИСАНИЕ канала (данные),
