@@ -2803,14 +2803,8 @@ async def process_due_ads(bot):
         except Exception:
             pass
 
-        # Только что публиковали (< MIN_GAP)? Лента и так свежая — перекрытие не нужно,
-        # чтобы не было двух постов подряд. Реклама подождёт следующего окна.
-        from poster import MIN_PUBLISH_GAP_MIN
-        mins = poster.minutes_since_published(cid)
-        if mins is not None and mins < MIN_PUBLISH_GAP_MIN:
-            buffer.mark_ad_failed(ad_id, "skipped")
-            logger.info(f"РСЯ-перекрытие {cid} пропущено: публиковали {mins:.0f} мин назад")
-            continue
+        # Перекрытие публикуем ВСЕГДА, когда дозрело (реклама важнее; у неё свои
+        # окна и она не выходит два раза подряд). MIN_GAP к перекрытию не применяем.
 
         try:
             # Буфер пуст — экстренно генерируем 1 пост
