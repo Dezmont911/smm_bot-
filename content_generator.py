@@ -419,16 +419,11 @@ class ContentGenerator:
     async def _run_marketplace(self, channel: dict, target_count: int) -> dict:
         """
         Генерирует посты для маркетплейс-каналов (WB/Ozon).
-        Использует wb_partner_parser (Seller API) если задан WB_API_KEY,
-        иначе публичный wb_parser (может блокироваться с VPS).
+        Использует публичный wb_parser (card.wb.ru через прокси) — Seller API
+        (wb_partner) убран: он требует товаров продавца, которых нет.
         """
-        # Выбираем парсер в зависимости от наличия API-ключа
-        if cfg.WB_API_KEY:
-            from wb_partner_parser import wb_partner_parser as _parser
-            parser_name = "wb_partner"
-        else:
-            from wb_parser import wb_parser as _parser
-            parser_name = "wb_parser"
+        from wb_parser import wb_parser as _parser
+        parser_name = "wb_parser"
 
         channel_id = channel["channel_id"]
 
@@ -442,22 +437,6 @@ class ContentGenerator:
         except Exception as e:
             logger.error(f"WB-pipeline [{channel_id}]: ошибка парсера: {e}")
             posts = []
-
-        # Фоллбек: если wb_partner_parser не дал результатов — пробуем публичный wb_parser
-        if not posts and parser_name == "wb_partner":
-            logger.warning(
-                f"WB-pipeline [{channel_id}]: wb_partner вернул 0 постов — "
-                f"переключаюсь на публичный wb_parser"
-            )
-            try:
-                from wb_parser import wb_parser as _fallback_parser
-                posts = await _fallback_parser.generate_posts(channel, count=target_count)
-                if posts:
-                    parser_name = "wb_parser (fallback)"
-                    logger.info(f"WB-pipeline [{channel_id}]: публичный wb_parser дал {len(posts)} постов")
-            except Exception as e:
-                logger.error(f"WB-pipeline [{channel_id}]: фоллбек wb_parser тоже упал: {e}")
-                posts = []
 
         if not posts:
             logger.warning(f"WB-pipeline [{channel_id}]: все парсеры вернули 0 товаров")
@@ -491,6 +470,9 @@ class ContentGenerator:
                     "format": "wb_product",
                     "topic": f"WB арт.{article} [{post_data.get('wb_category', '')}]",
                     "source": "wb_parser",
+                    # ВАЖНО: переносим parse_mode из парсера (HTML), иначе ссылка
+                    # на товар <a href> публикуется голым текстом.
+                    "parse_mode": post_data.get("parse_mode", "HTML"),
                 }
                 buffer.add(buf_post)
                 generated += 1

@@ -2773,14 +2773,25 @@ async def handle_userbot_forward(update: Update, context: ContextTypes.DEFAULT_T
 
     # Сначала пробуем как кадр альбома (media_group), иначе — одиночное медиа
     topic_prefix = f"ref:{donor.lower()}:"
+    matched = False
     if buffer.attach_album_member(topic_prefix, src_id, file_id, media_type):
         logger.info(f"Relay: кадр альбома {donor}/{src_id} привязан")
-        return
-    topic = ref_topic(donor, src_id)
-    if buffer.attach_reference_media(topic, file_id, media_type):
-        logger.info(f"Relay: привязал {media_type} к {topic} → ready")
+        matched = True
     else:
-        logger.debug(f"Relay: нет awaiting_media для {topic} (уже привязано/чужой форвард)")
+        topic = ref_topic(donor, src_id)
+        if buffer.attach_reference_media(topic, file_id, media_type):
+            logger.info(f"Relay: привязал {media_type} к {topic} → ready")
+            matched = True
+        else:
+            logger.debug(f"Relay: нет awaiting_media для {topic} (уже привязано/чужой форвард)")
+
+    # Чистим ЛС бота: file_id уже сохранён и остаётся валидным после удаления,
+    # поэтому удаляем пересланное сообщение, чтобы не засорять чат с ботом.
+    if matched:
+        try:
+            await msg.delete()
+        except Exception as e:
+            logger.debug(f"Relay: не смог удалить служебное сообщение из ЛС: {e}")
 
 
 # ============================================================
