@@ -302,6 +302,7 @@ async def cmd_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📋 Списком (много сразу)",         callback_data="addmethod:bulk")],
         [InlineKeyboardButton("✏️ Описать вручную",              callback_data="addmethod:manual")],
         [InlineKeyboardButton("📂 Загрузить экспорт Telegram",   callback_data="addmethod:export")],
+        [InlineKeyboardButton("◀️ В меню",                       callback_data="add_to_menu")],
     ])
     text = (
         "➕ <b>Добавление канала</b>\n\n"
@@ -722,9 +723,10 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _add_cancel_kb() -> InlineKeyboardMarkup:
-    """Кнопка отмены для каждого шага диалога добавления канала."""
+    """Кнопки отмены / выхода в меню для каждого шага диалога добавления канала."""
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("❌ Отменить", callback_data="add_cancel_inline"),
+        InlineKeyboardButton("❌ Отменить",  callback_data="add_cancel_inline"),
+        InlineKeyboardButton("◀️ В меню",    callback_data="add_to_menu"),
     ]])
 
 
@@ -751,6 +753,16 @@ async def cmd_add_cancel_inline(update: Update, context: ContextTypes.DEFAULT_TY
             InlineKeyboardButton("◀️ В меню", callback_data="ui:main"),
         ]]),
     )
+    return ConversationHandler.END
+
+
+async def cmd_add_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Закрывает диалог добавления канала и сразу открывает главное меню."""
+    from ui import screen_main
+    query = update.callback_query
+    await query.answer()
+    context.user_data.clear()
+    await screen_main(query, context)
     return ConversationHandler.END
 
 
@@ -3161,6 +3173,7 @@ def main():
         fallbacks=[
             CommandHandler("cancel", cmd_add_cancel),
             CallbackQueryHandler(cmd_add_cancel_inline, pattern="^add_cancel_inline$"),
+            CallbackQueryHandler(cmd_add_to_menu, pattern="^add_to_menu$"),
         ],
     )
     app.add_handler(add_channel_conv)
