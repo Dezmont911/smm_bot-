@@ -128,7 +128,21 @@ def format_post_message(post: dict, index: int = 0, total: int = 0) -> str:
     fmt = post.get("format", "?")
     topic = post.get("topic", "")[:60]
     content = post.get("content", "")
-    has_image = "🖼 Есть картинка" if post.get("image_url") else "📄 Без картинки"
+    mt = post.get("media_type")
+    if mt == "album":
+        has_image = "🖼 Альбом"
+    elif mt == "video":
+        has_image = "🎬 Видео"
+    elif mt == "animation":
+        has_image = "🎞 Гиф"
+    elif mt == "document":
+        has_image = "📎 Документ"
+    elif post.get("tg_file_id") or post.get("media_path"):
+        has_image = "🖼 Фото"
+    elif post.get("image_url"):
+        has_image = "🖼 Есть картинка"
+    else:
+        has_image = "📄 Без картинки"
     counter = f"Пост {index} из {total} · " if total > 0 else ""
 
     return (
@@ -1673,6 +1687,42 @@ async def handle_review_next_page(update: Update, context: ContextTypes.DEFAULT_
     await _send_review_page(query.message, channel_id, offset=offset)
 
 
+async def _send_review_post_media(message, post: dict, caption: str, keyboard) -> bool:
+    """
+    Показывает превью поста с медиа в ревью: по tg_file_id (черновик/relay) или URL.
+    Возвращает True, если медиа отправлено. Caption режем под лимит Telegram (1024).
+    """
+    cap = caption if len(caption) <= 1024 else caption[:1020] + "…"
+    mt = post.get("media_type")
+    fid = post.get("tg_file_id")
+    try:
+        if mt == "album" and fid:
+            data = json.loads(fid or "{}")
+            members, items = data.get("members", []), data.get("items", {})
+            first = items.get(str(members[0])) if members else None
+            if not first:
+                return False
+            send = message.reply_video if first.get("type") == "video" else message.reply_photo
+            await send(first["file_id"], caption=cap, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            return True
+        if fid:
+            if mt == "video":
+                await message.reply_video(fid, caption=cap, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            elif mt == "animation":
+                await message.reply_animation(fid, caption=cap, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            elif mt == "document":
+                await message.reply_document(fid, caption=cap, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            else:
+                await message.reply_photo(fid, caption=cap, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            return True
+        if post.get("image_url"):
+            await message.reply_photo(post["image_url"], caption=cap, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            return True
+    except Exception as e:
+        logger.debug(f"Review: превью медиа не удалось ({post.get('id','?')[:8]}): {e}")
+    return False
+
+
 async def _send_review_page(message, channel_id: str, offset: int):
     """
     Вспомогательная функция: показывает страницу постов канала.
@@ -1721,21 +1771,14 @@ async def _send_review_page(message, channel_id: str, offset: int):
         msg_text = format_post_message(post, index=i, total=total)
         keyboard = review_keyboard(post["id"])
 
+        # Медиа по file_id (черновики/relay) или по URL — показываем превью
+        if await _send_review_post_media(message, post, msg_text, keyboard):
+            continue
         if post.get("image_url"):
-            try:
-                await message.reply_photo(
-                    photo=post["image_url"],
-                    caption=msg_text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=keyboard,
-                )
-                continue
-            except Exception:
-                # Картинка по ссылке не открылась — честно сообщаем об этом
-                msg_text = msg_text.replace(
-                    "🖼 Есть картинка",
-                    "⚠️ Картинка недоступна (перегенерируется при публикации)",
-                )
+            msg_text = msg_text.replace(
+                "🖼 Есть картинка",
+                "⚠️ Картинка недоступна (перегенерируется при публикации)",
+            )
 
         await message.reply_text(
             msg_text,
