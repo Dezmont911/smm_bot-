@@ -449,6 +449,17 @@ class Poster:
         image_url = post.get("image_url")
         post_parse_mode = post.get("parse_mode", "Markdown")
 
+        # Предохранитель: запретный контент в готовом посте (война/Украина/дрон/ЛГБТ)
+        # не публикуем — помечаем skipped (ловит уже сгенерированные до фикса посты).
+        try:
+            from ai_client import _contains_forbidden
+            if _contains_forbidden(content):
+                buffer.mark_skipped(post["id"])
+                logger.warning(f"Пост [{channel_id}] с запретным контентом → skipped, не публикую")
+                return {"success": False, "used_image": False}
+        except Exception:
+            pass
+
         # Цель публикации: числовой chat_id (переживает смену @username и приватность),
         # иначе @handle. channel_id оставляем для логов/буфера.
         _card = self._load_channel_by_id(channel_id) or {}

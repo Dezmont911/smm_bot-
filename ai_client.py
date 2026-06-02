@@ -110,6 +110,15 @@ _REFUSAL_MARKERS = (
     "развивать в этом направлении",
     "которые мы не освещаем",
     "не освещаем",
+    "не могу писать",
+    "не могу про эту",
+    "слушай, я не могу",
+    "я не могу писать про",
+    "выходит за границы",
+    "за границы познавательн",
+    "или другой вариант",
+    "предложу альтернативу",
+    "подойдёт под профиль",
     "i cannot write",
     "i can't write",
     "i'm unable to",
@@ -123,14 +132,67 @@ class PostGenerationError(RuntimeError):
     """Claude вернул не пост, а отказ/мета-ответ — публиковать такое нельзя."""
 
 
+# Ведущая мета-преамбула, которую можно просто СРЕЗАТЬ, оставив сам пост.
+_META_PREFIX_RE = re.compile(
+    r"^\s*(вот\s+(пост|вариант|текст|что\s+получилось)\b[^\n:]*[:\-—]*\s*|"
+    r"конечно[!.,]*\s*(вот)?[^\n:]*[:\-—]*\s*|"
+    r"готово[!.,:]*\s*|"
+    r"держи[!.,:]*\s*(пост|вариант)?[:\-—]*\s*)",
+    re.IGNORECASE,
+)
+
+
+def _clean_post_output(content: str) -> str:
+    """Срезает безобидную ведущую преамбулу («Вот пост:», «Конечно!») и обрамляющие
+    разделители, чтобы спасти нормальный пост, если модель добавила вступление."""
+    if not content:
+        return content
+    t = content.strip()
+    for _ in range(2):  # до двух вступлений подряд
+        new = _META_PREFIX_RE.sub("", t, count=1).strip()
+        if new == t:
+            break
+        t = new
+    # обрамляющие --- в самом начале
+    while t.startswith("---"):
+        t = t.lstrip("-").strip()
+    return t
+
+
 def _looks_like_refusal(content: str) -> bool:
     """
-    True, если текст похож на служебный мета-ответ Claude, а не на готовый пост.
-    Маркеры ищем только в начале текста (первые ~400 символов) — чтобы не
-    зарубить нормальный пост, где такие слова встретились в середине по делу.
+    True, если текст — служебный мета-ответ/отказ, а не готовый пост.
+    Маркеры по началу (первые 500) + структурный признак (разделители --- вместе
+    с предложением альтернатив / вопросом пользователю / счётчиком слов).
     """
-    head = content[:400].lower()
-    return any(marker in head for marker in _REFUSAL_MARKERS)
+    if not content:
+        return True
+    head = content[:500].lower()
+    if any(marker in head for marker in _REFUSAL_MARKERS):
+        return True
+    full = content.lower()
+    if "---" in full and any(s in full for s in (
+        "или другой вариант", "предлож", "альтернатив", "подходит для канала",
+        "слово-count", "word count", "вместо этого", "если нужна другая",
+        "подойдёт под профиль", "вариант для канала",
+    )):
+        return True
+    return False
+
+
+# Стемы запретного контента для проверки ГОТОВОГО поста (ловит дрейф в тело поста,
+# даже если тема словами не пахла). Подстрочное совпадение, регистронезависимо.
+_CONTENT_FORBIDDEN_STEMS = (
+    "война", "войн", "украин", "зеленск", "путин", "дрон", "ракет", "обстрел",
+    "лгбт", "трансген", "гомосек", "наркотик", "порно", "казино", "ставк на спорт",
+    "мошенн", "теракт", "оружие массов",
+)
+
+
+def _contains_forbidden(content: str) -> bool:
+    """True, если в готовом посте есть запретный контент (война/Украина/дрон/ЛГБТ и т.п.)."""
+    low = (content or "").lower()
+    return any(stem in low for stem in _CONTENT_FORBIDDEN_STEMS)
 
 
 _SENTENCE_LEN = {
@@ -377,7 +439,12 @@ def _build_user_prompt(format_name: str, topic: str, hook: str | None = None) ->
 
 Тема/инфоповод: {topic}
 
-Напиши пост."""
+Напиши пост.
+
+ВАЖНО: ответ — ТОЛЬКО готовый текст поста. Без вступлений («Вот пост:», «Конечно!»),
+без объяснений, размышлений, альтернатив и вопросов мне. Если тема не подходит или
+запретная — НЕ объясняй, просто напиши хороший пост по смежному разрешённому аспекту
+темы канала. Начинай сразу с текста поста."""
 
 
 async def generate_post(
@@ -415,7 +482,9 @@ async def generate_post(
         format_name = pick_format(strategy)
 
     style = strategy.get("style")
-    temperature = strategy.get("temperature")
+    # Кап температуры: выше ~0.9 модель «фантазирует» и чаще выпадает из роли
+    # (мета-ответы). Держим в разумных рамках без потери живости.
+    temperature = min(strategy.get("temperature") or 0.9, 0.9)
 
     system_prompt = _build_system_prompt(channel, used_topics=used_topics, style=style)
     user_prompt = _build_user_prompt(format_name, topic, hook=hook)
@@ -442,11 +511,22 @@ async def generate_post(
             f"Claude вернул пустой ответ для канала {channel['channel_id']}"
         )
 
+    # Срезаем безобидную преамбулу («Вот пост:», «Конечно!») — спасаем нормальный пост
+    content = _clean_post_output(content)
+
     # Защита: Claude иногда возвращает отказ/мета-ответ вместо поста
     # ("Я не могу написать пост... выберите одну из тем..."). Не публикуем такое.
     if _looks_like_refusal(content):
         raise PostGenerationError(
             f"Claude вернул мета-ответ вместо поста "
+            f"(канал {channel['channel_id']}, тема: {topic[:60]})"
+        )
+
+    # Защита: запретный контент мог просочиться в тело поста (война/Украина/дрон/ЛГБТ),
+    # даже если тема словами не пахла. Такое не публикуем.
+    if _contains_forbidden(content):
+        raise PostGenerationError(
+            f"Пост содержит запретный контент — отклонён "
             f"(канал {channel['channel_id']}, тема: {topic[:60]})"
         )
 
