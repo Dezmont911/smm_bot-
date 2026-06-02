@@ -107,15 +107,23 @@ async def fetch_image_url(
     # Якорим запрос к теме канала коротким ключом, чтобы картинка не «уплывала»
     # (например тема CS2 → не случайный геймпад). Берём первый image_keyword
     # или первое слово темы канала.
+    # Годный якорь = КОРОТКИЙ ЛАТИНСКИЙ ключ (Pexels — англоязычный поиск).
+    # Длинная или кириллическая фраза («интересные факты со всего мира») якорем
+    # только уводит выдачу в мусор — такую отбрасываем (баг с нерелевантными
+    # картинками на @tftFunTime). Сам контекст темы уже учтён в _build_english_query.
+    def _good_anchor(s: str) -> str:
+        s = (s or "").strip()
+        if not s or len(s.split()) > 3:
+            return ""
+        if re.search(r"[а-яёА-ЯЁ]", s):  # кириллица якорем портит англоязычный запрос
+            return ""
+        return s[:30]
+
     anchor = ""
     if image_keywords:
-        anchor = image_keywords[0].strip()
-    elif channel_topic:
-        first = channel_topic.split(",")[0].strip()
-        # Якорь — только если это короткий ключ, а не описание-предложение
-        # («Практические советы и лайфхаки…» якорем только портит запрос)
-        if len(first.split()) <= 3:
-            anchor = first[:30]
+        anchor = _good_anchor(image_keywords[0])
+    if not anchor and channel_topic:
+        anchor = _good_anchor(channel_topic.split(",")[0])
     if anchor and anchor.lower() not in query.lower():
         query = f"{anchor} {query}"
 
