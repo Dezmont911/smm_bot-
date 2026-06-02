@@ -2341,13 +2341,15 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "ch_review" and len(parts) >= 3:
         handle = parts[2]
-        # Делегируем в существующий _send_review_page из bot.py
         context.user_data["review_channel"] = handle
-        # Импортируем функцию из bot.py
-        from bot import _send_review_page
+        # Фокус-режим: показываем ОДИН пост (карточку 1/N) вместо вываливания списка.
+        from bot import _send_post_card
         await query.answer()
-        await query.edit_message_reply_markup(reply_markup=None)
-        await _send_review_page(query.message, handle, offset=0)
+        try:
+            await query.message.delete()
+        except Exception:
+            await query.edit_message_reply_markup(reply_markup=None)
+        await _send_post_card(query.message, handle, 0, context)
 
     elif action == "ch_schedule" and len(parts) >= 3:
         handle = parts[2]

@@ -1827,6 +1827,150 @@ async def _send_review_page(message, channel_id: str, offset: int):
         )
 
 
+# ============================================================
+# Карточка одного поста (фокус-режим ревью)
+# ============================================================
+
+def _ready_posts(channel_id: str) -> list[dict]:
+    """Готовые к публикации посты канала в порядке очереди."""
+    with db.connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM posts WHERE channel_id = ? AND status = 'ready' "
+            "ORDER BY generated_at ASC",
+            (channel_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def post_card_keyboard(post_id: str, channel_id: str, index: int, total: int) -> InlineKeyboardMarkup:
+    """Клавиатура фокус-карточки поста: действия + навигация ◀▶ + вся очередь/назад."""
+    nav = []
+    if index > 0:
+        nav.append(InlineKeyboardButton(f"◀ {index}", callback_data=f"pcard:{channel_id}:{index - 1}"))
+    nav.append(InlineKeyboardButton(f"{index + 1}/{total}", callback_data="pcard:noop:0"))
+    if index < total - 1:
+        nav.append(InlineKeyboardButton(f"{index + 2} ▶", callback_data=f"pcard:{channel_id}:{index + 1}"))
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Текст",   callback_data=f"edit:{post_id}"),
+            InlineKeyboardButton("🖼 Картинка", callback_data=f"image:{post_id}"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Перегенерировать", callback_data=f"regen:{post_id}"),
+            InlineKeyboardButton("🗑 Удалить",           callback_data=f"delete:{post_id}"),
+        ],
+        [InlineKeyboardButton("📨 Опубликовать сейчас", callback_data=f"postnow:{post_id}")],
+        nav,
+        [
+            InlineKeyboardButton("📋 Вся очередь", callback_data=f"review_all:{channel_id}"),
+            InlineKeyboardButton("◀️ К каналу",    callback_data=f"ui:ch:{channel_id}"),
+        ],
+    ])
+
+
+async def _send_post_card(message, channel_id: str, index: int, context=None):
+    """Показывает ОДИН пост очереди (фокус-режим). Позицию пишем в user_data —
+    чтобы действия (удалить/опубликовать/перегенерить) перерисовали ту же точку."""
+    posts = _ready_posts(channel_id)
+    total = len(posts)
+    if total == 0:
+        if context is not None:
+            context.user_data.pop("review_card", None)
+        await message.reply_text(
+            f"📭 Очередь <b>{channel_id}</b> пуста.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚡ Сгенерировать посты", callback_data=f"ui:ch_generate:{channel_id}")],
+                [InlineKeyboardButton("◀️ К каналу",           callback_data=f"ui:ch:{channel_id}")],
+            ]),
+        )
+        return
+
+    index = max(0, min(index, total - 1))
+    post = posts[index]
+    if context is not None:
+        context.user_data["review_card"] = {"channel": channel_id, "index": index}
+
+    caption = format_post_message(post, index + 1, total)
+    kb = post_card_keyboard(post["id"], channel_id, index, total)
+
+    if await _send_review_post_media(message, post, caption, kb):
+        return
+    if post.get("image_url"):
+        caption = caption.replace(
+            "🖼 Есть картинка",
+            "⚠️ Картинка недоступна (перегенерируется при публикации)",
+        )
+    await message.reply_text(caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def _open_post_card_by_id(message, post_id: str, context=None):
+    """Открывает фокус-карточку КОНКРЕТНОГО поста (по id) — после редактирования."""
+    channel_id = buffer.get_post_channel(post_id)
+    rc = (context.user_data.get("review_card") if context is not None else None) or {}
+    if not channel_id:
+        channel_id = rc.get("channel")
+    if not channel_id:
+        await message.reply_text("Пост не найден.")
+        return
+    posts = _ready_posts(channel_id)
+    index = next((i for i, p in enumerate(posts) if p["id"] == post_id), None)
+    if index is None:  # пост уже ушёл (опубликован/удалён) — держим прежнюю позицию
+        index = rc.get("index", 0)
+    await _send_post_card(message, channel_id, index, context)
+
+
+async def _delete_card_message(query):
+    """Убирает текущую карточку (удаляет сообщение, иначе хотя бы снимает кнопки)."""
+    try:
+        await query.message.delete()
+    except Exception:
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+
+async def handle_post_card_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Навигация ◀▶ по карточкам очереди. callback: pcard:{channel}:{index} | pcard:noop:0."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+    parts = query.data.split(":")
+    if len(parts) >= 2 and parts[1] == "noop":
+        return  # счётчик-кнопка
+    channel_id = parts[1]
+    try:
+        index = int(parts[2])
+    except (IndexError, ValueError):
+        index = 0
+    await _delete_card_message(query)
+    await _send_post_card(query.message, channel_id, index, context)
+
+
+async def handle_post_card_by_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Открыть карточку конкретного поста (после правки/картинки). callback: pcard_id:{post_id}."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+    post_id = query.data.split(":", 1)[1]
+    await _delete_card_message(query)
+    await _open_post_card_by_id(query.message, post_id, context)
+
+
+async def handle_review_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать всю очередь списком (обзор). callback: review_all:{channel}."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+    channel_id = query.data.split(":", 1)[1]
+    await _delete_card_message(query)
+    await _send_review_page(query.message, channel_id, 0)
+
+
 async def handle_gen_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопки '⚡ Генерировать @channel' из /status."""
     query = update.callback_query
@@ -2380,7 +2524,7 @@ async def handle_img_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "✅ <b>Новая картинка подобрана!</b>",
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("◀️ К очереди постов", callback_data=f"ui:ch_review:{channel_id}")
+                        InlineKeyboardButton("🔁 Показать пост", callback_data=f"pcard_id:{post_id}")
                     ]]),
                 )
             else:
@@ -2447,13 +2591,10 @@ async def handle_img_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     conn.commit()
                 await query.edit_message_text(
-                    "✅ <b>Картинка сгенерирована!</b>\n\nОткрой пост чтобы увидеть результат.",
+                    "✅ <b>Картинка сгенерирована!</b>",
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton(
-                            "📋 К очереди постов",
-                            callback_data=f"ui:ch_review:{row['channel_id']}"
-                        )
+                        InlineKeyboardButton("🔁 Показать пост", callback_data=f"pcard_id:{post_id}")
                     ]]),
                 )
             else:
@@ -2474,10 +2615,10 @@ async def handle_img_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     elif action in ("cancel", "back"):
-        # Убираем состояние ожидания фото
+        # Убираем состояние ожидания фото и возвращаем фокус-карточку поста
         context.user_data.pop("awaiting_image_for", None)
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.delete()
+        await _delete_card_message(query)
+        await _open_post_card_by_id(query.message, post_id, context)
 
 
 async def handle_post_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2493,38 +2634,34 @@ async def handle_post_actions(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     action, post_id = query.data.split(":", 1)
 
+    # Текущая позиция в фокус-карточке (для перерисовки «той же точки» очереди)
+    card_idx = (context.user_data.get("review_card") or {}).get("index", 0)
+
     if action == "delete":
+        channel_id = buffer.get_post_channel(post_id)
         buffer.mark_skipped(post_id)
         logger.info(f"Пост удалён из очереди: {post_id[:8]}")
-        # Удаляем само сообщение с постом — не висит в ленте
-        try:
-            await query.message.delete()
-        except Exception:
-            # Если удалить не удалось — хотя бы убираем кнопки
-            await query.edit_message_reply_markup(reply_markup=None)
+        await _delete_card_message(query)
+        # Перерисовываем карточку на той же позиции — «подъезжает» следующий пост
+        if channel_id:
+            await _send_post_card(query.message, channel_id, card_idx, context)
 
     elif action == "regen":
-        # Удаляем старый пост и запускаем генерацию нового
-        with db.connect() as conn:
-            row = conn.execute(
-                "SELECT channel_id FROM posts WHERE id = ?", (post_id,)
-            ).fetchone()
-        if row:
+        channel_id = buffer.get_post_channel(post_id)
+        if channel_id:
             buffer.mark_skipped(post_id)
-            channel_id = row["channel_id"]
-            await query.edit_message_reply_markup(
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔄 Отправлен на перегенерацию", callback_data="done")
-                ]])
-            )
+            await _delete_card_message(query)
             asyncio.create_task(
                 _regen_one_post(context.bot, cfg.ADMIN_CHAT_ID, channel_id)
             )
             logger.info(f"Пост отправлен на перегенерацию: {post_id[:8]}")
+            # Старый ушёл — показываем следующий в очереди (новый придёт в конец)
+            await _send_post_card(query.message, channel_id, card_idx, context)
 
     elif action == "image":
         context.user_data["awaiting_image_for"] = post_id
         context.user_data.pop("editing_post_id", None)
+        await _delete_card_message(query)  # убираем карточку — меню картинки на её месте
 
         # Получаем тему поста для автоподбора
         with db.connect() as conn:
@@ -2557,6 +2694,7 @@ async def handle_post_actions(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         context.user_data["editing_post_id"] = post_id
         context.user_data.pop("awaiting_image_for", None)
+        await _delete_card_message(query)  # убираем карточку — форма правки на её месте
         import html as _html
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🤖 ИИ перепишет текст", callback_data=f"etxt:regen:{post_id}")],
@@ -2608,12 +2746,12 @@ async def handle_post_actions(update: Update, context: ContextTypes.DEFAULT_TYPE
                 InlineKeyboardButton(label, callback_data="done")
             ]]))
             logger.info(f"Пост опубликован вручную из /review: {post_id[:8]}")
-            # Удаляем карточку поста из чата через 3 секунды
-            await asyncio.sleep(3)
-            try:
-                await query.message.delete()
-            except Exception:
-                pass  # Если не удалось удалить — не страшно
+            channel_id = post_data.get("channel_id")
+            # Убираем карточку и показываем следующий пост на той же позиции
+            await asyncio.sleep(1)
+            await _delete_card_message(query)
+            if channel_id:
+                await _send_post_card(query.message, channel_id, card_idx, context)
         else:
             await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("❌ Ошибка публикации", callback_data="done")
@@ -2648,21 +2786,10 @@ async def handle_edited_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     logger.info(f"Текст поста обновлён админом: {post_id[:8]}")
 
-    import html as _html
-    channel_id = buffer.get_post_channel(post_id)
-    preview = _html.escape(new_text[:120]) + ("…" if len(new_text) > 120 else "")
-    kb_rows = []
-    if channel_id:
-        kb_rows.append([InlineKeyboardButton("📋 К очереди постов", callback_data=f"ui:ch_review:{channel_id}")])
-        kb_rows.append([InlineKeyboardButton("🏠 Меню канала", callback_data=f"ui:ch:{channel_id}")])
-    await update.message.reply_text(
-        f"✅ Текст обновлён! Пост остаётся в очереди.\n\n"
-        f"<i>{preview}</i>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(kb_rows) if kb_rows else None,
-    )
-
     context.user_data.pop("editing_post_id", None)
+    await update.message.reply_text("✅ Текст обновлён.")
+    # Показываем обновлённый КОНКРЕТНЫЙ пост (фокус-карточка)
+    await _open_post_card_by_id(update.message, post_id, context)
     return ConversationHandler.END
 
 
@@ -2673,16 +2800,9 @@ async def cancel_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(query.from_user.id):
         return ConversationHandler.END
     post_id = context.user_data.pop("editing_post_id", None)
-    channel_id = buffer.get_post_channel(post_id) if post_id else None
-    kb = None
-    if channel_id:
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("📋 К очереди постов", callback_data=f"ui:ch_review:{channel_id}")
-        ]])
-    try:
-        await query.edit_message_text("◀️ Отменено. Текст поста не изменён.", reply_markup=kb)
-    except Exception:
-        pass
+    await _delete_card_message(query)
+    if post_id:
+        await _open_post_card_by_id(query.message, post_id, context)
     return ConversationHandler.END
 
 
@@ -2761,17 +2881,13 @@ async def regen_post_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.execute("UPDATE posts SET content = ? WHERE id = ?", (new_text, post_id))
     logger.info(f"Текст поста перегенерирован ИИ: {post_id[:8]}")
 
-    import html as _html
-    preview = _html.escape(new_text[:400]) + ("…" if len(new_text) > 400 else "")
     context.user_data.pop("editing_post_id", None)
-    await query.edit_message_text(
-        f"✅ <b>Текст переписан ИИ</b> (картинка сохранена):\n\n<i>{preview}</i>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 К очереди постов", callback_data=f"ui:ch_review:{channel_id}")],
-            [InlineKeyboardButton("🤖 Ещё раз переписать", callback_data=f"edit:{post_id}")],
-        ]),
-    )
+    try:
+        await query.edit_message_text("✅ Текст переписан ИИ (картинка сохранена).")
+    except Exception:
+        pass
+    # Показываем обновлённый КОНКРЕТНЫЙ пост
+    await _open_post_card_by_id(query.message, post_id, context)
     return ConversationHandler.END
 
 
@@ -2870,10 +2986,10 @@ async def handle_image_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (image_ref, post_id),
         )
     logger.info(f"Картинка привязана к посту {post_id[:8]}")
-    await update.message.reply_text(
-        "✅ Картинка добавлена! Пост опубликуется с ней по расписанию."
-    )
     context.user_data.pop("awaiting_image_for", None)
+    await update.message.reply_text("✅ Картинка добавлена.")
+    # Показываем обновлённый пост (фокус-карточка)
+    await _open_post_card_by_id(update.message, post_id, context)
 
 
 async def handle_photo_for_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3488,6 +3604,11 @@ def main():
     # --- Кнопки: /review — выбор канала и пагинация ---
     app.add_handler(CallbackQueryHandler(handle_review_channel_select, pattern="^review_ch:"))
     app.add_handler(CallbackQueryHandler(handle_review_next_page, pattern="^review_page:"))
+
+    # --- Кнопки: фокус-карточка одного поста (навигация / показать пост / вся очередь) ---
+    app.add_handler(CallbackQueryHandler(handle_post_card_nav, pattern="^pcard:"))
+    app.add_handler(CallbackQueryHandler(handle_post_card_by_id, pattern="^pcard_id:"))
+    app.add_handler(CallbackQueryHandler(handle_review_all, pattern="^review_all:"))
 
     # --- Кнопки: редактирование постов ---
     app.add_handler(CallbackQueryHandler(handle_post_actions, pattern="^(delete|image|regen|done|postnow):"))
