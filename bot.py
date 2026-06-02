@@ -2642,11 +2642,18 @@ async def handle_edited_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     logger.info(f"Текст поста обновлён админом: {post_id[:8]}")
 
-    preview = new_text[:120] + ("..." if len(new_text) > 120 else "")
+    import html as _html
+    channel_id = buffer.get_post_channel(post_id)
+    preview = _html.escape(new_text[:120]) + ("…" if len(new_text) > 120 else "")
+    kb_rows = []
+    if channel_id:
+        kb_rows.append([InlineKeyboardButton("📋 К очереди постов", callback_data=f"ui:ch_review:{channel_id}")])
+        kb_rows.append([InlineKeyboardButton("🏠 Меню канала", callback_data=f"ui:ch:{channel_id}")])
     await update.message.reply_text(
         f"✅ Текст обновлён! Пост остаётся в очереди.\n\n"
         f"<i>{preview}</i>",
         parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(kb_rows) if kb_rows else None,
     )
 
     context.user_data.pop("editing_post_id", None)
