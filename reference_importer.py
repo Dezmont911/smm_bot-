@@ -68,6 +68,30 @@ def _strip_filtered_sentences(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", result).strip()
 
 
+_LINK_RE = re.compile(r'<a\s+href="([^"]+)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+
+
+def _extract_links(text_html: str) -> list[tuple[str, str]]:
+    """
+    Достаёт гиперссылки (url, видимый_текст) из HTML-текста донора. Только http(s),
+    дедуп по url, без t.me-упоминаний самого донора (служебные ссылки). Нужно, чтобы
+    при перефразе (он отдаёт plain-текст) не терять партнёрские/товарные ссылки.
+    """
+    if not text_html:
+        return []
+    out, seen = [], set()
+    for url, label in _LINK_RE.findall(text_html):
+        url = url.strip()
+        if not url.lower().startswith(("http://", "https://")):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        label = re.sub(r"<[^>]+>", "", label or "").strip()
+        out.append((url, label))
+    return out
+
+
 def ref_topic(handle: str, msg_id: int) -> str:
     """
     Единый ключ исходного сообщения донора. Используется и при создании записи,
@@ -129,6 +153,18 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
             logger.warning(f"Перефраз {handle}/{p['id']} не удался: {e} — беру оригинал")
             content = raw
         parse_mode = None
+        # Перефраз отдаёт plain-текст и теряет гиперссылки (<a href>). Если в оригинале
+        # были ссылки (например партнёрская/на товар) — сохраняем их: экранируем
+        # перефраз под HTML и переклеиваем ссылки CTA-строкой в конце (баг #13).
+        links = _extract_links(p.get("text_html") or "")
+        if links:
+            import html as _html
+            body = _html.escape(content or "")
+            cta = "\n".join(
+                f'<a href="{url}">{(label or url).strip()}</a>' for url, label in links
+            )
+            content = (body + ("\n\n" if body else "") + cta).strip()
+            parse_mode = "HTML"
     else:
         content = p.get("text_html") or raw
         parse_mode = "HTML"
