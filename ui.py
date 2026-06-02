@@ -1261,8 +1261,7 @@ async def screen_drafts(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
 
     # Массовые действия снизу
     foot = []
-    if len(drafts) > 1:
-        foot.append([InlineKeyboardButton(f"📤 Все в очередь ({len(drafts)})", callback_data=f"ui:draft_qall:{handle}")])
+    foot.append([InlineKeyboardButton(f"📤 Все в очередь ({len(drafts)})", callback_data=f"ui:draft_qall:{handle}")])
     foot.append([InlineKeyboardButton("➕ Создать пост", callback_data=f"ui:draft_new:{handle}")])
     foot.append([InlineKeyboardButton("🗑 Очистить все черновики", callback_data=f"ui:draft_clear:{handle}")])
     foot.append([InlineKeyboardButton("↩️ Назад к каналу", callback_data=f"ui:ch:{handle}")])
@@ -2156,6 +2155,13 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "noop":
         await query.answer()
         return
+
+    # Любой клик по кнопке = навигация → сбрасываем «залипшие» режимы ожидания текста
+    # (правка черновика/настроек/поиск). Нужный режим экран-обработчик ниже поставит
+    # заново (он выполняется ПОСЛЕ этой очистки). Иначе старый режим перехватывал
+    # чужой ввод (длина поста, добавление референса) — баги #7/#10/#11.
+    for _k in ("draft_compose", "draft_edit", "draft_media", "channel_search", "editing"):
+        context.user_data.pop(_k, None)
 
     if action == "main":
         await screen_main(query, context)
