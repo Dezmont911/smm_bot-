@@ -72,6 +72,11 @@ class WBParser:
     """
 
     CARD_API = "https://card.wb.ru/cards/v4/detail"
+    # Динамический поиск товаров по ключевому слову. ВАЖНО: с нового VPS (Contabo)
+    # этот эндпоинт работает НАПРЯМУЮ (без прокси), а через наши прокси отдаёт 429
+    # (их IP зафлажены WB). Поэтому search ходит direct, а карточки — card.wb.ru.
+    SEARCH_API = "https://search.wb.ru/exactmatch/ru/common/{ver}/search"
+    SEARCH_VERSIONS = ("v5", "v4")  # классическая структура {"products":[...]}
     HEADERS = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json",
@@ -133,20 +138,132 @@ class WBParser:
         random.shuffle(pool)
         return pool[:min(count * 5, len(pool))]
 
+    async def search_articles(self, keyword: str, pages: int = 1) -> list[int]:
+        """
+        Динамический поиск артикулов по ключевому слову через search.wb.ru.
+        Ходит НАПРЯМУЮ (без прокси) — с нового VPS не блокируется. Перебирает
+        версии эндпоинта (WB их меняет). Возвращает список id товаров.
+        """
+        if not keyword or not keyword.strip():
+            return []
+
+        ids: list[int] = []
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(
+            headers=self.HEADERS, connector=connector, trust_env=False,
+        ) as session:
+            for ver in self.SEARCH_VERSIONS:
+                url = self.SEARCH_API.format(ver=ver)
+                ok = False
+                for page in range(1, max(1, pages) + 1):
+                    params = {
+                        "ab_testing": "false", "appType": "1", "curr": "rub",
+                        "dest": "-1257786", "query": keyword.strip(),
+                        "resultset": "catalog", "sort": "popular", "spp": "30",
+                        "suppressSpellcheck": "false", "page": str(page),
+                    }
+                    # search.wb.ru жёстко троттлит — на 429 ретраим с backoff
+                    data = None
+                    bad_version = False
+                    for attempt in range(3):
+                        try:
+                            async with session.get(
+                                url, params=params,
+                                timeout=aiohttp.ClientTimeout(total=15),
+                            ) as resp:
+                                if resp.status == 429:
+                                    await asyncio.sleep(2 * (attempt + 1))
+                                    continue
+                                if resp.status != 200:
+                                    bad_version = True
+                                    break  # версия не та — пробуем следующую
+                                data = await resp.json(content_type=None)
+                                break
+                        except Exception as e:
+                            logger.debug(f"WB search [{ver}] '{keyword}': {e}")
+                            break
+                    if bad_version:
+                        break
+                    if data is None:
+                        break  # 429 не отступил — отдаём что есть (или пусто)
+
+                    products = (data.get("products")
+                                or data.get("data", {}).get("products", []))
+                    page_ids = [int(p["id"]) for p in products if p.get("id")]
+                    if not page_ids:
+                        break
+                    ids.extend(page_ids)
+                    ok = True
+                    await asyncio.sleep(random.uniform(0.5, 1.0))
+                if ok:
+                    break  # версия сработала — другие не нужны
+
+        # дедуп с сохранением порядка
+        seen: set[int] = set()
+        uniq = [a for a in ids if not (a in seen or seen.add(a))]
+        logger.info(f"WB search '{keyword}': найдено {len(uniq)} артикулов")
+        return uniq
+
+    async def _discover_articles(self, channel: dict, count: int) -> list[int]:
+        """
+        Live-подбор артикулов по wb_categories канала через search.wb.ru.
+        Round-robin по категориям, дедуп, перемешивание. Запас ×5 на фильтрацию.
+        Пусто (нет категорий / WB упал) → вызывающий уйдёт на кеш-фолбэк.
+        """
+        cats = [c for c in (channel.get("wb_categories") or []) if c and c.strip()]
+        if not cats:
+            return []
+
+        # Один успешный запрос отдаёт ~100 артикулов — этого с запасом хватает на
+        # count*5. Чтобы не злить троттлинг search.wb.ru, дёргаем категории ПО ОДНОЙ
+        # (в случайном порядке) и останавливаемся, как только набрали достаточно.
+        random.shuffle(cats)
+        pool: list[int] = []
+        seen: set[int] = set()
+        enough = count * 3
+        for cat in cats:
+            try:
+                found = await self.search_articles(cat, pages=1)
+            except Exception as e:
+                logger.warning(f"WB discover '{cat}': {e}")
+                found = []
+            for a in found:
+                if a not in seen:
+                    seen.add(a)
+                    pool.append(a)
+            if len(pool) >= enough:
+                break  # набрали — лишний раз WB не дёргаем
+            if not found:
+                await asyncio.sleep(2.0)  # троттлинг — пауза перед след. категорией
+
+        random.shuffle(pool)
+        return pool[:min(count * 5, len(pool))]
+
     async def generate_posts(self, channel: dict, count: int = 10) -> list[dict]:
         """
         Главный метод. Генерирует count постов.
-        Использует кеш артикулов + card.wb.ru (без 429).
+        Гибрид: сначала live-поиск товаров (search.wb.ru по wb_categories), при
+        неудаче — статический кеш артикулов. Детали/цены/картинки — card.wb.ru.
         """
-        article_ids = self._pick_articles(channel, count)
+        # 1) Динамический поиск (свежие товары, без ручного обновления кеша)
+        article_ids = await self._discover_articles(channel, count)
+        source = "search"
+
+        # 2) Фолбэк на статический кеш (если поиск пуст / WB вернул 429)
+        if not article_ids:
+            article_ids = self._pick_articles(channel, count)
+            source = "cache"
 
         if not article_ids:
-            logger.error("WB-парсер: кеш пустой. Обнови cards/wb_ids_cache.json")
+            logger.error(
+                "WB-парсер: ни поиск, ни кеш не дали артикулов "
+                f"[{channel.get('channel_id', '?')}]. Проверь wb_categories / кеш."
+            )
             return []
 
         logger.info(
-            f"WB-парсер [{channel.get('channel_id', '?')}]: "
-            f"запрос {count} постов из {len(article_ids)} артикулов"
+            f"WB-парсер [{channel.get('channel_id', '?')}]: источник артикулов="
+            f"{source}, кандидатов={len(article_ids)}, запрос {count} постов"
         )
 
         posts = await self._fetch_posts(article_ids, count)
