@@ -2557,13 +2557,19 @@ async def handle_post_actions(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         context.user_data["editing_post_id"] = post_id
         context.user_data.pop("awaiting_image_for", None)
+        import html as _html
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🤖 ИИ перепишет текст", callback_data=f"etxt:regen:{post_id}")],
+            [InlineKeyboardButton("◀️ Назад", callback_data=f"etxt:cancel:{post_id}")],
+        ])
         await query.message.reply_text(
             f"✏️ <b>Текущий текст поста:</b>\n\n"
-            f"{current_text}\n\n"
+            f"{_html.escape(current_text)}\n\n"
             f"——\n"
-            f"Пришли новый текст целиком.\n"
+            f"Пришли новый текст целиком — или дай ИИ переписать (картинка сохранится).\n"
             f"/cancel — отменить",
             parse_mode=ParseMode.HTML,
+            reply_markup=kb,
         )
         return WAITING_EDITED_TEXT
 
@@ -2657,6 +2663,115 @@ async def handle_edited_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
     context.user_data.pop("editing_post_id", None)
+    return ConversationHandler.END
+
+
+async def cancel_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «◀️ Назад» в режиме правки текста поста — выход без изменений."""
+    query = update.callback_query
+    await query.answer("Отменено")
+    if not is_admin(query.from_user.id):
+        return ConversationHandler.END
+    post_id = context.user_data.pop("editing_post_id", None)
+    channel_id = buffer.get_post_channel(post_id) if post_id else None
+    kb = None
+    if channel_id:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📋 К очереди постов", callback_data=f"ui:ch_review:{channel_id}")
+        ]])
+    try:
+        await query.edit_message_text("◀️ Отменено. Текст поста не изменён.", reply_markup=kb)
+    except Exception:
+        pass
+    return ConversationHandler.END
+
+
+async def regen_post_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «🤖 ИИ перепишет текст»: генерит новый текст на ту же тему, картинку
+    поста сохраняет. Заменяет только content этого поста, статус остаётся ready."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return ConversationHandler.END
+
+    post_id = context.user_data.get("editing_post_id")
+    if not post_id:
+        return ConversationHandler.END
+
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT topic, format, channel_id FROM posts WHERE id = ?", (post_id,)
+        ).fetchone()
+    if not row:
+        await query.edit_message_text("❌ Пост не найден.")
+        context.user_data.pop("editing_post_id", None)
+        return ConversationHandler.END
+
+    channel_id = row["channel_id"]
+    topic = row["topic"] or ""
+    fmt = row["format"] or None
+
+    try:
+        await query.edit_message_text(
+            "🤖 <b>ИИ переписывает текст…</b>\n\n⚡ Обычно 5-15 секунд.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏳ Генерация…", callback_data="noop")]]),
+        )
+    except Exception:
+        pass
+
+    from ai_client import generate_post, PostGenerationError
+    from content_router import resolve, pick_hook
+
+    channel = next((c for c in load_all_channels() if c["channel_id"] == channel_id), {})
+    try:
+        strategy = resolve(channel) if channel else None
+        hook = pick_hook(strategy) if strategy else None
+        used = buffer.get_used_topics(channel_id) if hasattr(buffer, "get_used_topics") else []
+        post = await generate_post(
+            channel, topic, fmt, used_topics=used, strategy=strategy, hook=hook,
+        )
+        new_text = (post.get("content") if isinstance(post, dict) else str(post)) or ""
+        new_text = new_text.strip()
+        if not new_text:
+            raise PostGenerationError("пустой текст")
+    except PostGenerationError as e:
+        logger.warning(f"Перегенерация текста {post_id[:8]} отклонена: {e}")
+        await query.edit_message_text(
+            "😔 ИИ вернул негодный текст (мета/отказ). Попробуй ещё раз или впиши текст вручную.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🤖 Ещё раз", callback_data=f"etxt:regen:{post_id}"),
+                InlineKeyboardButton("◀️ Назад", callback_data=f"etxt:cancel:{post_id}"),
+            ]]),
+        )
+        return WAITING_EDITED_TEXT
+    except Exception as e:
+        logger.error(f"Ошибка перегенерации текста {post_id[:8]}: {e}")
+        await query.edit_message_text(
+            f"❌ Ошибка: {e}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🤖 Ещё раз", callback_data=f"etxt:regen:{post_id}"),
+                InlineKeyboardButton("◀️ Назад", callback_data=f"etxt:cancel:{post_id}"),
+            ]]),
+        )
+        return WAITING_EDITED_TEXT
+
+    # Сохраняем новый текст, картинку (image_url) НЕ трогаем
+    with db.connect() as conn:
+        conn.execute("UPDATE posts SET content = ? WHERE id = ?", (new_text, post_id))
+    logger.info(f"Текст поста перегенерирован ИИ: {post_id[:8]}")
+
+    import html as _html
+    preview = _html.escape(new_text[:400]) + ("…" if len(new_text) > 400 else "")
+    context.user_data.pop("editing_post_id", None)
+    await query.edit_message_text(
+        f"✅ <b>Текст переписан ИИ</b> (картинка сохранена):\n\n<i>{preview}</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 К очереди постов", callback_data=f"ui:ch_review:{channel_id}")],
+            [InlineKeyboardButton("🤖 Ещё раз переписать", callback_data=f"edit:{post_id}")],
+        ]),
+    )
     return ConversationHandler.END
 
 
@@ -3326,7 +3441,9 @@ def main():
         entry_points=[CallbackQueryHandler(handle_post_actions, pattern="^edit:")],
         states={
             WAITING_EDITED_TEXT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edited_text)
+                CallbackQueryHandler(regen_post_text, pattern="^etxt:regen:"),
+                CallbackQueryHandler(cancel_edit_text, pattern="^etxt:cancel:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edited_text),
             ],
         },
         per_message=False,
