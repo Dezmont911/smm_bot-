@@ -192,7 +192,6 @@ async def screen_main(qm, context: ContextTypes.DEFAULT_TYPE):
         ],
         [InlineKeyboardButton("📝 Очередь постов", callback_data="ui:queue")],
         [InlineKeyboardButton("➕ Добавить канал",  callback_data="add_start")],
-        [InlineKeyboardButton("🎨 Тест генерации картинок", callback_data="ui:img_test")],
     ])
     await _answer_or_send(qm, text, kb)
 
@@ -201,10 +200,17 @@ CHANNELS_PAGE_SIZE = 10
 
 
 def _toggle_icon(ch: dict) -> str:
-    """Тумблер состояния канала: 🔵 публикует по расписанию, ⚪ на паузе/без расписания."""
-    if ch.get("schedule_disabled") or not ch.get("post_times_utc"):
-        return "⚪️"
-    return "🔵"
+    """Индикатор состояния канала в списке:
+      🟢 — расписание активно (канал полноценно публикует);
+      ⏸ — расписание на паузе, но РСЯ-перекрытие включено (реклама всё равно выходит);
+      🔴 — и расписание остановлено, и РСЯ-перекрытие выключено (канал молчит).
+    """
+    schedule_active = not ch.get("schedule_disabled") and bool(ch.get("post_times_utc"))
+    if schedule_active:
+        return "🟢"
+    if ch.get("rsy_override", False):
+        return "⏸"
+    return "🔴"
 
 
 def _channel_button(ch: dict) -> InlineKeyboardButton:
@@ -1044,7 +1050,7 @@ async def screen_references(qm, context: ContextTypes.DEFAULT_TYPE, handle: str)
     rows.append([InlineKeyboardButton("➕ Добавить донор", callback_data=f"ui:ref_add:{handle}")])
     if refs:
         rows.append([InlineKeyboardButton("📥 Взять референсы", callback_data=f"ui:ref_take:{handle}")])
-    rows.append([InlineKeyboardButton("◀️ К настройкам", callback_data=f"ui:ch_settings:{handle}")])
+    rows.append([InlineKeyboardButton("◀️ К каналу", callback_data=f"ui:ch:{handle}")])
 
     await _answer_or_send(qm, "\n".join(lines), InlineKeyboardMarkup(rows))
 
