@@ -21,6 +21,7 @@ ui.py — Inline-меню бота (UI слой)
   ui:generate_all             → сгенерировать для всех каналов
 """
 
+import asyncio
 import json
 import re
 from datetime import datetime, timezone
@@ -1321,10 +1322,69 @@ async def action_draft_new(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
     )
 
 
+def _extract_msg_media(msg) -> tuple[str | None, str | None]:
+    """file_id + тип из сообщения (порядок: animation до document)."""
+    if msg.photo:
+        return msg.photo[-1].file_id, "photo"
+    if getattr(msg, "animation", None):
+        return msg.animation.file_id, "animation"
+    if msg.video:
+        return msg.video.file_id, "video"
+    if msg.document:
+        return msg.document.file_id, "document"
+    return None, None
+
+
+def _draft_done_kb(handle: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬆️ Сразу в очередь", callback_data=f"ui:draft_qlast:{handle}")],
+        [InlineKeyboardButton("➕ Ещё пост",         callback_data=f"ui:draft_new:{handle}")],
+        [InlineKeyboardButton("✍️ К черновикам",     callback_data=f"ui:ch_draft:{handle}")],
+    ])
+
+
+async def _flush_album_draft(context, gid: str, reply_msg):
+    """Собирает накопленные кадры альбома в ОДИН черновик-альбом после паузы."""
+    try:
+        await asyncio.sleep(1.2)  # ждём, пока придут все кадры media_group
+    except asyncio.CancelledError:
+        return
+    slots = context.user_data.get("_album_slots", {})
+    slot = slots.pop(gid, None)
+    if not slot or not slot["items"]:
+        return
+    handle = slot["handle"]
+    members = list(range(len(slot["items"])))
+    items = {str(i): {"file_id": fid, "type": mt} for i, (fid, mt) in enumerate(slot["items"])}
+    buffer.add({
+        "channel_id": handle,
+        "content": slot["caption"],
+        "format": "manual",
+        "topic": "manual draft",
+        "status": "draft",
+        "media_type": "album",
+        "parse_mode": None,
+        "tg_file_id": json.dumps({"members": members, "items": items}),
+    })
+    try:
+        await reply_msg.reply_text(
+            f"✅ Черновик-альбом создан ({len(members)} медиа). В очередь пока не попал.",
+            reply_markup=_draft_done_kb(handle),
+        )
+    except Exception:
+        pass
+
+
 async def create_draft_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
-    Создаёт черновик из присланного админом сообщения (текст/фото/видео/документ).
-    Медиа храним по file_id (без скачивания). Возвращает True, если черновик создан.
+    Создаёт черновик из присланного/пересланного админом сообщения
+    (текст/фото/видео/документ/альбом). Медиа храним по file_id (без скачивания).
+
+    Режим compose «липкий»: после создания черновика остаётся включённым, чтобы
+    можно было переслать СРАЗУ НЕСКОЛЬКО постов (каждый → свой черновик). Выход —
+    любой кнопкой меню (ui_router сбрасывает draft_compose). Альбом (media_group)
+    склеивается в ОДИН черновик-альбом через короткую паузу-дебаунс.
+    Возвращает True, если сообщение обработано (поглощено режимом compose).
     """
     handle = context.user_data.get("draft_compose")
     if not handle:
@@ -1334,21 +1394,26 @@ async def create_draft_from_message(update: Update, context: ContextTypes.DEFAUL
         return False
 
     caption = (msg.caption or msg.text or "").strip()
-    file_id = media_type = None
-    if msg.photo:
-        file_id, media_type = msg.photo[-1].file_id, "photo"
-    elif getattr(msg, "animation", None):
-        file_id, media_type = msg.animation.file_id, "animation"
-    elif msg.video:
-        file_id, media_type = msg.video.file_id, "video"
-    elif msg.document:
-        file_id, media_type = msg.document.file_id, "document"
+    file_id, media_type = _extract_msg_media(msg)
+
+    # --- Альбом: копим кадры, флашим одним черновиком после паузы ---
+    gid = getattr(msg, "media_group_id", None)
+    if gid and file_id:
+        slots = context.user_data.setdefault("_album_slots", {})
+        slot = slots.setdefault(str(gid), {"items": [], "caption": "", "handle": handle, "task": None})
+        slot["items"].append((file_id, media_type))
+        if caption and not slot["caption"]:
+            slot["caption"] = caption
+        if slot.get("task"):
+            slot["task"].cancel()
+        slot["task"] = asyncio.create_task(_flush_album_draft(context, str(gid), msg))
+        return True
 
     if not file_id and not caption:
-        await msg.reply_text("⚠️ Пусто. Пришли текст, фото или видео.")
+        await msg.reply_text("⚠️ Пусто. Пришли текст, фото, видео или перешли пост.")
         return True  # остаёмся в режиме compose
 
-    context.user_data.pop("draft_compose", None)
+    # Режим НЕ сбрасываем (липкий) — можно слать/пересылать ещё посты подряд.
     post = {
         "channel_id": handle,
         "content": caption,
@@ -1363,14 +1428,9 @@ async def create_draft_from_message(update: Update, context: ContextTypes.DEFAUL
     buffer.add(post)
 
     kind = {"photo": "фото", "video": "видео", "document": "документ", "animation": "гиф"}.get(media_type, "текст")
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬆️ Сразу в очередь", callback_data=f"ui:draft_qlast:{handle}")],
-        [InlineKeyboardButton("➕ Ещё пост",         callback_data=f"ui:draft_new:{handle}")],
-        [InlineKeyboardButton("✍️ К черновикам",     callback_data=f"ui:ch_draft:{handle}")],
-    ])
     await msg.reply_text(
-        f"✅ Черновик создан ({kind}). Лежит в черновике, в очередь пока не попал.",
-        reply_markup=kb,
+        f"✅ Черновик создан ({kind}). Можно прислать ещё или вернуться в меню.",
+        reply_markup=_draft_done_kb(handle),
     )
     return True
 

@@ -2977,6 +2977,14 @@ async def handle_userbot_forward(update: Update, context: ContextTypes.DEFAULT_T
     if not msg:
         return
 
+    # Админ в режиме создания черновика → пересланный пост = контент черновика,
+    # а НЕ relay-референс. Делегируем (текст/медиа/альбом → черновик). Форварды
+    # юзербота сюда не попадают: у него в user_data нет draft_compose.
+    if context.user_data.get("draft_compose") and is_admin(update.effective_user.id):
+        from ui import create_draft_from_message
+        if await create_draft_from_message(update, context):
+            return
+
     # Должно быть переслано из канала-донора (forward_from_* в PTB 20.7)
     src_chat = getattr(msg, "forward_from_chat", None)
     src_id = getattr(msg, "forward_from_message_id", None)
