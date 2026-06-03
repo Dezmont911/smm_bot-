@@ -869,13 +869,23 @@ async def _finalize_new_channel(query, context: ContextTypes.DEFAULT_TYPE, count
     ch_type_label = "🛍 Маркетплейс" if channel_type == "marketplace" else "📝 Контент"
     channel_id_added = ch['channel_id']
     topic_now = (ch.get("topic") or "").strip()
-    # Тему не удалось вывести (в канале мало постов) — честно предупреждаем
-    topic_line = (
-        f"Тема: {topic_now}\n" if topic_now else
-        "Тема: <b>не определена</b> (в канале мало постов для анализа)\n"
-        "→ добавь постов в канал и нажми «🔄 Подобрать тему заново» в настройках; "
-        "без темы автогенерация не запустится.\n"
-    ) if channel_type == "content" else ""
+    forbidden_reason = context.user_data.get("_forbidden_reason")
+    # Тему не удалось вывести (мало постов) или канал на запретной тематике — честно говорим
+    if channel_type != "content":
+        topic_line = ""
+    elif forbidden_reason:
+        topic_line = (
+            f"Тема: 🚫 <b>запрещённая тематика</b> ({forbidden_reason})\n"
+            "→ бот не работает с таким контентом, автогенерация недоступна.\n"
+        )
+    elif topic_now:
+        topic_line = f"Тема: {topic_now}\n"
+    else:
+        topic_line = (
+            "Тема: <b>не определена</b> (в канале мало постов для анализа)\n"
+            "→ добавь постов в канал и нажми «🔄 Подобрать тему заново» в настройках; "
+            "без темы автогенерация не запустится.\n"
+        )
     await query.edit_message_text(
         f"🎉 <b>Канал добавлен!</b>\n\n"
         f"Handle: {channel_id_added}\n"
@@ -1277,10 +1287,12 @@ async def _create_channel_from_analysis(analysis: dict, channel_id: str, display
             except Exception as e:
                 logger.warning(f"RSS suggest ошибка: {e}")
 
+    # Запретная тематика по смыслу постов → тему НЕ присваиваем (генерация заблокируется)
+    derived_topic = "" if analysis.get("forbidden") else analysis.get("topic", "")
     card = {
         "channel_id": channel_id,
         "name": display_name or channel_id,
-        "topic": analysis.get("topic", ""),
+        "topic": derived_topic,
         "tone": analysis.get("tone", "информационный"),
         "channel_type": channel_type,
         "daily_posts_count": analysis.get("post_frequency", 4),
@@ -1440,12 +1452,23 @@ async def handle_username_confirm(update: Update, context: ContextTypes.DEFAULT_
         src_label = "🌐 веб-поиск" if card.get("topic_source") == "search" else "📡 по лентам"
         meta_line = f"Стиль: {arch_label}\nИсточник тем: {src_label}\n"
 
+    if analysis.get("forbidden"):
+        reason = (analysis.get("forbidden_reason") or "контент нарушает правила")
+        topic_line = (f"Тема: 🚫 <b>запрещённая тематика</b> ({reason})\n"
+                      f"→ бот не работает с таким контентом, автогенерация недоступна.\n")
+        meta_line = ""
+    elif (card.get("topic") or "").strip():
+        topic_line = f"Тема: {card['topic'][:80]}\n"
+    else:
+        topic_line = ("Тема: <b>не определена</b> (мало постов) — выложи контент и подбери "
+                      "тему в настройках.\n")
+
     await query.edit_message_text(
         f"🎉 <b>Канал добавлен!</b>\n\n"
         f"Handle: {handle}\n"
         f"Название: {title}\n"
         f"Тип: {ch_type_label}\n"
-        f"Тема: {card.get('topic', '—')[:80]}\n"
+        f"{topic_line}"
         f"Постов в день: {card.get('daily_posts_count')}\n"
         + meta_line
         + (f"Лент подобрано: {len(rss_urls)}\n" if card.get("channel_type") == "content" else "") +
@@ -1604,10 +1627,16 @@ async def handle_add_channel_type(update: Update, context: ContextTypes.DEFAULT_
                 analysis = await analyzer.analyze_posts(
                     ch.get("name", ""), posts, about=context.user_data.get("_add_about", "")
                 )
-                ch["topic"] = (analysis.get("topic") or "").strip()
-                arch, src = normalize_meta(analysis.get("archetype"), analysis.get("topic_source"))
-                ch["archetype"] = arch
-                ch.setdefault("topic_source", src)
+                if analysis.get("forbidden"):
+                    # Запретная тематика по смыслу постов — тему НЕ присваиваем
+                    reason = (analysis.get("forbidden_reason") or "контент нарушает правила")
+                    context.user_data["_forbidden_reason"] = reason
+                    logger.warning(f"/add: запретная тематика [{ch['channel_id']}]: {reason}")
+                else:
+                    ch["topic"] = (analysis.get("topic") or "").strip()
+                    arch, src = normalize_meta(analysis.get("archetype"), analysis.get("topic_source"))
+                    ch["archetype"] = arch
+                    ch.setdefault("topic_source", src)
             except Exception as e:
                 logger.warning(f"Анализ темы при /add не удался [{ch['channel_id']}]: {e}")
         ch.setdefault("topic", "")

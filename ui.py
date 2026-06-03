@@ -1851,6 +1851,17 @@ async def action_rederive_topic(qm, context, handle: str):
         await _show(f"❌ Ошибка анализа: {type(e).__name__}")
         return
 
+    # Запрещённая тематика канала (по СМЫСЛУ постов, не по словам) — тему не присваиваем
+    if analysis.get("forbidden"):
+        reason = (analysis.get("forbidden_reason") or "контент нарушает правила").strip()
+        ch.pop("topic", None)
+        _save_channel(ch)
+        await _show(
+            f"🚫 <b>Канал на запрещённую тематику</b>\n\nПричина: {reason}.\n\n"
+            "Бот не работает с таким контентом — тема не присвоена, автогенерация недоступна."
+        )
+        return
+
     new_topic = (analysis.get("topic") or "").strip()
     if not new_topic:
         await _show("⚠️ Не удалось определить тему по постам канала.")
