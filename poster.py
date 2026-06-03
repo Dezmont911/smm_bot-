@@ -94,9 +94,11 @@ class Poster:
             return
 
         # Проверяем: пришло ли время для этого канала?
-        post_hours = channel.get("post_times_utc", self.DEFAULT_POST_HOURS_UTC)
-        if current_hour not in post_hours:
-            return  # не время — пропускаем
+        # ВАЖНО: пустое/отсутствующее расписание = автопубликации НЕТ (без дефолт-часов!).
+        # Иначе канал без post_times_utc постил по дефолту, хотя «расписание не задано».
+        post_hours = channel.get("post_times_utc") or []
+        if not post_hours or current_hour not in post_hours:
+            return  # расписание не задано или не наш час — пропускаем
 
         # Правило 1: есть ожидающее РСЯ-перекрытие → слот пропускаем,
         # перекрытие выйдет само (иначе был бы дубль: плановый + перекрытие рядом).

@@ -72,10 +72,10 @@ MENU_KEYBOARD = ReplyKeyboardMarkup(
 # ── Вспомогательные функции ────────────────────────────────────────────────
 
 def _load_channels(include_inactive: bool = False, owner_id: int | None = None) -> list[dict]:
-    """Загружает карточки каналов из channels/. Если задан owner_id — отдаёт ТОЛЬКО
-    каналы этого владельца (изоляция; листинги строгие даже для админа, «всё» — отдельно)."""
+    """Загружает карточки каналов из channels/. Тестер (owner_id, не админ) видит ТОЛЬКО
+    свои каналы; админы (оба прописанных id) видят ВСЕ каналы — общее пространство."""
     channels_dir = Path(__file__).parent / "channels"
-    only_owner = owner_id is not None
+    only_owner = owner_id is not None and not accounts.is_admin(owner_id)
     channels = []
     for f in channels_dir.glob("*.json"):
         if f.name.startswith("example_"):
@@ -172,6 +172,16 @@ async def _answer_or_send(query_or_message, text: str, reply_markup, parse_mode=
     from telegram import Message, CallbackQuery
     if isinstance(query_or_message, CallbackQuery):
         await query_or_message.answer()
+        msg = query_or_message.message
+        # Фото/медиа-карточка (нет текста для edit_message_text) — удаляем и шлём новым.
+        # Иначе «К каналу» с фото-карточки молча падал (нет текста для редактирования).
+        if msg is not None and not msg.text:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            await msg.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+            return
         try:
             await query_or_message.edit_message_text(
                 text, reply_markup=reply_markup, parse_mode=parse_mode
@@ -649,7 +659,7 @@ async def action_schedule_clear(qm, context, handle: str):
 
 async def screen_status(qm, context: ContextTypes.DEFAULT_TYPE):
     """Общий статус всех буферов."""
-    channels = _load_channels()
+    channels = _load_channels(owner_id=_acting_uid(qm))
     if not channels:
         await _answer_or_send(qm, "📊 Каналов нет.", InlineKeyboardMarkup([[
             InlineKeyboardButton("◀️ Назад", callback_data="ui:main")
@@ -2430,7 +2440,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "ch_sched_copy" and len(parts) >= 3:
         handle = parts[2]
-        channels = _load_channels()
+        channels = _load_channels(owner_id=uid)
         others = [c for c in channels if c["channel_id"] != handle]
         if not others:
             await query.answer("Нет других каналов для копирования.", show_alert=True)

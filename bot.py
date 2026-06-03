@@ -151,10 +151,14 @@ async def _guard_post(update, post_id) -> bool:
 
 
 def _channels_for(update) -> list[dict]:
-    """Каналы, видимые текущему юзеру (свои; админ — тоже только свои в листингах)."""
+    """Каналы, видимые текущему юзеру: тестер — только свои; админ — ВСЕ (общее
+    пространство двух прописанных админов)."""
     user = update.effective_user
     uid = user.id if user else None
-    return [c for c in load_all_channels() if uid is not None and c.get("owner_id") == uid]
+    allc = load_all_channels()
+    if uid is not None and is_admin(uid):
+        return allc
+    return [c for c in allc if uid is not None and c.get("owner_id") == uid]
 
 
 def safe_slug(channel_id: str) -> str:
