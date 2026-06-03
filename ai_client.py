@@ -317,6 +317,12 @@ def _style_guidance(style: dict | None) -> str:
     return "\n\nСТИЛЬ ЭТОГО КАНАЛА (выдержи фирменный голос, не похожий на другие каналы):\n" + "\n".join(lines)
 
 
+# Границы длины поста (слов). Минимум — чтобы не было пустых постов; максимум —
+# чтобы пост влезал в подпись Telegram (~1024 симв для медиа) и не жёг токены.
+POST_LENGTH_MIN_WORDS = 10
+POST_LENGTH_MAX_WORDS = 220
+
+
 def _parse_post_length(post_length: str) -> tuple[str, int]:
     """Разбирает поле post_length → (человекочитаемая длина, max_tokens).
 
@@ -331,13 +337,15 @@ def _parse_post_length(post_length: str) -> tuple[str, int]:
         lo = int(m.group(1))
         hi = int(m.group(2)) if m.group(2) else lo
         hi = max(lo, hi)
-        # Пол: не меньше 10 слов — защита от 0/слишком мало (иначе Claude пишет
-        # пусто, пост бракуется детектором отказов → 0 постов впустую).
-        hi = max(hi, 10)
-        lo = max(min(lo, hi), 10) if lo else hi
+        # Границы 10..300 слов: пол — чтобы не было пустых постов (0 слов), потолок —
+        # чтобы пост не вылезал за лимит подписи Telegram и не жёг лишние токены.
+        hi = min(max(hi, 10), POST_LENGTH_MAX_WORDS)
+        lo = min(max(lo, 10), hi) if lo else hi
         label = (f"{lo}–{hi} слов" if m.group(2) else f"около {lo} слов") + \
                 f" (СТРОГО не больше {hi} слов)"
-        max_tokens = min(1024, max(120, hi * 8))
+        # Токены масштабируем под длину (≈8 ток/слово для русского), но с потолком,
+        # чтобы длинные посты реально дописывались, а не обрезались на полуслове.
+        max_tokens = min(2400, max(160, hi * 8))
         return label, max_tokens
     return (raw or "100–200 слов"), 1024
 

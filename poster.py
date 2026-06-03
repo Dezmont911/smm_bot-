@@ -39,6 +39,17 @@ from image_generator import generate_image as generate_ai_image
 # ближайший слот пропускаем, чтобы не было двух постов подряд.
 MIN_PUBLISH_GAP_MIN = 40
 
+# Лимит подписи Telegram для медиа (send_photo/video/...). Длиннее — Telegram
+# отвергает весь пост; поэтому подпись медиа обрезаем, чтобы картинка всё же вышла.
+TG_CAPTION_LIMIT = 1024
+
+
+def _clip_caption(caption):
+    """Обрезает подпись медиа до лимита Telegram (с многоточием). None/короткие — как есть."""
+    if caption and len(caption) > TG_CAPTION_LIMIT:
+        return caption[:TG_CAPTION_LIMIT - 1].rstrip() + "…"
+    return caption
+
 
 class Poster:
     """Публикует посты из буфера в Telegram-каналы."""
@@ -353,7 +364,7 @@ class Poster:
     async def _send_by_file_id(self, channel_id, file_id, media_type, caption, parse_mode) -> bool:
         """Публикует relay-референс по file_id (медиа уже на серверах Telegram).
         Без скачивания и без лимита 50 МБ. Пробует оба parse_mode."""
-        cap = caption or None
+        cap = _clip_caption(caption) or None
         for pm in (parse_mode, None):
             try:
                 if media_type == "video":
@@ -380,7 +391,7 @@ class Poster:
             return False
         members = data.get("members", [])
         items = data.get("items", {})
-        cap = caption or None
+        cap = _clip_caption(caption) or None
 
         for pm in (parse_mode, None):
             media = []
@@ -412,7 +423,7 @@ class Poster:
     async def _send_local_media(self, channel_id, path, media_type, caption, parse_mode) -> bool:
         """Отправляет локальный медиа-файл (референс «как есть»): фото или видео.
         Пробует оба parse_mode. Подпись может быть пустой."""
-        cap = caption or None
+        cap = _clip_caption(caption) or None
         for pm in (parse_mode, None):
             try:
                 with open(path, "rb") as fh:
@@ -512,6 +523,7 @@ class Poster:
 
         # ---- Вспомогательные отправщики (пробуют оба parse_mode) ----
         async def _send_with_image() -> bool:
+            cap = _clip_caption(content)  # подпись медиа ≤1024, иначе Telegram отвергнет
             for pm in (post_parse_mode, None):
                 try:
                     if wb_image_bytes:
@@ -519,7 +531,7 @@ class Poster:
                     else:
                         photo = image_url
                     await self.bot.send_photo(
-                        chat_id=target, photo=photo, caption=content, parse_mode=pm
+                        chat_id=target, photo=photo, caption=cap, parse_mode=pm
                     )
                     return True
                 except Exception as e:

@@ -2092,14 +2092,23 @@ async def handle_settings_text_input(update: Update, context: ContextTypes.DEFAU
             return True
 
     elif field == "post_length":
-        # Если задано число/диапазон (слова) — не меньше 10. Текстовые форматы пропускаем.
+        # Если задано число/диапазон (слова) — в пределах 10..300. Текстовые форматы пропускаем.
+        from ai_client import POST_LENGTH_MIN_WORDS as _LMIN, POST_LENGTH_MAX_WORDS as _LMAX
         m = re.fullmatch(r"(\d+)\s*(?:[-–—]\s*(\d+))?\s*(?:слов\w*)?", text.strip(), re.IGNORECASE)
         if m:
             lo = int(m.group(1)); hi = int(m.group(2)) if m.group(2) else lo
-            if max(lo, hi) < 10:
+            if max(lo, hi) < _LMIN:
                 await update.message.reply_text(
-                    "⚠️ Слишком мало — минимум <b>10 слов</b>.\n"
+                    f"⚠️ Слишком мало — минимум <b>{_LMIN} слов</b>.\n"
                     "Напр.: <code>100-200</code> или <code>150</code>.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return True
+            if max(lo, hi) > _LMAX:
+                await update.message.reply_text(
+                    f"⚠️ Слишком много — максимум <b>{_LMAX} слов</b>.\n"
+                    "Для постов с картинкой Telegram обрезает подпись (~1024 символа, "
+                    "≈150 слов), так что длиннее ставить смысла мало.",
                     parse_mode=ParseMode.HTML,
                 )
                 return True
