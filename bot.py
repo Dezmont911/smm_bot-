@@ -3176,7 +3176,10 @@ async def handle_image_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Сначала проверяет не находится ли пользователь в режиме
     редактирования настроек канала (ui.py editing).
     """
-    uid = update.effective_user.id
+    user = update.effective_user
+    if user is None:
+        return  # пост/правка канала (effective_user=None) — не наш кейс
+    uid = user.id
     if not has_access(uid):
         # Незарегистрированный — единственное доступное действие: ввод инвайт-кода
         await _try_invite_code_text(update, context)
@@ -4013,7 +4016,9 @@ def main():
 
     # --- Текстовые сообщения от админа (URL картинки / новая тема канала) ---
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
+        # Только личка админа/тестера. БЕЗ ChatType.PRIVATE сюда прилетали посты/
+        # правки каналов (edited_channel_post) — у них effective_user=None → краш.
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
         handle_image_url,
     ))
 
