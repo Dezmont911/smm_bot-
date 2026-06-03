@@ -45,6 +45,34 @@ def bot_user_id() -> int:
     return int(cfg.BOT_TOKEN.split(":")[0])
 
 
+# ─── Сериализация обращений к юзерботу ──────────────────────────────────────
+# Юзербот — ОДИН user-аккаунт на одной .session. Параллельные операции (два
+# тестера разом жмут «Взять референсы» / добавляют канал) дерутся за session-файл
+# и провоцируют FloodWait. Глобальный Lock пропускает строго ПО ОДНОЙ операции,
+# а декоратор ещё и переживает FloodWaitError (ждёт указанное время и повторяет).
+_USERBOT_LOCK = asyncio.Lock()
+
+
+def _userbot_op(fn):
+    """Декоратор публичной операции юзербота: глоб. Lock + backoff на FloodWait."""
+    async def wrapper(*args, **kwargs):
+        from telethon.errors import FloodWaitError
+        async with _USERBOT_LOCK:
+            for attempt in range(3):
+                try:
+                    return await fn(*args, **kwargs)
+                except FloodWaitError as e:
+                    wait = int(getattr(e, "seconds", 30)) + 1
+                    if attempt >= 2 or wait > 300:
+                        logger.warning(f"Юзербот {fn.__name__}: FloodWait {wait}s — сдаюсь")
+                        raise
+                    logger.warning(f"Юзербот {fn.__name__}: FloodWait {wait}s — жду и повторяю")
+                    await asyncio.sleep(wait)
+    wrapper.__name__ = getattr(fn, "__name__", "userbot_op")
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
+
+
 def _msg_html(msg) -> str:
     """
     Текст сообщения как HTML — сохраняет ссылки/форматирование донора
@@ -125,6 +153,7 @@ def _classify_and_check(msg, max_video_mb, max_video_sec, max_doc_mb):
     return None, False, "неподдерживаемый тип медиа"
 
 
+@_userbot_op
 async def read_candidates(
     username: str,
     after_id: int = 0,
@@ -265,6 +294,7 @@ async def read_candidates(
         await client.disconnect()
 
 
+@_userbot_op
 async def forward_to_bot(username: str, msg_ids: list[int]) -> int:
     """
     Пересылает указанные сообщения донора В ЛС бота-публикатора (обычный форвард,
@@ -327,6 +357,7 @@ class UserbotNotAuthorized(RuntimeError):
     """Сессия юзербота отсутствует или не авторизована."""
 
 
+@_userbot_op
 async def read_channel(username: str, limit: int = 40) -> dict:
     """
     Читает публичный канал по @username.
@@ -419,6 +450,7 @@ def _media_kind(msg) -> str | None:
     return None
 
 
+@_userbot_op
 async def read_new_posts(
     username: str,
     after_id: int = 0,
