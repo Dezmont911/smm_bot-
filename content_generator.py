@@ -44,6 +44,21 @@ import dedup
 from config import cfg
 
 
+def _has_meaningful_text(s: str) -> bool:
+    """True, если в строке есть хотя бы одно «слово» (≥2 буквы подряд).
+    Отсекает пустое / «1» / «а» / «123» / «!!!» как тему канала."""
+    return bool(re.search(r"[а-яёa-z]{2,}", (s or ""), re.IGNORECASE))
+
+
+def _meaningful_base(*parts: str) -> str:
+    """Первый осмысленный кусок из переданных (тема, название) для синтез-резерва."""
+    for p in parts:
+        p = (p or "").split(",")[0].strip()
+        if _has_meaningful_text(p):
+            return p
+    return ""
+
+
 class ContentGenerator:
     """Генерирует посты для каналов и пополняет буфер."""
 
@@ -130,6 +145,18 @@ class ContentGenerator:
                 }
         except Exception:
             pass
+
+        # ---- Стоп-кран: у канала нет ОСМЫСЛЕННОЙ темы (пусто/«1»/«а»/«123») ----
+        # Без сигнала генерация даёт пустые/бессмысленные посты. Если ни в теме, ни
+        # в названии нет нормального слова — выходим с понятной причиной.
+        if not _has_meaningful_text(f"{channel.get('topic','')} {channel.get('name','')}"):
+            logger.warning(f"Генерация отклонена [{channel_id}]: нет осмысленной темы канала")
+            return {
+                "channel_id": channel_id, "generated": 0, "skipped": 0,
+                "buffer_level": current_level, "sources_used": [],
+                "reason": "у канала не задана осмысленная тема — укажи тему хотя бы из пары слов "
+                          "(в настройках канала «Тема»)",
+            }
 
         # Получаем темы из источников. Берём ПУЛ кандидатов больше нужного:
         # часть отсеется как уже использованные (вкл. недавно очищенные) и дубли
@@ -640,7 +667,7 @@ class ContentGenerator:
         # вечнозелёных в карточке). Гарантирует, что буфер не останется пустым:
         # лучше пост по теме канала, чем ничего. Темы из живого тона выйдут норм.
         if len(topics) < count:
-            base = (channel.get("topic", "") or "").split(",")[0].strip() or channel.get("name", "")
+            base = _meaningful_base(channel.get("topic", ""), channel.get("name", ""))
             if base:
                 ANGLES = [
                     "интересный неочевидный факт", "разбор для новичка",
