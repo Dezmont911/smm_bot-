@@ -2355,8 +2355,22 @@ async def action_admin_invite(qm, context, uses: int, days: int):
     await _answer_or_send(qm, text, kb)
 
 
+async def _user_label(context, uid: int) -> str | None:
+    """Юзернейм/имя пользователя через Bot API (работает для всех, кто писал боту)."""
+    try:
+        chat = await context.bot.get_chat(uid)
+        if getattr(chat, "username", None):
+            return f"@{chat.username}"
+        name = " ".join(filter(None, [getattr(chat, "first_name", None),
+                                      getattr(chat, "last_name", None)]))
+        return name or None
+    except Exception:
+        return None
+
+
 async def screen_admin_users(qm, context: ContextTypes.DEFAULT_TYPE):
-    """Список тестеров: план, остаток триала, кнопки выдать PRO / закрыть доступ."""
+    """Список тестеров: юзернейм/имя, план, остаток триала, кнопки PRO / закрыть доступ."""
+    import html as _html
     users = accounts.list_users()
     if not users:
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Админ-панель", callback_data="ui:admin")]])
@@ -2369,9 +2383,12 @@ async def screen_admin_users(qm, context: ContextTypes.DEFAULT_TYPE):
         plan = accounts.effective_plan(uid)
         left = accounts.trial_days_left(uid)
         left_s = f" · осталось {left}д" if left is not None else ""
-        lines.append(f"• <code>{uid}</code> — <b>{plan}</b>{left_s}")
+        label = await _user_label(context, uid)
+        who = _html.escape(label) if label else "—"
+        lines.append(f"• <b>{who}</b> · <code>{uid}</code> — <b>{plan}</b>{left_s}")
+        short = (label or str(uid))[:16]
         rows.append([
-            InlineKeyboardButton(f"🔼 PRO 30д · {uid}", callback_data=f"ui:adm_pro:{uid}"),
+            InlineKeyboardButton(f"🔼 PRO · {short}", callback_data=f"ui:adm_pro:{uid}"),
             InlineKeyboardButton("⛔ Доступ", callback_data=f"ui:adm_revoke:{uid}"),
         ])
     rows.append([InlineKeyboardButton("◀️ Админ-панель", callback_data="ui:admin")])
