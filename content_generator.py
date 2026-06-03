@@ -116,6 +116,20 @@ class ContentGenerator:
         if channel.get("channel_type") == "marketplace":
             return await self._run_marketplace(channel, target_count)
 
+        # ---- Стоп-кран: тема/название самого канала запретные ----
+        # Иначе синтез-резерв (Источник 4) построил бы «углы» из запретной темы и
+        # жёг бы LLM на гарантированных отказах. Сразу выходим с понятной причиной.
+        try:
+            from ai_client import _contains_forbidden
+            if _contains_forbidden(f"{channel.get('topic','')} {channel.get('name','')}"):
+                logger.warning(f"Генерация отклонена [{channel_id}]: тема канала запрещена")
+                return {
+                    "channel_id": channel_id, "generated": 0, "skipped": 0,
+                    "buffer_level": current_level, "sources_used": [],
+                    "reason": "тема канала содержит запрещённый контент — измени тему канала",
+                }
+        except Exception:
+            pass
 
         # Получаем темы из источников. Берём ПУЛ кандидатов больше нужного:
         # часть отсеется как уже использованные (вкл. недавно очищенные) и дубли

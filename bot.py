@@ -2237,6 +2237,14 @@ async def _run_generation_background(bot, chat_id: int, force: bool = False, cha
                 return
             result = await generator.run_for_channel(channel, force=force)
             generated = result.get("generated", 0)
+            # 0 постов с явной причиной (например запретная тема канала) — объясняем
+            if generated == 0 and result.get("reason"):
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ <b>{channel_id}: посты не созданы</b>\n\nПричина: {result['reason']}.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
             sources = ", ".join(result.get("sources_used", [])) or "нет тем"
             text = (
                 f"✅ <b>Генерация для {channel_id} завершена!</b>\n\n"
