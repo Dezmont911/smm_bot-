@@ -3712,16 +3712,28 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     Без него ошибка просто молча падала в лог, а пользователь ничего не получал.
     Логирует traceback и уведомляет администратора.
     """
-    logger.exception(f"Необработанная ошибка в хендлере: {context.error}")
+    from telegram.error import Forbidden, NetworkError, TimedOut, RetryAfter
+    err = context.error
+
+    # Доброкачественные «ошибки» со стороны пользователя/сети — не баг бота:
+    # юзер заблокировал бота, таймаут, флуд-лимит. Тихо логируем без traceback/алерта.
+    if isinstance(err, Forbidden):
+        logger.info(f"Пользователь заблокировал бота или нет доступа: {err}")
+        return
+    if isinstance(err, (NetworkError, TimedOut, RetryAfter)):
+        logger.warning(f"Сетевая ошибка Telegram (не критично): {type(err).__name__}: {err}")
+        return
+
+    logger.exception(f"Необработанная ошибка в хендлере: {err}")
 
     # Пытаемся уведомить администратора (коротко, без traceback в чат)
     try:
-        err_type = type(context.error).__name__
+        err_type = type(err).__name__
         await context.bot.send_message(
             chat_id=cfg.ADMIN_CHAT_ID,
             text=(
                 f"⚠️ <b>Ошибка в боте</b>\n"
-                f"<code>{err_type}: {str(context.error)[:300]}</code>\n"
+                f"<code>{err_type}: {str(err)[:300]}</code>\n"
                 f"Подробности в логах."
             ),
             parse_mode="HTML",
