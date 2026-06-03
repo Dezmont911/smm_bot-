@@ -882,12 +882,10 @@ async def action_generate(qm, context, handle: str):
         [
             InlineKeyboardButton("1️⃣  1 пост",   callback_data=f"ui:ch_gen_run:{handle}:1"),
             InlineKeyboardButton("3️⃣  3 поста",  callback_data=f"ui:ch_gen_run:{handle}:3"),
-            InlineKeyboardButton("5️⃣  5 постов", callback_data=f"ui:ch_gen_run:{handle}:5"),
         ],
         [
+            InlineKeyboardButton("5️⃣  5 постов", callback_data=f"ui:ch_gen_run:{handle}:5"),
             InlineKeyboardButton("🔟 10 постов", callback_data=f"ui:ch_gen_run:{handle}:10"),
-            InlineKeyboardButton("💼 15 постов", callback_data=f"ui:ch_gen_run:{handle}:15"),
-            InlineKeyboardButton("📦 20 постов", callback_data=f"ui:ch_gen_run:{handle}:20"),
         ],
         [InlineKeyboardButton("◀️ Отмена", callback_data=f"ui:ch:{handle}")],
     ])
@@ -2470,7 +2468,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "ch_gen_run" and len(parts) >= 4:
         handle = parts[2]
-        count = min(int(parts[3]), 20)  # максимум 20
+        count = min(int(parts[3]), 10)  # максимум 10 за раз (15-20 — уже много)
         await action_generate_run(query, context, handle, count)
 
     elif action == "ch_postnow" and len(parts) >= 3:

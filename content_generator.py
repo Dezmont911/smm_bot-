@@ -65,6 +65,9 @@ class ContentGenerator:
     # Сколько постов генерировать за один утренний запуск
     POSTS_PER_MORNING = 10
 
+    # Жёсткий потолок на ОДНУ генерацию (ручную/авто) — больше 10 за раз не нужно
+    MAX_GENERATE_PER_RUN = 10
+
     # Порог схожести для анти-повтора (0.0 = разные, 1.0 = одинаковые)
     # Посты со схожестью выше этого порога не добавляются в буфер
     SIMILARITY_THRESHOLD = 0.80
@@ -108,6 +111,9 @@ class ContentGenerator:
             else:
                 # Авто-запуск — добираем только до лимита
                 target_count = max(0, daily_target - current_level)
+
+        # Жёсткий потолок на одну генерацию — 10 постов (15-20 за раз уже много).
+        target_count = min(target_count, self.MAX_GENERATE_PER_RUN)
 
         if target_count == 0:
             logger.info(f"Буфер в норме [{channel_id}]: {current_level} постов, генерация не нужна")
