@@ -505,21 +505,19 @@ async def screen_channel_settings(qm, context: ContextTypes.DEFAULT_TYPE, handle
     rows = [
         [InlineKeyboardButton(f"🔄 Тема (подобрать заново): {topic[:25]}", callback_data=f"ui:ch_topic_redo:{channel_id}")],
         [InlineKeyboardButton(f"📅 Расписание: {sched_str}", callback_data=f"ui:ch_schedule:{channel_id}")],
-        [InlineKeyboardButton(f"🔢 Постов в день: {posts_day}", callback_data=f"ui:ch_set:{channel_id}:posts_count")],
         [InlineKeyboardButton(f"📏 Длина поста: {post_len}",    callback_data=f"ui:ch_set:{channel_id}:post_length")],
         [InlineKeyboardButton(f"🖼 Картинки: {img_str}",        callback_data=f"ui:ch_images_toggle:{channel_id}")],
         [InlineKeyboardButton(f"📰 Источники тем: {src_mode_short}", callback_data=f"ui:ch_set:{channel_id}:rss")],
-        [InlineKeyboardButton(f"🔗 Референс-каналы ({len(ch.get('reference_channels', []))})", callback_data=f"ui:ch_refs:{channel_id}")],
         [InlineKeyboardButton(f"🚫 Запрещённые темы: {forb_str}", callback_data=f"ui:ch_set:{channel_id}:forbidden")],
         [InlineKeyboardButton(f"{rsy_icon} Перекрытие рекламы РСЯ", callback_data=f"ui:rsy_toggle:{channel_id}")],
     ]
 
     if is_wb:
-        rows.insert(4, [InlineKeyboardButton(f"📦 Категории WB: {wb_str}", callback_data=f"ui:ch_set:{channel_id}:wb_categories")])
+        rows.insert(3, [InlineKeyboardButton(f"📦 Категории WB: {wb_str}", callback_data=f"ui:ch_set:{channel_id}:wb_categories")])
     else:
-        # Стиль (архетип) и источник тем — только для контент-каналов
+        # Стиль (архетип) — только для контент-каналов. Источник тем — единая кнопка
+        # «📰 Источники тем» (там же тумблер Авто/Ленты), отдельного дубля больше нет.
         rows.insert(2, [InlineKeyboardButton(f"🎭 Стиль: {arch_label}", callback_data=f"ui:ch_archetype:{channel_id}")])
-        rows.insert(3, [InlineKeyboardButton(f"🔎 Источник тем: {src_label}", callback_data=f"ui:ch_source_toggle:{channel_id}")])
 
     rows.append([InlineKeyboardButton("◀️ Назад к каналу", callback_data=f"ui:ch:{channel_id}")])
 

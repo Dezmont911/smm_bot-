@@ -465,22 +465,39 @@ async def cmd_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ADD_CHOOSE_METHOD
 
 
+async def _ask_channel_type(message, handle: str, name: str):
+    """Показывает выбор типа канала (общий шаг ручного добавления)."""
+    await message.reply_text(
+        f"✅ Handle: <b>{handle}</b>\n"
+        f"Название: <b>{name}</b>\n\n"
+        f"<b>Тип канала:</b>\n"
+        f"📝 <b>Контент</b> — посты: новости, советы, факты, разборы\n"
+        f"🛍 <b>Маркетплейс</b> — товары WB/Ozon (цена, фото, ссылка)",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📝 Контент-канал",       callback_data="channeltype:content"),
+                InlineKeyboardButton("🛍 Маркетплейс WB/Ozon", callback_data="channeltype:marketplace"),
+            ],
+            [InlineKeyboardButton("❌ Отменить", callback_data="add_cancel_inline")],
+        ]),
+    )
+
+
 async def cmd_add_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Получает handle канала. Принимает любой формат:
        @channel, https://t.me/channel, t.me/channel, просто channel
-    """
+    Читает канал юзерботом → автоматически подставляет НАЗВАНИЕ и сохраняет посты
+    (тему выведем из анализа на шаге типа — руками тему/название не вводим)."""
     text = update.message.text.strip()
 
     # Вытаскиваем handle из любого формата
     if "t.me/" in text:
-        # https://t.me/channel или t.me/channel
         handle = "@" + text.split("t.me/")[-1].strip("/").split("?")[0]
     elif text.startswith("@"):
         handle = text
     else:
         handle = f"@{text}"
-
-    # Убираем лишние символы которые не могут быть в handle
     handle = handle.split()[0]  # берём только первое слово
 
     # Проверяем нет ли уже такого канала
@@ -492,10 +509,30 @@ async def cmd_add_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ADD_HANDLE
 
     context.user_data["new_channel"] = {"channel_id": handle}
+
+    # Пытаемся прочитать канал → автоназвание + посты для анализа темы
+    await update.message.reply_text(f"🔎 Читаю {handle}…")
+    title = None
+    try:
+        from userbot_reader import read_channel
+        data = await read_channel(handle, limit=50)
+        title = (data.get("title") or "").strip()
+        context.user_data["new_channel"]["chat_id_num"] = data.get("chat_id_num")
+        context.user_data["_add_posts"] = data.get("posts") or []
+        context.user_data["_add_about"] = data.get("about", "")
+    except Exception as e:
+        logger.info(f"Ручной /add: не смог прочитать {handle}: {type(e).__name__}: {e}")
+
+    if title:
+        context.user_data["new_channel"]["name"] = title
+        await _ask_channel_type(update.message, handle, title)
+        return ADD_CHANNEL_TYPE
+
+    # Не прочитали (закрытый/нет юзербота) — название спросим вручную
     await update.message.reply_text(
         f"✅ Handle: <b>{handle}</b>\n\n"
-        f"Шаг 2/3: Как называется канал?\n"
-        f"Например: <i>Финансы для людей</i>",
+        f"Не смог прочитать канал автоматически (закрытый или недоступен).\n"
+        f"Как он называется?",
         parse_mode=ParseMode.HTML,
         reply_markup=_add_cancel_kb(),
     )
@@ -503,17 +540,12 @@ async def cmd_add_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получает название канала."""
-    context.user_data["new_channel"]["name"] = update.message.text.strip()
-    await update.message.reply_text(
-        f"✅ Название сохранено.\n\n"
-        f"Шаг 3/3: <b>Тема канала</b> — о чём пишем?\n"
-        f"Например: <i>личные финансы, инвестиции, сбережения</i>\n\n"
-        f"<i>Тон, источники тем и картинки настроятся автоматически.</i>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=_add_cancel_kb(),
-    )
-    return ADD_TOPIC
+    """Получает название канала вручную (только если не удалось прочитать автоматически).
+    Тему руками НЕ спрашиваем — переходим сразу к типу."""
+    name = update.message.text.strip()
+    context.user_data["new_channel"]["name"] = name
+    await _ask_channel_type(update.message, context.user_data["new_channel"]["channel_id"], name)
+    return ADD_CHANNEL_TYPE
 
 
 async def cmd_add_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -821,18 +853,7 @@ async def _finalize_new_channel(query, context: ContextTypes.DEFAULT_TYPE, count
     # Добавляем вечнозелёные темы в БД (для контент-каналов)
     buffer.add_evergreen_topics(ch["channel_id"], ch.get("evergreen_topics", []))
 
-    rss_count = len(ch.get("rss_sources", []))
-    eg_count = len(ch.get("evergreen_topics", []))
     ch_type_label = "🛍 Маркетплейс" if channel_type == "marketplace" else "📝 Контент"
-
-    # Строка про авто-определённый стиль и источник тем (для контент-каналов)
-    meta_line = ""
-    if channel_type == "content":
-        from archetypes import ARCHETYPE_LABELS
-        arch_label = ARCHETYPE_LABELS.get(ch.get("archetype", "default"), ch.get("archetype", "default"))
-        src_label = "🌐 веб-поиск" if ch.get("topic_source") == "search" else "📡 RSS"
-        meta_line = f"Стиль: {arch_label}\nИсточник тем: {src_label}\n"
-
     channel_id_added = ch['channel_id']
     await query.edit_message_text(
         f"🎉 <b>Канал добавлен!</b>\n\n"
@@ -840,12 +861,9 @@ async def _finalize_new_channel(query, context: ContextTypes.DEFAULT_TYPE, count
         f"Название: {ch['name']}\n"
         f"Тип: {ch_type_label}\n"
         f"Тема: {ch.get('topic', '—')}\n"
-        f"Постов в день: {count}\n"
-        + meta_line
-        + (f"RSS-источников: {rss_count}\nВечнозелёных тем: {eg_count}\n" if channel_type == "content" else "") +
-        f"\n⏸ Автопубликация <b>выключена</b> — включи расписание:\n"
-        f"<code>/schedule {channel_id_added} 09 12 16 20</code>\n"
-        f"\n⚠️ Добавь бота администратором в <code>{channel_id_added}</code>",
+        f"\n⚠️ <b>Добавь бота администратором</b> в <code>{channel_id_added}</code> — "
+        f"без этого он не сможет публиковать.\n"
+        f"Расписание включается в настройках канала.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("⚡ Сгенерировать первые посты", callback_data=f"ui:ch_generate:{channel_id_added}")],
             [InlineKeyboardButton("⚙️ Настройки канала",           callback_data=f"ui:ch_settings:{channel_id_added}")],
@@ -1552,19 +1570,41 @@ async def handle_add_channel_type(update: Update, context: ContextTypes.DEFAULT_
         ch.setdefault("use_images", True)
 
         await query.edit_message_text(
-            "⏳ Настраиваю канал: подбираю источники тем, вечнозелёные темы и стиль…"
+            "⏳ Анализирую канал: определяю тему, источники и стиль…"
         )
 
+        # Тему выводим ИЗ АНАЛИЗА ПОСТОВ канала (не из ручного ввода — защита от
+        # обхода фильтров). Если канал прочитать не удалось — тема пустая, юзер
+        # подберёт её позже кнопкой «🔄 Подобрать тему заново» в настройках.
+        posts = context.user_data.get("_add_posts") or []
+        if posts:
+            try:
+                from channel_analyzer import analyzer, normalize_meta
+                analysis = await analyzer.analyze_posts(
+                    ch.get("name", ""), posts, about=context.user_data.get("_add_about", "")
+                )
+                ch["topic"] = (analysis.get("topic") or "").strip()
+                arch, src = normalize_meta(analysis.get("archetype"), analysis.get("topic_source"))
+                ch["archetype"] = arch
+                ch.setdefault("topic_source", src)
+            except Exception as e:
+                logger.warning(f"Анализ темы при /add не удался [{ch['channel_id']}]: {e}")
+        ch.setdefault("topic", "")
+
         from ai_client import suggest_rss_sources, suggest_evergreen_topics
-        try:
-            ch["rss_sources"] = await suggest_rss_sources(ch["topic"], ch.get("name", ""))
-        except Exception as e:
-            logger.warning(f"Авто-RSS не удалось [{ch['channel_id']}]: {e}")
+        if ch.get("topic"):
+            try:
+                ch["rss_sources"] = await suggest_rss_sources(ch["topic"], ch.get("name", ""))
+            except Exception as e:
+                logger.warning(f"Авто-RSS не удалось [{ch['channel_id']}]: {e}")
+                ch.setdefault("rss_sources", [])
+            try:
+                ch["evergreen_topics"] = await suggest_evergreen_topics(ch["topic"], count=8)
+            except Exception as e:
+                logger.warning(f"Авто-evergreen не удалось [{ch['channel_id']}]: {e}")
+                ch.setdefault("evergreen_topics", [])
+        else:
             ch.setdefault("rss_sources", [])
-        try:
-            ch["evergreen_topics"] = await suggest_evergreen_topics(ch["topic"], count=8)
-        except Exception as e:
-            logger.warning(f"Авто-evergreen не удалось [{ch['channel_id']}]: {e}")
             ch.setdefault("evergreen_topics", [])
 
         # Кол-во постов в день по умолчанию (меняется в карточке канала)
