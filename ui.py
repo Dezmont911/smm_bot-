@@ -92,6 +92,16 @@ def _load_channels(include_inactive: bool = False, owner_id: int | None = None) 
     return channels
 
 
+def _folders(owner_id: int | None) -> list[str]:
+    """Список папок (непустые `folder`) среди каналов владельца, отсортирован."""
+    seen = set()
+    for c in _load_channels(include_inactive=True, owner_id=owner_id):
+        f = (c.get("folder") or "").strip()
+        if f:
+            seen.add(f)
+    return sorted(seen)
+
+
 def _safe_slug(channel_id: str) -> str:
     """Безопасное имя файла из handle (защита от path traversal)."""
     cleaned = re.sub(r"[^A-Za-z0-9_-]", "", channel_id.lstrip("@"))
@@ -258,16 +268,30 @@ async def screen_channels(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0)
     channels = [c for c in _load_channels(include_inactive=True, owner_id=_acting_uid(qm))
                 if c.get("active", True)]
 
-    # Верхние кнопки-действия (как в референсе)
+    # Фильтр по папке (из user_data): None=все, "__none__"=без папки, иначе имя папки
+    folder = context.user_data.get("chfolder")
+    if folder == "__none__":
+        channels = [c for c in channels if not (c.get("folder") or "").strip()]
+    elif folder:
+        channels = [c for c in channels if (c.get("folder") or "").strip() == folder]
+
+    # Верхние кнопки-действия
     top = [
         InlineKeyboardButton("➕ Добавить",   callback_data="add_start"),
         InlineKeyboardButton("🔍 Поиск",      callback_data="ui:ch_search"),
         InlineKeyboardButton("🗑 Удалённые",  callback_data="ui:ch_deleted:0"),
     ]
+    folder_row = [InlineKeyboardButton("📁 Папки", callback_data="ui:folders")]
+    if folder:  # внутри папки — кнопка сброса фильтра
+        folder_row.append(InlineKeyboardButton("📋 Все каналы", callback_data="ui:chfold:all"))
+
+    folder_title = (
+        f" · 📂 без папки" if folder == "__none__" else (f" · 📁 {folder}" if folder else "")
+    )
 
     if not channels:
-        kb = InlineKeyboardMarkup([top, [InlineKeyboardButton("◀️ Меню", callback_data="ui:main")]])
-        await _answer_or_send(qm, "📋 <b>Мои каналы</b>\n\nАктивных каналов нет.", kb)
+        kb = InlineKeyboardMarkup([top, folder_row, [InlineKeyboardButton("◀️ Меню", callback_data="ui:main")]])
+        await _answer_or_send(qm, f"📋 <b>Мои каналы</b>{folder_title}\n\nКаналов нет.", kb)
         return
 
     total = len(channels)
@@ -275,7 +299,7 @@ async def screen_channels(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0)
     page = max(0, min(page, pages - 1))
     chunk = channels[page * CHANNELS_PAGE_SIZE:(page + 1) * CHANNELS_PAGE_SIZE]
 
-    buttons = [top]
+    buttons = [top, folder_row]
     for ch in chunk:
         buttons.append([_channel_button(ch)])
 
@@ -289,7 +313,7 @@ async def screen_channels(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0)
 
     buttons.append([InlineKeyboardButton("◀️ Меню", callback_data="ui:main")])
 
-    header = f"📋 <b>Мои каналы</b> ({total})"
+    header = f"📋 <b>Мои каналы</b> ({total}){folder_title}"
     if pages > 1:
         header += f" · стр. {page + 1}/{pages}"
     legend = "🟢 публикует · ⏸ пауза (РСЯ вкл) · 🔴 остановлен"
@@ -375,6 +399,47 @@ async def screen_channels_search(qm, context: ContextTypes.DEFAULT_TYPE, query: 
     else:
         text = f"🔍 По «{query}» ничего не найдено."
     await _answer_or_send(qm, text, InlineKeyboardMarkup(buttons))
+
+
+async def screen_folders(qm, context: ContextTypes.DEFAULT_TYPE):
+    """Обзор папок: все каналы / по папкам / без папки. Выбор → фильтрует список."""
+    uid = _acting_uid(qm)
+    allch = [c for c in _load_channels(include_inactive=True, owner_id=uid) if c.get("active", True)]
+    folders = _folders(uid)
+    nofolder = sum(1 for c in allch if not (c.get("folder") or "").strip())
+
+    rows = [[InlineKeyboardButton(f"📋 Все каналы ({len(allch)})", callback_data="ui:chfold:all")]]
+    for i, f in enumerate(folders):
+        cnt = sum(1 for c in allch if (c.get("folder") or "").strip() == f)
+        rows.append([InlineKeyboardButton(f"📁 {f} ({cnt})", callback_data=f"ui:chfold:{i}")])
+    if nofolder:
+        rows.append([InlineKeyboardButton(f"📂 Без папки ({nofolder})", callback_data="ui:chfold:none")])
+    rows.append([InlineKeyboardButton("◀️ К каналам", callback_data="ui:channels")])
+
+    hint = ("Каналы раскидываются по папкам в настройках канала → «📁 Папка»."
+            if folders else
+            "Папок пока нет. Зайди в любой канал → ⚙️ Настройки → «📁 Папка» и создай папку.")
+    await _answer_or_send(qm, f"📁 <b>Папки</b>\n\n{hint}", InlineKeyboardMarkup(rows))
+
+
+async def screen_set_folder(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
+    """Назначение папки каналу: выбрать существующую / новая / убрать."""
+    ch = _load_channel(handle)
+    if not ch:
+        return
+    cur = (ch.get("folder") or "").strip()
+    folders = _folders(_acting_uid(qm))
+    rows = []
+    for i, f in enumerate(folders):
+        mark = "✅ " if f == cur else "📁 "
+        rows.append([InlineKeyboardButton(f"{mark}{f}", callback_data=f"ui:ch_setfold:{handle}:{i}")])
+    rows.append([InlineKeyboardButton("➕ Новая папка", callback_data=f"ui:ch_newfold:{handle}")])
+    if cur:
+        rows.append([InlineKeyboardButton("🚫 Убрать из папки", callback_data=f"ui:ch_setfold:{handle}:none")])
+    rows.append([InlineKeyboardButton("◀️ К настройкам", callback_data=f"ui:ch_settings:{handle}")])
+    text = (f"📁 <b>Папка канала</b> <code>{handle}</code>\n\n"
+            f"Текущая: <b>{cur or 'нет'}</b>\n\nВыбери папку или создай новую.")
+    await _answer_or_send(qm, text, InlineKeyboardMarkup(rows))
 
 
 async def screen_channel_card(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
@@ -508,6 +573,7 @@ async def screen_channel_settings(qm, context: ContextTypes.DEFAULT_TYPE, handle
     src_mode_short = "Авто (веб-поиск)" if ch.get("topic_source") == "search" else "по лентам"
     rows = [
         [InlineKeyboardButton(f"🔄 Тема (подобрать заново): {topic[:25]}", callback_data=f"ui:ch_topic_redo:{channel_id}")],
+        [InlineKeyboardButton(f"📁 Папка: {(ch.get('folder') or 'нет')[:25]}", callback_data=f"ui:ch_folder:{channel_id}")],
         [InlineKeyboardButton(f"📅 Расписание: {sched_str}", callback_data=f"ui:ch_schedule:{channel_id}")],
         [InlineKeyboardButton(f"📏 Длина поста: {post_len}",    callback_data=f"ui:ch_set:{channel_id}:post_length")],
         [InlineKeyboardButton(f"🖼 Картинки: {img_str}",        callback_data=f"ui:ch_images_toggle:{channel_id}")],
@@ -2086,14 +2152,28 @@ async def handle_settings_text_input(update: Update, context: ContextTypes.DEFAU
             await update.message.reply_text("⚠️ Не понял. Напиши названия через запятую.")
             return True
 
+    elif field == "folder":
+        name = re.sub(r"\s+", " ", text).strip()[:40]
+        if not name or name.lower() in ("нет", "убрать", "очистить"):
+            ch.pop("folder", None)
+            success_msg = "✅ Канал убран из папки."
+        else:
+            ch["folder"] = name
+            success_msg = f"✅ Канал в папке: <b>{name}</b>"
+
     if success_msg:
         _save_channel(ch)
         context.user_data.pop("editing", None)
-        # Для расписания — возвращаем на экран расписания, иначе на настройки
+        # Для расписания — возвращаем на экран расписания, для папки — на экран папки
         if field == "schedule_add":
             kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("📅 К расписанию", callback_data=f"ui:ch_schedule:{handle}"),
                 InlineKeyboardButton("◀️ К каналу",     callback_data=f"ui:ch:{handle}"),
+            ]])
+        elif field == "folder":
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("📁 Папка канала", callback_data=f"ui:ch_folder:{handle}"),
+                InlineKeyboardButton("⚙️ К настройкам", callback_data=f"ui:ch_settings:{handle}"),
             ]])
         else:
             kb = InlineKeyboardMarkup([[
@@ -2479,8 +2559,57 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await screen_main(query, context)
 
     elif action == "channels":
+        # Вход из меню (без страницы) сбрасывает фильтр папки; пагинация — сохраняет
+        if len(parts) < 3:
+            context.user_data.pop("chfolder", None)
         page = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 0
         await screen_channels(query, context, page)
+
+    elif action == "folders":
+        await screen_folders(query, context)
+
+    elif action == "chfold" and len(parts) >= 3:
+        sel = parts[2]
+        if sel == "all":
+            context.user_data.pop("chfolder", None)
+        elif sel == "none":
+            context.user_data["chfolder"] = "__none__"
+        else:
+            folders = _folders(uid)
+            idx = int(sel) if sel.isdigit() else -1
+            if 0 <= idx < len(folders):
+                context.user_data["chfolder"] = folders[idx]
+            else:
+                context.user_data.pop("chfolder", None)
+        await screen_channels(query, context, 0)
+
+    elif action == "ch_folder" and len(parts) >= 3:
+        await screen_set_folder(query, context, parts[2])
+
+    elif action == "ch_setfold" and len(parts) >= 4:
+        handle = parts[2]
+        ch = _load_channel(handle)
+        if ch:
+            sel = parts[3]
+            if sel == "none":
+                ch.pop("folder", None)
+            else:
+                folders = _folders(uid)
+                idx = int(sel) if sel.isdigit() else -1
+                if 0 <= idx < len(folders):
+                    ch["folder"] = folders[idx]
+            _save_channel(ch)
+        await screen_set_folder(query, context, handle)
+
+    elif action == "ch_newfold" and len(parts) >= 3:
+        handle = parts[2]
+        context.user_data["editing"] = {"handle": handle, "field": "folder"}
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data=f"ui:ch_folder:{handle}")]])
+        await _answer_or_send(
+            query,
+            "➕ <b>Новая папка</b>\n\nНапиши название папки (напр. <i>Факты</i>, <i>Анеки</i>):",
+            kb,
+        )
 
     elif action == "ch_search":
         await prompt_channel_search(query, context)
