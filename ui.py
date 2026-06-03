@@ -503,7 +503,7 @@ async def screen_channel_settings(qm, context: ContextTypes.DEFAULT_TYPE, handle
 
     src_mode_short = "Авто (веб-поиск)" if ch.get("topic_source") == "search" else "по лентам"
     rows = [
-        [InlineKeyboardButton(f"📌 Тема: {topic[:35]}", callback_data=f"ui:ch_set:{channel_id}:topic")],
+        [InlineKeyboardButton(f"🔄 Тема (подобрать заново): {topic[:25]}", callback_data=f"ui:ch_topic_redo:{channel_id}")],
         [InlineKeyboardButton(f"📅 Расписание: {sched_str}", callback_data=f"ui:ch_schedule:{channel_id}")],
         [InlineKeyboardButton(f"🔢 Постов в день: {posts_day}", callback_data=f"ui:ch_set:{channel_id}:posts_count")],
         [InlineKeyboardButton(f"📏 Длина поста: {post_len}",    callback_data=f"ui:ch_set:{channel_id}:post_length")],
@@ -1721,8 +1721,10 @@ async def action_rss_ai_confirm(qm, context: ContextTypes.DEFAULT_TYPE, handle: 
 # ── Редактирование настроек ───────────────────────────────────────────────
 
 # Конфиг редактируемых полей: field_key → (заголовок, подсказка, тип)
+# ВАЖНО: «topic» НАМЕРЕННО убран из ручного редактирования — тему нельзя вписывать
+# руками (это был вектор обхода фильтров). Тема выводится ИИ из анализа канала
+# (кнопка «🔄 Подобрать тему заново» → action_rederive_topic).
 EDITABLE_FIELDS = {
-    "topic":       ("📌 Тема канала",        "Введи новую тему канала\nНапример: <i>Майнкрафт советы и новости</i>",      "text"),
     "tone":        ("🎨 Тон общения",         "Введи желаемый тон\nНапример: <i>дружелюбный, с юмором, без снобизма</i>", "text"),
     "schedule":    ("📅 Расписание",          "Введи часы публикации МСК через пробел\nНапример: <code>9 12 16 20</code>",  "schedule"),
     "posts_count": ("🔢 Постов в день",       "Введи число постов в день (от 1 до 30)\nНапример: <code>10</code>",         "int"),
@@ -1732,6 +1734,67 @@ EDITABLE_FIELDS = {
     "forbidden":   ("🚫 Запрещённые темы",    "Глобальные запретки (политика, 18+, война, скам и др.) действуют всегда.\nЗдесь добавь СВОИ доп. темы через запятую.\nНапиши <b>нет</b> чтобы убрать доп. список.", "text_list"),
     "wb_categories":("📦 Категории WB",       "Перечисли категории через запятую\nНапример: <code>кроссовки, наушники</code>\nНапиши <b>все</b> чтобы убрать фильтр.", "text_list_or_clear"),
 }
+
+
+async def action_rederive_topic(qm, context, handle: str):
+    """🔄 Подобрать тему заново: читает посты канала юзерботом и выводит тему через ИИ.
+    Тему руками не задают — поэтому обойти фильтры через тему-фритекст нельзя."""
+    from telegram import CallbackQuery
+    ch = _load_channel(handle)
+    if not ch:
+        return
+    back = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К настройкам", callback_data=f"ui:ch_settings:{handle}")]])
+
+    async def _show(text: str, kb=back):
+        """Показ результата без повторного answer (qm уже отвечен)."""
+        try:
+            await qm.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception:
+            try:
+                await qm.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            except Exception:
+                pass
+
+    if isinstance(qm, CallbackQuery):
+        await qm.answer("🔎 Анализирую канал…")
+    await _show(f"🔎 <b>Анализирую {handle}…</b>\n\nЧитаю посты и определяю тему. ~10–20 сек.", None)
+
+    try:
+        from userbot_reader import read_channel
+        from channel_analyzer import analyzer, normalize_meta
+        from ai_client import _contains_forbidden
+        data = await read_channel(handle, limit=50)
+    except Exception as e:
+        await _show(f"❌ Не смог прочитать {handle}.\n\nКанал должен быть публичным. ({type(e).__name__})")
+        return
+
+    try:
+        analysis = await analyzer.analyze_posts(
+            data.get("title", handle), data.get("posts", []), about=data.get("about", "")
+        )
+    except ValueError as e:
+        await _show(f"⚠️ Мало постов для анализа: {e}")
+        return
+    except Exception as e:
+        await _show(f"❌ Ошибка анализа: {type(e).__name__}")
+        return
+
+    new_topic = (analysis.get("topic") or "").strip()
+    if not new_topic:
+        await _show("⚠️ Не удалось определить тему по постам канала.")
+        return
+
+    ch["topic"] = new_topic
+    if ch.get("channel_type") != "marketplace":
+        arch, src = normalize_meta(analysis.get("archetype"), analysis.get("topic_source"))
+        ch["archetype"] = arch
+    _save_channel(ch)
+    logger.info(f"Тема канала {handle} переопределена ИИ: {new_topic[:60]}")
+
+    warn = ""
+    if _contains_forbidden(new_topic):
+        warn = "\n\n⚠️ Похоже, канал на запрещённую тематику — автогенерация будет недоступна."
+    await _show(f"✅ <b>Тема обновлена по анализу канала:</b>\n\n📌 {new_topic}{warn}")
 
 
 async def screen_edit_field(qm, context, handle: str, field: str):
@@ -1887,8 +1950,12 @@ async def handle_settings_text_input(update: Update, context: ContextTypes.DEFAU
         return True
 
     if field == "topic":
-        ch["topic"] = text
-        success_msg = f"✅ Тема обновлена: <i>{text}</i>"
+        # Тему руками не задаём — её выводит ИИ из анализа канала (защита от обхода фильтров)
+        await update.message.reply_text(
+            "✋ Тему нельзя вписывать вручную. Открой настройки канала и нажми "
+            "«🔄 Подобрать тему заново» — ИИ определит тему по постам канала."
+        )
+        return True
 
     elif field == "tone":
         ch["tone"] = text
@@ -2374,6 +2441,10 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "ch_settings" and len(parts) >= 3:
         handle = parts[2]
         await screen_channel_settings(query, context, handle)
+
+    elif action == "ch_topic_redo" and len(parts) >= 3:
+        handle = parts[2]
+        await action_rederive_topic(query, context, handle)
 
     elif action == "ch_pause" and len(parts) >= 3:
         handle = parts[2]

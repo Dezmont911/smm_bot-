@@ -1666,10 +1666,15 @@ async def handle_channel_actions(update: Update, context: ContextTypes.DEFAULT_T
         )
 
     elif action == "settopic":
-        context.user_data["settopic_channel"] = channel_id
+        # Тему руками больше не задаём — её выводит ИИ из анализа канала.
+        context.user_data.pop("settopic_channel", None)
         await query.message.reply_text(
-            f"✏️ Пришли новую тему для канала <b>{channel_id}</b>:",
+            "✋ Тему нельзя вписывать вручную — её определяет ИИ по постам канала.\n"
+            "Открой <b>настройки канала</b> и нажми «🔄 Подобрать тему заново».",
             parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⚙️ Настройки канала", callback_data=f"ui:ch_settings:{channel_id}")
+            ]]),
         )
 
 
