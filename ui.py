@@ -292,7 +292,8 @@ async def screen_channels(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0)
     header = f"📋 <b>Мои каналы</b> ({total})"
     if pages > 1:
         header += f" · стр. {page + 1}/{pages}"
-    await _answer_or_send(qm, f"{header}\n\n🔵 публикует · ⚪️ на паузе", InlineKeyboardMarkup(buttons))
+    legend = "🟢 публикует · ⏸ пауза (РСЯ вкл) · 🔴 остановлен"
+    await _answer_or_send(qm, f"{header}\n\n{legend}", InlineKeyboardMarkup(buttons))
 
 
 async def screen_channels_deleted(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
