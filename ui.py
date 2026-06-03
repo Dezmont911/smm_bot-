@@ -1839,8 +1839,13 @@ async def action_rederive_topic(qm, context, handle: str):
         analysis = await analyzer.analyze_posts(
             data.get("title", handle), data.get("posts", []), about=data.get("about", "")
         )
-    except ValueError as e:
-        await _show(f"⚠️ Мало постов для анализа: {e}")
+    except ValueError:
+        await _show(
+            "📭 <b>В канале пока нет/мало постов</b> для определения темы.\n\n"
+            "Тему бот определяет <b>только по реальным постам канала</b> "
+            "(название не в счёт — оно может быть любым).\n\n"
+            "Выложи в канал хотя бы 3 поста с текстом и нажми «🔄 Подобрать тему заново»."
+        )
         return
     except Exception as e:
         await _show(f"❌ Ошибка анализа: {type(e).__name__}")
