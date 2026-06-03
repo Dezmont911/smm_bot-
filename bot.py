@@ -379,6 +379,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Встроенная справка по разделам бота."""
+    if not has_access(update.effective_user.id):
+        return
+    from ui import screen_help
+    await screen_help(update.message, context)
+
+
 async def _try_invite_code_text(update, context):
     """Незарегистрированный прислал текст — пробуем как инвайт-код."""
     code = (update.message.text or "").strip()
@@ -3924,6 +3932,7 @@ def main():
 
     # --- Команды ---
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("status", cmd_status))
@@ -4013,6 +4022,17 @@ def main():
     async def on_startup(application):
         """Запускается после старта бота — инициализируем постер и планировщик."""
         poster.set_bot(application.bot)
+
+        # Синее меню команд Telegram (заметность для тестеров)
+        try:
+            from telegram import BotCommand
+            await application.bot.set_my_commands([
+                BotCommand("start", "Меню / регистрация по инвайту"),
+                BotCommand("help", "Справка — что умеет бот"),
+                BotCommand("status", "Состояние очередей каналов"),
+            ])
+        except Exception as e:
+            logger.warning(f"set_my_commands не удалось: {e}")
 
         # job_defaults применяются ко ВСЕМ задачам — защита от рестартов/простоя:
         #   coalesce=True       — после простоя пропущенные запуски схлопываются в один
