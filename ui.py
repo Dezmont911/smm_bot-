@@ -216,15 +216,18 @@ async def screen_main(qm, context: ContextTypes.DEFAULT_TYPE):
         f"📬 Постов в очереди: <b>{total_posts}</b> {buf_icon}"
     )
 
-    kb = InlineKeyboardMarkup([
+    rows = [
         [
             InlineKeyboardButton("📋 Мои каналы", callback_data="ui:channels"),
             InlineKeyboardButton("📊 Статус",     callback_data="ui:status"),
         ],
         [InlineKeyboardButton("📝 Очередь постов", callback_data="ui:queue")],
         [InlineKeyboardButton("➕ Добавить канал",  callback_data="add_start")],
-    ])
-    await _answer_or_send(qm, text, kb)
+    ]
+    # Админ-панель — только для главного владельца (superadmin)
+    if accounts.is_superadmin(_acting_uid(qm)):
+        rows.append([InlineKeyboardButton("👑 Админ-панель", callback_data="ui:admin")])
+    await _answer_or_send(qm, text, InlineKeyboardMarkup(rows))
 
 
 CHANNELS_PAGE_SIZE = 10
@@ -2309,6 +2312,88 @@ async def handle_img_test_input(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# АДМИН-ПАНЕЛЬ (только superadmin) — инвайты и пользователи по кнопкам
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def screen_admin(qm, context: ContextTypes.DEFAULT_TYPE):
+    """Меню админа: создать инвайт, список тестеров."""
+    users = accounts.list_users()
+    text = (
+        "👑 <b>Админ-панель</b>\n\n"
+        f"Зарегистрировано тестеров: <b>{len(users)}</b>\n\n"
+        "🎟 Инвайт-ссылка <b>одноразовая</b> (на N человек): кто первый откроет — "
+        "тот и зарегистрируется. Отправляй её тестеру <b>лично</b>."
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎟 Инвайт (1 чел · 30 дней)", callback_data="ui:adm_inv:1:30")],
+        [InlineKeyboardButton("🎟 Инвайт (5 чел · 30 дней)", callback_data="ui:adm_inv:5:30")],
+        [InlineKeyboardButton(f"👥 Пользователи ({len(users)})", callback_data="ui:adm_users")],
+        [InlineKeyboardButton("◀️ В меню", callback_data="ui:main")],
+    ])
+    await _answer_or_send(qm, text, kb)
+
+
+async def action_admin_invite(qm, context, uses: int, days: int):
+    """Создаёт инвайт-код и показывает готовую ссылку."""
+    code = accounts.gen_invite(plan="trial", days=days, max_uses=uses, created_by=_acting_uid(qm))
+    try:
+        bot_username = (await context.bot.get_me()).username
+        link = f"https://t.me/{bot_username}?start={code}"
+    except Exception:
+        link = f"(?start={code})"
+    text = (
+        "🎟 <b>Инвайт создан</b>\n\n"
+        f"План: <b>trial</b> · {days} дней · использований: <b>{uses}</b>\n\n"
+        f"Ссылка (нажми, чтобы скопировать):\n<code>{link}</code>\n\n"
+        f"⚠️ Зарегистрируются первые <b>{uses}</b>, кто откроет ссылку. Отправь её лично."
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎟 Ещё инвайт", callback_data="ui:admin")],
+        [InlineKeyboardButton("◀️ Админ-панель", callback_data="ui:admin")],
+    ])
+    await _answer_or_send(qm, text, kb)
+
+
+async def screen_admin_users(qm, context: ContextTypes.DEFAULT_TYPE):
+    """Список тестеров: план, остаток триала, кнопки выдать PRO / закрыть доступ."""
+    users = accounts.list_users()
+    if not users:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Админ-панель", callback_data="ui:admin")]])
+        await _answer_or_send(qm, "👥 <b>Тестеры</b>\n\nПока никто не зарегистрировался.", kb)
+        return
+    lines = ["👥 <b>Тестеры</b>\n"]
+    rows = []
+    for u in users[:20]:
+        uid = u["user_id"]
+        plan = accounts.effective_plan(uid)
+        left = accounts.trial_days_left(uid)
+        left_s = f" · осталось {left}д" if left is not None else ""
+        lines.append(f"• <code>{uid}</code> — <b>{plan}</b>{left_s}")
+        rows.append([
+            InlineKeyboardButton(f"🔼 PRO 30д · {uid}", callback_data=f"ui:adm_pro:{uid}"),
+            InlineKeyboardButton("⛔ Доступ", callback_data=f"ui:adm_revoke:{uid}"),
+        ])
+    rows.append([InlineKeyboardButton("◀️ Админ-панель", callback_data="ui:admin")])
+    await _answer_or_send(qm, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+async def action_admin_revoke(qm, context, uid: str):
+    try:
+        accounts.revoke_user(int(uid))
+    except Exception:
+        pass
+    await screen_admin_users(qm, context)
+
+
+async def action_admin_pro(qm, context, uid: str):
+    try:
+        accounts.set_plan(int(uid), "pro", days=30)
+    except Exception:
+        pass
+    await screen_admin_users(qm, context)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ГЛАВНЫЙ РОУТЕР — обрабатывает все ui:* callback
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2330,6 +2415,23 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "noop":
         await query.answer()
+        return
+
+    # 👑 Админ-действия — только для главного владельца (superadmin)
+    if action in ("admin", "adm_inv", "adm_users", "adm_revoke", "adm_pro"):
+        if not accounts.is_superadmin(uid):
+            await query.answer("Только для владельца.", show_alert=True)
+            return
+        if action == "admin":
+            await screen_admin(query, context)
+        elif action == "adm_inv" and len(parts) >= 4:
+            await action_admin_invite(query, context, int(parts[2]), int(parts[3]))
+        elif action == "adm_users":
+            await screen_admin_users(query, context)
+        elif action == "adm_revoke" and len(parts) >= 3:
+            await action_admin_revoke(query, context, parts[2])
+        elif action == "adm_pro" and len(parts) >= 3:
+            await action_admin_pro(query, context, parts[2])
         return
 
     # 🔒 Гард владельца (линчпин изоляции): если действие адресует конкретный канал
