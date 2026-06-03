@@ -331,6 +331,10 @@ def _parse_post_length(post_length: str) -> tuple[str, int]:
         lo = int(m.group(1))
         hi = int(m.group(2)) if m.group(2) else lo
         hi = max(lo, hi)
+        # Пол: не меньше 10 слов — защита от 0/слишком мало (иначе Claude пишет
+        # пусто, пост бракуется детектором отказов → 0 постов впустую).
+        hi = max(hi, 10)
+        lo = max(min(lo, hi), 10) if lo else hi
         label = (f"{lo}–{hi} слов" if m.group(2) else f"около {lo} слов") + \
                 f" (СТРОГО не больше {hi} слов)"
         max_tokens = min(1024, max(120, hi * 8))

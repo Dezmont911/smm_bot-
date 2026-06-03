@@ -2092,6 +2092,17 @@ async def handle_settings_text_input(update: Update, context: ContextTypes.DEFAU
             return True
 
     elif field == "post_length":
+        # Если задано число/диапазон (слова) — не меньше 10. Текстовые форматы пропускаем.
+        m = re.fullmatch(r"(\d+)\s*(?:[-–—]\s*(\d+))?\s*(?:слов\w*)?", text.strip(), re.IGNORECASE)
+        if m:
+            lo = int(m.group(1)); hi = int(m.group(2)) if m.group(2) else lo
+            if max(lo, hi) < 10:
+                await update.message.reply_text(
+                    "⚠️ Слишком мало — минимум <b>10 слов</b>.\n"
+                    "Напр.: <code>100-200</code> или <code>150</code>.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return True
         ch["post_length"] = text
         success_msg = f"✅ Длина поста: <i>{text}</i>"
 
