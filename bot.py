@@ -193,11 +193,16 @@ def load_all_channels() -> list[dict]:
 
 
 def format_post_message(post: dict, index: int = 0, total: int = 0) -> str:
-    """Форматирует сообщение с постом для просмотра админом."""
-    channel_id = post.get("channel_id", "?")
-    fmt = post.get("format", "?")
-    topic = post.get("topic", "")[:60]
-    content = post.get("content", "")
+    """Форматирует сообщение с постом для просмотра админом.
+    Подпись — HTML, поэтому plain/Markdown-контент ЭКРАНИРУЕМ (иначе `<`/`&` в тексте
+    ломают парсинг и карточка не отправляется). HTML-контент (WB) оставляем как есть."""
+    import html as _html
+    channel_id = _html.escape(post.get("channel_id", "?") or "?")
+    fmt = _html.escape(post.get("format", "?") or "?")
+    topic = _html.escape((post.get("topic", "") or "")[:60])
+    content = post.get("content", "") or ""
+    if (post.get("parse_mode") or "").lower() != "html":
+        content = _html.escape(content)
     mt = post.get("media_type")
     if mt == "album":
         has_image = "🖼 Альбом"
@@ -863,12 +868,20 @@ async def _finalize_new_channel(query, context: ContextTypes.DEFAULT_TYPE, count
 
     ch_type_label = "🛍 Маркетплейс" if channel_type == "marketplace" else "📝 Контент"
     channel_id_added = ch['channel_id']
+    topic_now = (ch.get("topic") or "").strip()
+    # Тему не удалось вывести (в канале мало постов) — честно предупреждаем
+    topic_line = (
+        f"Тема: {topic_now}\n" if topic_now else
+        "Тема: <b>не определена</b> (в канале мало постов для анализа)\n"
+        "→ добавь постов в канал и нажми «🔄 Подобрать тему заново» в настройках; "
+        "без темы автогенерация не запустится.\n"
+    ) if channel_type == "content" else ""
     await query.edit_message_text(
         f"🎉 <b>Канал добавлен!</b>\n\n"
         f"Handle: {channel_id_added}\n"
         f"Название: {ch['name']}\n"
         f"Тип: {ch_type_label}\n"
-        f"Тема: {ch.get('topic', '—')}\n"
+        f"{topic_line}"
         f"\n⚠️ <b>Добавь бота администратором</b> в <code>{channel_id_added}</code> — "
         f"без этого он не сможет публиковать.\n"
         f"Расписание включается в настройках канала.",
@@ -2099,7 +2112,15 @@ async def _send_post_card(message, channel_id: str, index: int, context=None):
             "🖼 Есть картинка",
             "⚠️ Картинка недоступна (перегенерируется при публикации)",
         )
-    await message.reply_text(caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+    # Подстраховка: если HTML-подпись всё же не распарсилась — шлём как обычный текст,
+    # чтобы карточка не «пропадала» молча (ошибка уходила в error_handler).
+    try:
+        await message.reply_text(caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception as e:
+        logger.warning(f"Карточка поста: HTML не распарсился ({e}) — шлю как plain")
+        import re as _re
+        plain = _re.sub(r"<[^>]+>", "", caption)
+        await message.reply_text(plain, reply_markup=kb)
 
 
 async def _open_post_card_by_id(message, post_id: str, context=None):
