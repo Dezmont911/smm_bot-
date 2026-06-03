@@ -2676,7 +2676,7 @@ async def handle_img_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             with db.connect() as conn:
                 row = conn.execute(
-                    "SELECT topic, channel_id FROM posts WHERE id = ?", (post_id,)
+                    "SELECT topic, content, channel_id FROM posts WHERE id = ?", (post_id,)
                 ).fetchone()
             if not row:
                 raise ValueError("Пост не найден")
@@ -2685,8 +2685,11 @@ async def handle_img_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             channels = load_all_channels()
             channel = next((c for c in channels if c["channel_id"] == row["channel_id"]), {})
+            # Картинку подбираем по ТЕКСТУ поста (а не по теме) — иначе «Вечнозелёные
+            # темы» давало лес. Фолбэк на тему, если контент пуст.
+            image_basis = (row["content"] or "").strip()[:500] or row["topic"]
             new_url = await fetch_image_url(
-                topic=row["topic"],
+                topic=image_basis,
                 channel_topic=channel.get("topic", "") if channel else "",
                 subreddits=channel.get("reddit_image_subreddits") if channel else None,
                 channel_name=channel.get("name", "") if channel else "",
@@ -2750,14 +2753,17 @@ async def handle_img_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             with db.connect() as conn:
                 row = conn.execute(
-                    "SELECT topic, channel_id FROM posts WHERE id=?", (post_id,)
+                    "SELECT topic, content, channel_id FROM posts WHERE id=?", (post_id,)
                 ).fetchone()
 
             channels = load_all_channels()
             channel = next((c for c in channels if c["channel_id"] == row["channel_id"]), {})
 
+            # FLUX строит картинку по ТЕКСТУ поста (а не по теме) — «Вечнозелёные
+            # темы» давало лес. Фолбэк на тему, если контент пуст.
+            image_basis = (row["content"] or "").strip()[:500] or row["topic"]
             new_url = await generate_image(
-                topic=row["topic"],
+                topic=image_basis,
                 channel_topic=channel.get("topic", ""),
                 channel_name=channel.get("name", ""),
             )

@@ -602,6 +602,19 @@ class ContentGenerator:
         # (имплицитные Claude отсекает сам, мета-ответ ловит детектор отказов)
         topics = self._drop_forbidden_topics(channel_id, topics)
 
+        # --- Отсев «мусорных» тем: заголовки-артефакты («# Вечнозелёные темы…»),
+        # мета/отказы («Я не могу помочь…»), 18+/запретка прямо в теме. Источник 4
+        # (fallback) строится из темы канала — его не трогаем. ---
+        try:
+            from ai_client import is_valid_topic
+            before = len(topics)
+            topics = [t for t in topics
+                      if t.get("source") == "fallback" or is_valid_topic(t.get("topic", ""))]
+            if before - len(topics):
+                logger.info(f"Мусорные/мета-темы отсеяны [{channel_id}]: {before - len(topics)}")
+        except Exception as e:
+            logger.warning(f"Фильтр валидности тем пропущен: {e}")
+
         # --- Гейт релевантности: отсев off-topic тем ДО генерации (эмбеддинги) ---
         # Бьёт по дрейфу: Reddit/новости иногда дают темы не в тему канала.
         # evergreen/fallback не трогаем (они по построению на-тему). Если отсев

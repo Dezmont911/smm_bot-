@@ -114,6 +114,15 @@ _REFUSAL_MARKERS = (
     "не могу про эту",
     "слушай, я не могу",
     "я не могу писать про",
+    "не могу помочь",
+    "не могу вам помочь",
+    "не могу с этим помочь",
+    "не могу помочь с этим",
+    "не содержит конкретно",
+    "укажите конкретную тему",
+    "укажите конкретный",
+    "не могу выполнить",
+    "не могу ответить",
     "выходит за границы",
     "за границы познавательн",
     "или другой вариант",
@@ -186,13 +195,52 @@ _CONTENT_FORBIDDEN_STEMS = (
     "война", "войн", "украин", "зеленск", "путин", "дрон", "ракет", "обстрел",
     "лгбт", "трансген", "гомосек", "наркотик", "порно", "казино", "ставк на спорт",
     "мошенн", "теракт", "оружие массов",
+    # 18+/сексуальный контент (тестеры пробуют пробить цензуру)
+    "секс", "порн", "фистинг", "шлюх", "проститу", "интим", "эроти", "18+",
+    "извращ", "минет", "анал", "вагин", "член ", "оргии", "бдсм",
 )
 
 
 def _contains_forbidden(content: str) -> bool:
-    """True, если в готовом посте есть запретный контент (война/Украина/дрон/ЛГБТ и т.п.)."""
+    """True, если в готовом посте есть запретный контент (война/Украина/дрон/ЛГБТ/18+ и т.п.)."""
     low = (content or "").lower()
     return any(stem in low for stem in _CONTENT_FORBIDDEN_STEMS)
+
+
+def is_valid_topic(topic: str) -> bool:
+    """
+    True, если строка — годная ТЕМА для генерации (а не заголовок-артефакт, мета,
+    отказ или запретка). Фильтр на входе тем: не даём «# Вечнозелёные темы…»,
+    «Я не могу помочь…», «Вот список:» и т.п. попасть в очередь тем.
+    """
+    t = (topic or "").strip()
+    if len(t) < 4:
+        return False
+    low = t.lower()
+    # markdown-заголовки / код-блоки / служебные строки
+    if t.startswith(("#", "```", ">", "—", "–", "*", "•")):
+        return False
+    if low.startswith((
+        "вот ", "конечно", "готов", "держи", "пример", "темы:", "список",
+        "вечнозелёные темы", "evergreen", "here are", "here's",
+    )):
+        return False
+    if _looks_like_refusal(t):
+        return False
+    if _contains_forbidden(t):
+        return False
+    return True
+
+
+def clean_topics(lines: list[str]) -> list[str]:
+    """Очищает список тем от буллетов/нумерации и отсевает негодные (is_valid_topic)."""
+    out = []
+    for line in lines or []:
+        t = re.sub(r"^\s*[\d]+[\.\)]\s*", "", (line or "").strip())  # «1. », «2) »
+        t = t.strip("-–—•*#> ").strip()
+        if is_valid_topic(t):
+            out.append(t)
+    return out
 
 
 _SENTENCE_LEN = {
@@ -667,7 +715,8 @@ async def suggest_evergreen_topics(topic: str, count: int = 10) -> list[str]:
         max_tokens=500,
         messages=[{"role": "user", "content": prompt}],
     )
-    topics = [line.strip("–—•* ").strip() for line in raw.splitlines() if line.strip()]
+    # Отсекаем заголовки/мета/отказы/запретку — не пускаем «# Вечнозелёные темы…» в темы
+    topics = clean_topics(raw.splitlines())
     return topics[:count]
 
 

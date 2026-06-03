@@ -37,7 +37,9 @@ _WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search"}
 
 
 def _parse_topics(text: str) -> list[str]:
-    """Достаёт список тем из ответа Claude (сначала JSON-массив, потом построчно)."""
+    """Достаёт список тем из ответа Claude (сначала JSON-массив, потом построчно).
+    На выходе отсекает заголовки/мета/отказы/запретку через ai_client.clean_topics."""
+    from ai_client import clean_topics
     if not text:
         return []
     # 1) пытаемся найти JSON-массив
@@ -45,18 +47,17 @@ def _parse_topics(text: str) -> list[str]:
     if m:
         try:
             arr = json.loads(m.group())
-            topics = [str(t).strip() for t in arr if str(t).strip()]
+            topics = clean_topics([str(t) for t in arr])
             if topics:
                 return topics
         except Exception:
             pass
     # 2) фолбэк — построчно, чистим маркеры списков/нумерацию/кавычки
-    topics = []
+    lines = []
     for line in text.splitlines():
         cleaned = re.sub(r'^[\-\*\d\.\)\s"«»]+', "", line).strip().strip('"«»').strip()
-        if len(cleaned) > 10:
-            topics.append(cleaned)
-    return topics
+        lines.append(cleaned)
+    return clean_topics(lines)
 
 
 def _build_prompt(channel: dict, count: int, used_topics: list[str]) -> str:
