@@ -88,8 +88,13 @@ loguru, paramiko, feedparser, fal-client, sentence-transformers + torch (CPU), t
 **Каналы / Telethon / БД**
 - `channel_analyzer.py` — `analyze_export`, `analyze_posts(name, posts, about)` (для @username),
   `classify_channel`, `normalize_meta`. Анализ игнорирует рекламные посты.
-- `userbot_reader.py` — Telethon-юзербот (лимиты подключения, не виснет). `read_channel`
-  (для /add). **Referenсы — RELAY, без скачивания:** `read_candidates` (читает донора,
+- `userbot_reader.py` — Telethon-юзербот (лимиты подключения, не виснет). ОДИН user-аккаунт
+  на одной `.session` → ВСЕ операции (`read_channel`/`read_candidates`/`forward_to_bot`/
+  `read_new_posts`) обёрнуты декоратором `@_userbot_op`: глобальный `asyncio.Lock` (строго по
+  одной операции — иначе гонка за session-файл и FloodWait при параллельных импортах разных
+  тестеров) + backoff на `FloodWaitError` (ждёт и повторяет, до 3×, кап 300с). Не вложенные.
+  `read_channel` (для /add — авто-название + анализ темы). **Referenсы — RELAY, без скачивания:**
+  `read_candidates` (читает донора,
   группирует альбомы по `grouped_id`, проверяет лимиты видео ≤100МБ/≤5мин и док ≤100МБ,
   отдаёт `text`/`text_html`/`media_kind`/`members`) + `forward_to_bot` (форвардит медиа
   В ЛС бота, обычный форвард — чтобы сохранился `forward_from_*` для матчинга).
