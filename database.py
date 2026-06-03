@@ -135,6 +135,29 @@ class Database:
                 );
 
                 -- --------------------------------------------------------
+                -- SaaS: пользователи (тестеры) и инвайт-коды
+                -- --------------------------------------------------------
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id     INTEGER PRIMARY KEY,   -- Telegram id
+                    plan        TEXT DEFAULT 'trial',  -- trial | free | pro | admin
+                    trial_until TEXT,                  -- ISO; план trial действует до этой даты
+                    invited_by  TEXT,                  -- код инвайта или id пригласившего
+                    created_at  TEXT,
+                    note        TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS invite_codes (
+                    code        TEXT PRIMARY KEY,
+                    plan        TEXT DEFAULT 'trial',  -- какой план выдаёт
+                    days        INTEGER DEFAULT 30,    -- на сколько дней trial
+                    max_uses    INTEGER DEFAULT 1,
+                    used_count  INTEGER DEFAULT 0,
+                    active      INTEGER DEFAULT 1,
+                    created_by  INTEGER,
+                    created_at  TEXT
+                );
+
+                -- --------------------------------------------------------
                 -- Индексы для быстрых запросов
                 -- --------------------------------------------------------
                 CREATE INDEX IF NOT EXISTS idx_posts_channel_status

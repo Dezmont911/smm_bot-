@@ -63,6 +63,12 @@ from ui import (
     handle_img_test_input,
     MENU_KEYBOARD,
 )
+import accounts
+from accounts import (
+    has_access, is_registered, is_superadmin,
+    effective_plan, trial_days_left, get_user,
+    redeem_invite, gen_invite, list_users, set_plan, revoke_user,
+)
 
 
 # ============================================================
@@ -89,6 +95,66 @@ ADD_BULK = 27
 def is_admin(user_id: int) -> bool:
     """Проверяет что команду отправил администратор."""
     return user_id in cfg.ADMIN_CHAT_IDS
+
+
+def assert_owns(user_id: int, channel) -> bool:
+    """
+    🔒 Линчпин изоляции: True, если юзер владеет каналом ИЛИ он админ.
+    `channel` — карточка (dict) или channel_id (@handle). Вызывать в КАЖДОМ
+    обработчике, принимающем channel_id/post канала. Пропуск = утечка в чужой канал.
+    """
+    if is_admin(user_id):
+        return True
+    if isinstance(channel, str):
+        channel = next(
+            (c for c in _all_channel_cards() if c.get("channel_id") == channel), None
+        )
+    return bool(channel) and channel.get("owner_id") == user_id
+
+
+def _all_channel_cards() -> list[dict]:
+    """Все карточки (включая неактивные) — для проверки владельца по handle."""
+    channels_dir = Path(__file__).parent / "channels"
+    out = []
+    for jf in channels_dir.glob("*.json"):
+        if jf.name.startswith("example_"):
+            continue
+        try:
+            out.append(json.loads(jf.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+    return out
+
+
+async def _deny(update) -> None:
+    """Единый отказ «не твой канал» для команд и колбэков."""
+    q = getattr(update, "callback_query", None)
+    if q:
+        await q.answer("Это не твой канал.", show_alert=True)
+    elif update.effective_message:
+        await update.effective_message.reply_text("⛔ Это не твой канал.")
+
+
+async def _guard_channel(update, channel_id) -> bool:
+    """🔒 True если юзер владеет каналом (или админ); иначе шлёт отказ и False."""
+    user = update.effective_user or (update.callback_query.from_user if update.callback_query else None)
+    if user and assert_owns(user.id, channel_id):
+        return True
+    await _deny(update)
+    return False
+
+
+async def _guard_post(update, post_id) -> bool:
+    """🔒 Гард по посту: резолвит канал поста и проверяет владельца."""
+    cid = buffer.get_post_channel(post_id)
+    return await _guard_channel(update, cid)
+
+
+def _channels_for(update) -> list[dict]:
+    """Каналы, видимые текущему юзеру (свои; админ — тоже только свои в листингах)."""
+    user = update.effective_user
+    uid = user.id if user else None
+    return [c for c in load_all_channels() if uid is not None and c.get("owner_id") == uid]
 
 
 def safe_slug(channel_id: str) -> str:
@@ -258,26 +324,79 @@ def deactivate_channel(channel_id: str):
 # Команды бота
 # ============================================================
 
+def _status_line(user_id: int) -> str:
+    """Строка статуса плана для меню тестера."""
+    if is_admin(user_id):
+        return "👑 admin"
+    plan = effective_plan(user_id)
+    left = trial_days_left(user_id)
+    if plan == "trial" and left is not None:
+        return f"🧪 trial · осталось дней: {left}"
+    return f"📦 план: {plan}"
+
+
+async def _show_main_menu(update, context):
+    """ReplyKeyboard + главное меню (+ строка статуса для тестеров)."""
+    await update.message.reply_text("☰", reply_markup=MENU_KEYBOARD)
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text(_status_line(uid))
+    await screen_main(update.message, context)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Открывает главное меню и показывает постоянную кнопку Меню."""
-    if not is_admin(update.effective_user.id):
+    """Онбординг: deep-link инвайт / уже зарегистрирован / вход по коду."""
+    uid = update.effective_user.id
+
+    # Deep-link: t.me/<bot>?start=<CODE> → Telegram отдаёт CODE как context.args[0]
+    code_arg = (context.args[0] if context.args else "").strip()
+    if code_arg and not is_registered(uid):
+        ok, msg = redeem_invite(code_arg, uid)
+        if ok:
+            await update.message.reply_text(f"✅ {msg}")
+            await _show_main_menu(update, context)
+        else:
+            await update.message.reply_text(
+                f"❌ {msg}\n\nПопробуй другой код или попроси новое приглашение."
+            )
         return
 
-    # Сначала отправляем ReplyKeyboard — она «прилипнет» внизу навсегда
+    if has_access(uid):
+        await _show_main_menu(update, context)
+        return
+
+    # Не зарегистрирован и без валидного кода — просим инвайт
+    context.user_data["awaiting_invite"] = True
     await update.message.reply_text(
-        "☰",
-        reply_markup=MENU_KEYBOARD,
+        "🔒 <b>Доступ по приглашению</b>\n\n"
+        "Пришли инвайт-код сообщением или открой ссылку-приглашение, "
+        "которую тебе дали.",
+        parse_mode=ParseMode.HTML,
     )
-    # Затем показываем главное меню как inline
-    await screen_main(update.message, context)
+
+
+async def _try_invite_code_text(update, context):
+    """Незарегистрированный прислал текст — пробуем как инвайт-код."""
+    code = (update.message.text or "").strip()
+    if not code:
+        return
+    ok, msg = redeem_invite(code, update.effective_user.id)
+    if ok:
+        context.user_data.pop("awaiting_invite", None)
+        await update.message.reply_text(f"✅ {msg}")
+        await _show_main_menu(update, context)
+    else:
+        await update.message.reply_text(
+            f"❌ {msg}\n\nПришли корректный инвайт-код или попроси новое приглашение."
+        )
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает список всех каналов с кнопками управления."""
-    if not is_admin(update.effective_user.id):
+    if not has_access(update.effective_user.id):
         return
 
-    channels = load_all_channels()
+    channels = _channels_for(update)
     if not channels:
         await update.message.reply_text(
             "Каналов пока нет.\nДобавь первый канал командой /add"
@@ -307,7 +426,7 @@ async def cmd_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начинает диалог добавления нового канала — предлагает выбор метода.
     Работает и как команда /add, и как callback от кнопки 'Добавить канал'.
     """
-    if not is_admin(update.effective_user.id):
+    if not has_access(update.effective_user.id):
         return ConversationHandler.END
 
     context.user_data.clear()
@@ -640,6 +759,8 @@ async def _finalize_new_channel(query, context: ContextTypes.DEFAULT_TYPE, count
     """Собирает карточку канала с дефолтами, авто-стилем и сохраняет."""
     ch = context.user_data["new_channel"]
     ch["daily_posts_count"] = count
+    # 🔒 Владелец канала = тот, кто его добавил (изоляция тенантов)
+    ch["owner_id"] = query.from_user.id
 
     channel_type = ch.get("channel_type", "content")
 
@@ -1041,6 +1162,8 @@ async def handle_export_confirm(update: Update, context: ContextTypes.DEFAULT_TY
         "image_keywords": [],
         # Новый канал не постит по умолчанию — расписание включается через /schedule
         "schedule_disabled": True,
+        # 🔒 Владелец канала (изоляция тенантов)
+        "owner_id": query.from_user.id,
     }
 
     # Marketplace-специфика
@@ -1093,7 +1216,8 @@ async def handle_export_confirm(update: Update, context: ContextTypes.DEFAULT_TY
 # ============================================================
 
 async def _create_channel_from_analysis(analysis: dict, channel_id: str, display_name: str,
-                                        chat_id_num: int | None = None) -> tuple[dict, list]:
+                                        chat_id_num: int | None = None,
+                                        owner_id: int | None = None) -> tuple[dict, list]:
     """Собирает и сохраняет карточку канала из результата анализа.
     Общая логика для экспорт- и username-пути. Возвращает (карточка, rss_urls)."""
     from ai_client import suggest_rss_sources
@@ -1133,6 +1257,8 @@ async def _create_channel_from_analysis(analysis: dict, channel_id: str, display
         # Числовой chat_id (устойчивость к смене @username/приватности) + текущий handle
         "chat_id_num": chat_id_num,
         "username": channel_id,
+        # 🔒 Владелец канала (изоляция тенантов)
+        "owner_id": owner_id,
     }
     if channel_type == "marketplace":
         card["post_formats"] = ["wb_product"]
@@ -1259,7 +1385,8 @@ async def handle_username_confirm(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
 
     card, rss_urls = await _create_channel_from_analysis(
-        analysis, handle, title, chat_id_num=context.user_data.get("uname_chat_id")
+        analysis, handle, title, chat_id_num=context.user_data.get("uname_chat_id"),
+        owner_id=query.from_user.id,
     )
 
     ch_type_label = "🛍 Маркетплейс" if card.get("channel_type") == "marketplace" else "📝 Контент"
@@ -1341,7 +1468,8 @@ async def handle_add_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         data["title"], data["posts"], about=data["about"]
                     )
                     await _create_channel_from_analysis(
-                        analysis, data["handle"], data["title"], chat_id_num=data.get("chat_id_num")
+                        analysis, data["handle"], data["title"], chat_id_num=data.get("chat_id_num"),
+                        owner_id=update.effective_user.id,
                     )
                     existing.add(data["handle"].lower())
                     added.append(data["handle"])
@@ -1500,10 +1628,13 @@ async def handle_channel_actions(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
 
-    if not is_admin(query.from_user.id):
+    if not has_access(query.from_user.id):
         return
 
     action, channel_id = query.data.split(":", 1)
+
+    if not await _guard_channel(update, channel_id):
+        return
 
     if action == "removech":
         # Показываем подтверждение
@@ -1540,11 +1671,14 @@ async def handle_channel_actions(update: Update, context: ContextTypes.DEFAULT_T
 
 async def handle_set_topic_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Получает новую тему канала от администратора."""
-    if not is_admin(update.effective_user.id):
+    if not has_access(update.effective_user.id):
         return
 
     channel_id = context.user_data.get("settopic_channel")
     if not channel_id:
+        return
+    if not await _guard_channel(update, channel_id):
+        context.user_data.pop("settopic_channel", None)
         return
 
     from ai_client import sanitize_field, FIELD_LIMITS
@@ -1578,12 +1712,12 @@ async def handle_set_topic_text(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает состояние буферов всех каналов."""
-    if not is_admin(update.effective_user.id):
+    if not has_access(update.effective_user.id):
         return
 
-    channels = load_all_channels()
+    channels = _channels_for(update)
     if not channels:
-        await update.message.reply_text("Нет активных каналов. Добавь карточки в папку channels/")
+        await update.message.reply_text("Нет активных каналов. Добавь канал через /add")
         return
 
     lines = ["📊 <b>Состояние буферов</b>\n"]
@@ -1629,7 +1763,7 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         /review          — выбор канала через inline-кнопки
         /review @channel — посты конкретного канала сразу
     """
-    if not is_admin(update.effective_user.id):
+    if not has_access(update.effective_user.id):
         return
 
     args = context.args or []
@@ -1637,10 +1771,12 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if args:
         # Прямой переход к постам конкретного канала
         channel_id = args[0] if args[0].startswith("@") else f"@{args[0]}"
+        if not await _guard_channel(update, channel_id):
+            return
         await _send_review_page(update.message, channel_id, offset=0)
     else:
         # Показываем выбор канала через inline-кнопки
-        channels = load_all_channels()
+        channels = _channels_for(update)
         if not channels:
             await update.message.reply_text("Нет активных каналов. Добавь через /add")
             return
@@ -1670,10 +1806,12 @@ async def handle_review_channel_select(update: Update, context: ContextTypes.DEF
     query = update.callback_query
     await query.answer()
 
-    if not is_admin(query.from_user.id):
+    if not has_access(query.from_user.id):
         return
 
     channel_id = query.data.split(":", 1)[1]
+    if not await _guard_channel(update, channel_id):
+        return
     await query.edit_message_reply_markup(reply_markup=None)  # убираем клавиатуру выбора
     await _send_review_page(query.message, channel_id, offset=0)
 
@@ -1683,13 +1821,16 @@ async def handle_review_next_page(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     await query.answer()
 
-    if not is_admin(query.from_user.id):
+    if not has_access(query.from_user.id):
         return
 
     # format: review_page:@channel:offset
     parts = query.data.split(":", 2)
     channel_id = parts[1]
     offset = int(parts[2])
+
+    if not await _guard_channel(update, channel_id):
+        return
 
     # Убираем кнопку пагинации у предыдущей страницы
     await query.edit_message_reply_markup(reply_markup=None)
@@ -1935,12 +2076,14 @@ async def handle_post_card_nav(update: Update, context: ContextTypes.DEFAULT_TYP
     """Навигация ◀▶ по карточкам очереди. callback: pcard:{channel}:{index} | pcard:noop:0."""
     query = update.callback_query
     await query.answer()
-    if not is_admin(query.from_user.id):
+    if not has_access(query.from_user.id):
         return
     parts = query.data.split(":")
     if len(parts) >= 2 and parts[1] == "noop":
         return  # счётчик-кнопка
     channel_id = parts[1]
+    if not await _guard_channel(update, channel_id):
+        return
     try:
         index = int(parts[2])
     except (IndexError, ValueError):
@@ -1953,9 +2096,11 @@ async def handle_post_card_by_id(update: Update, context: ContextTypes.DEFAULT_T
     """Открыть карточку конкретного поста (после правки/картинки). callback: pcard_id:{post_id}."""
     query = update.callback_query
     await query.answer()
-    if not is_admin(query.from_user.id):
+    if not has_access(query.from_user.id):
         return
     post_id = query.data.split(":", 1)[1]
+    if not await _guard_post(update, post_id):
+        return
     await _delete_card_message(query)
     await _open_post_card_by_id(query.message, post_id, context)
 
@@ -1964,9 +2109,11 @@ async def handle_review_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать всю очередь списком (обзор). callback: review_all:{channel}."""
     query = update.callback_query
     await query.answer()
-    if not is_admin(query.from_user.id):
+    if not has_access(query.from_user.id):
         return
     channel_id = query.data.split(":", 1)[1]
+    if not await _guard_channel(update, channel_id):
+        return
     await _delete_card_message(query)
     await _send_review_page(query.message, channel_id, 0)
 
@@ -1976,10 +2123,12 @@ async def handle_gen_channel(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
 
-    if not is_admin(query.from_user.id):
+    if not has_access(query.from_user.id):
         return
 
     channel_id = query.data.split(":", 1)[1]
+    if not await _guard_channel(update, channel_id):
+        return
     await query.edit_message_reply_markup(reply_markup=None)  # убираем кнопки
     await context.bot.send_message(
         chat_id=query.message.chat_id,
@@ -2000,13 +2149,13 @@ async def cmd_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Использование:
       /generate @channel — генерация для одного канала
     """
-    if not is_admin(update.effective_user.id):
+    if not has_access(update.effective_user.id):
         return
 
     args = context.args or []
 
     if not args:
-        channels = load_all_channels()
+        channels = _channels_for(update)
         if not channels:
             await update.message.reply_text("Каналов нет. Добавь канал через меню.")
             return
@@ -2025,6 +2174,8 @@ async def cmd_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ Канал <code>{channel_id}</code> не найден.",
             parse_mode=ParseMode.HTML,
         )
+        return
+    if not await _guard_channel(update, channel_id):
         return
 
     await update.message.reply_text(
@@ -2134,10 +2285,10 @@ async def cmd_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
       /preview          — первый канал из списка
       /preview @channel — конкретный канал
     """
-    if not is_admin(update.effective_user.id):
+    if not has_access(update.effective_user.id):
         return
 
-    channels = load_all_channels()
+    channels = _channels_for(update)
     if not channels:
         await update.message.reply_text("Нет активных каналов.")
         return
@@ -2227,7 +2378,7 @@ async def handle_preview_actions(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
 
-    if not is_admin(query.from_user.id):
+    if not has_access(query.from_user.id):
         return
 
     data = query.data  # "preview_queue:uuid" / "preview_now:uuid" / etc.
@@ -2236,6 +2387,8 @@ async def handle_preview_actions(update: Update, context: ContextTypes.DEFAULT_T
     # --- Перегенерировать ---
     if action == "preview_regen":
         channel_id = payload
+        if not await _guard_channel(update, channel_id):
+            return
         channels = load_all_channels()
         channel = next((c for c in channels if c["channel_id"] == channel_id), None)
         if not channel:
@@ -2260,6 +2413,8 @@ async def handle_preview_actions(update: Update, context: ContextTypes.DEFAULT_T
     post_data = _preview_store.get(payload)
     if not post_data:
         await query.edit_message_text("❌ Превью устарело, перегенерируй заново.")
+        return
+    if not await _guard_channel(update, post_data.get("channel_id")):
         return
 
     # --- В очередь ---
@@ -2311,10 +2466,10 @@ async def cmd_post_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Немедленно публикует следующий пост из буфера.
     Использование: /post_now или /post_now @channel
     """
-    if not is_admin(update.effective_user.id):
+    if not has_access(update.effective_user.id):
         return
 
-    channels = load_all_channels()
+    channels = _channels_for(update)
     if not channels:
         await update.message.reply_text("Нет активных каналов.")
         return
@@ -2360,16 +2515,17 @@ async def cmd_delete_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
       /delete_posts              — удалить все posты со всех каналов
       /delete_posts @channel     — удалить все посты конкретного канала
     """
-    if not is_admin(update.effective_user.id):
+    if not has_access(update.effective_user.id):
         return
 
     args = context.args or []
 
+    my_ids = [c["channel_id"] for c in _channels_for(update)]
+
     # Определяем: все каналы или конкретный
     if args:
         handle = args[0] if args[0].startswith("@") else "@" + args[0]
-        channels = load_all_channels()
-        if not any(c["channel_id"] == handle for c in channels):
+        if handle not in my_ids:
             await update.message.reply_text(
                 f"❌ Канал <code>{handle}</code> не найден. Список: /list",
                 parse_mode=ParseMode.HTML,
@@ -2377,19 +2533,23 @@ async def cmd_delete_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         filter_channel = handle
     else:
-        filter_channel = None  # все каналы
+        filter_channel = None  # все МОИ каналы
 
-    # Считаем сколько постов будет удалено
+    # Считаем сколько постов будет удалено (только среди СВОИХ каналов)
     with db.connect() as conn:
         if filter_channel:
             count = conn.execute(
                 "SELECT COUNT(*) FROM posts WHERE channel_id = ? AND status = 'ready'",
                 (filter_channel,),
             ).fetchone()[0]
-        else:
+        elif my_ids:
+            ph = ",".join("?" * len(my_ids))
             count = conn.execute(
-                "SELECT COUNT(*) FROM posts WHERE status = 'ready'"
+                f"SELECT COUNT(*) FROM posts WHERE status = 'ready' AND channel_id IN ({ph})",
+                my_ids,
             ).fetchone()[0]
+        else:
+            count = 0
 
     if count == 0:
         target = f"канала <b>{filter_channel}</b>" if filter_channel else "всех каналов"
@@ -2424,7 +2584,7 @@ async def handle_delete_posts_confirm(update: Update, context: ContextTypes.DEFA
     query = update.callback_query
     await query.answer()
 
-    if not is_admin(query.from_user.id):
+    if not has_access(query.from_user.id):
         return
 
     data = query.data  # "delete_all_confirm:@channel" или "delete_all_cancel"
@@ -2437,17 +2597,28 @@ async def handle_delete_posts_confirm(update: Update, context: ContextTypes.DEFA
     encoded = data.split(":", 1)[1]
     filter_channel = None if encoded == "ALL" else encoded
 
+    # 🔒 Конкретный канал — проверяем владельца
+    if filter_channel and not await _guard_channel(update, filter_channel):
+        return
+
+    my_ids = [c["channel_id"] for c in _channels_for(update)]
     with db.connect() as conn:
         if filter_channel:
             result = conn.execute(
                 "DELETE FROM posts WHERE channel_id = ? AND status = 'ready'",
                 (filter_channel,),
             )
-        else:
+            deleted = result.rowcount
+        elif my_ids:
+            # ALL — только СВОИ каналы (тестер не трогает чужие)
+            ph = ",".join("?" * len(my_ids))
             result = conn.execute(
-                "DELETE FROM posts WHERE status = 'ready'"
+                f"DELETE FROM posts WHERE status = 'ready' AND channel_id IN ({ph})",
+                my_ids,
             )
-        deleted = result.rowcount
+            deleted = result.rowcount
+        else:
+            deleted = 0
 
     target_label = f"канала {filter_channel}" if filter_channel else "всех каналов"
     logger.info(f"Удалено {deleted} постов из буфера ({target_label})")
@@ -2473,10 +2644,14 @@ async def handle_img_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if not is_admin(query.from_user.id):
+    if not has_access(query.from_user.id):
         return
 
     _, action, post_id = query.data.split(":", 2)
+
+    # 🔒 Гард владельца
+    if not await _guard_post(update, post_id):
+        return
 
     if action == "upload":
         # Просим пользователя прислать фото
@@ -2629,10 +2804,14 @@ async def handle_post_actions(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
 
-    if not is_admin(query.from_user.id):
+    if not has_access(query.from_user.id):
         return
 
     action, post_id = query.data.split(":", 1)
+
+    # 🔒 Гард владельца: пост принадлежит каналу — проверяем владельца
+    if action != "done" and not await _guard_post(update, post_id):
+        return
 
     # Текущая позиция в фокус-карточке (для перерисовки «той же точки» очереди)
     card_idx = (context.user_data.get("review_card") or {}).get("index", 0)
@@ -2770,11 +2949,14 @@ async def handle_post_actions(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_edited_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Получает отредактированный текст поста от администратора."""
-    if not is_admin(update.effective_user.id):
+    if not has_access(update.effective_user.id):
         return ConversationHandler.END
 
     post_id = context.user_data.get("editing_post_id")
     if not post_id:
+        return ConversationHandler.END
+    if not await _guard_post(update, post_id):
+        context.user_data.pop("editing_post_id", None)
         return ConversationHandler.END
 
     new_text = update.message.text
@@ -2797,7 +2979,7 @@ async def cancel_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Кнопка «◀️ Назад» в режиме правки текста поста — выход без изменений."""
     query = update.callback_query
     await query.answer("Отменено")
-    if not is_admin(query.from_user.id):
+    if not has_access(query.from_user.id):
         return ConversationHandler.END
     post_id = context.user_data.pop("editing_post_id", None)
     await _delete_card_message(query)
@@ -2811,11 +2993,14 @@ async def regen_post_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     поста сохраняет. Заменяет только content этого поста, статус остаётся ready."""
     query = update.callback_query
     await query.answer()
-    if not is_admin(query.from_user.id):
+    if not has_access(query.from_user.id):
         return ConversationHandler.END
 
     post_id = context.user_data.get("editing_post_id")
     if not post_id:
+        return ConversationHandler.END
+    if not await _guard_post(update, post_id):
+        context.user_data.pop("editing_post_id", None)
         return ConversationHandler.END
 
     with db.connect() as conn:
@@ -2899,7 +3084,10 @@ async def handle_image_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Сначала проверяет не находится ли пользователь в режиме
     редактирования настроек канала (ui.py editing).
     """
-    if not is_admin(update.effective_user.id):
+    uid = update.effective_user.id
+    if not has_access(uid):
+        # Незарегистрированный — единственное доступное действие: ввод инвайт-кода
+        await _try_invite_code_text(update, context)
         return
 
     # Создание черновика (из «Канал → ✍️ Черновик → ➕ Создать пост»)
@@ -3218,7 +3406,7 @@ async def handle_userbot_forward(update: Update, context: ContextTypes.DEFAULT_T
     # Админ в режиме создания черновика → пересланный пост = контент черновика,
     # а НЕ relay-референс. Делегируем (текст/медиа/альбом → черновик). Форварды
     # юзербота сюда не попадают: у него в user_data нет draft_compose.
-    if context.user_data.get("draft_compose") and is_admin(update.effective_user.id):
+    if context.user_data.get("draft_compose") and has_access(update.effective_user.id):
         from ui import create_draft_from_message
         if await create_draft_from_message(update, context):
             return
@@ -3319,11 +3507,11 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
       /schedule @channel off           — только РСЯ (без таймера)
       /schedule @channel on            — вернуть расписание
     """
-    if not is_admin(update.effective_user.id):
+    if not has_access(update.effective_user.id):
         return
 
     args = context.args or []
-    channels = load_all_channels()
+    channels = _channels_for(update)
 
     def utc_to_msk(hours: list) -> list:
         return sorted([(h + 3) % 24 for h in hours])
@@ -3480,6 +3668,88 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
+# Админ-команды SaaS (только superadmin): инвайты и пользователи
+# ============================================================
+
+async def cmd_gen_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/gen_invite [days] [uses] [plan] → создаёт инвайт-код и ссылку."""
+    if not is_superadmin(update.effective_user.id):
+        return
+    args = context.args or []
+    days = int(args[0]) if len(args) >= 1 and args[0].isdigit() else 30
+    uses = int(args[1]) if len(args) >= 2 and args[1].isdigit() else 1
+    plan = args[2] if len(args) >= 3 else "trial"
+    code = gen_invite(plan=plan, days=days, max_uses=uses, created_by=update.effective_user.id)
+    try:
+        bot_username = (await context.bot.get_me()).username
+        link = f"https://t.me/{bot_username}?start={code}"
+    except Exception:
+        link = f"(ссылку собери вручную: ?start={code})"
+    await update.message.reply_text(
+        f"🎟 <b>Инвайт создан</b>\n\n"
+        f"Код: <code>{code}</code>\n"
+        f"План: {plan} · дней: {days} · использований: {uses}\n\n"
+        f"Ссылка-приглашение:\n{link}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/users → список тестеров с планом и сроком триала."""
+    if not is_superadmin(update.effective_user.id):
+        return
+    users = list_users()
+    if not users:
+        await update.message.reply_text("Тестеров пока нет.")
+        return
+    lines = [f"👥 <b>Тестеры ({len(users)})</b>\n"]
+    for u in users:
+        eff = effective_plan(u["user_id"])
+        left = trial_days_left(u["user_id"])
+        left_s = f" · триал: {left}д" if left is not None else ""
+        # сколько каналов у юзера
+        n_ch = sum(1 for c in _all_channel_cards() if c.get("owner_id") == u["user_id"])
+        lines.append(
+            f"• <code>{u['user_id']}</code> — {eff}{left_s} · каналов: {n_ch} · by {u.get('invited_by','?')}"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_grant(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/grant <user_id> <plan> [days] → выдать план вручную."""
+    if not is_superadmin(update.effective_user.id):
+        return
+    args = context.args or []
+    if len(args) < 2 or not args[0].lstrip("-").isdigit():
+        await update.message.reply_text("Использование: /grant <user_id> <plan> [days]")
+        return
+    target = int(args[0])
+    plan = args[1]
+    days = int(args[2]) if len(args) >= 3 and args[2].isdigit() else 30
+    set_plan(target, plan, days)
+    await update.message.reply_text(
+        f"✅ Юзеру <code>{target}</code> выдан план <b>{plan}</b> на {days} дней.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/revoke <user_id> → закрыть доступ (каналы не трогаем)."""
+    if not is_superadmin(update.effective_user.id):
+        return
+    args = context.args or []
+    if not args or not args[0].lstrip("-").isdigit():
+        await update.message.reply_text("Использование: /revoke <user_id>")
+        return
+    target = int(args[0])
+    ok = revoke_user(target)
+    await update.message.reply_text(
+        f"{'✅ Доступ закрыт' if ok else '⚠️ Юзер не найден'}: <code>{target}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ============================================================
 # Запуск бота
 # ============================================================
 
@@ -3588,6 +3858,12 @@ def main():
     app.add_handler(CommandHandler("post_now", cmd_post_now))
     app.add_handler(CommandHandler("schedule", cmd_schedule))
     app.add_handler(CommandHandler("delete_posts", cmd_delete_posts))
+
+    # --- Админ-команды (только superadmin): инвайты и пользователи ---
+    app.add_handler(CommandHandler("gen_invite", cmd_gen_invite))
+    app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CommandHandler("grant", cmd_grant))
+    app.add_handler(CommandHandler("revoke", cmd_revoke))
 
     # --- Кнопки: удаление всех постов ---
     app.add_handler(CallbackQueryHandler(

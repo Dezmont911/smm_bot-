@@ -42,6 +42,22 @@ from buffer_manager import buffer
 from config import cfg
 from content_generator import generator
 from poster import poster
+import accounts
+
+
+def _acting_uid(qm) -> int | None:
+    """Telegram id того, кто инициировал экран (Message или CallbackQuery)."""
+    u = getattr(qm, "from_user", None)
+    return u.id if u else None
+
+
+def _owns(user_id, ch: dict) -> bool:
+    """🔒 Владелец канала или админ."""
+    if user_id is None:
+        return False
+    if accounts.is_admin(user_id):
+        return True
+    return bool(ch) and ch.get("owner_id") == user_id
 
 
 # ── Постоянная ReplyKeyboard с кнопкой «Меню» ─────────────────────────────
@@ -55,17 +71,22 @@ MENU_KEYBOARD = ReplyKeyboardMarkup(
 
 # ── Вспомогательные функции ────────────────────────────────────────────────
 
-def _load_channels(include_inactive: bool = False) -> list[dict]:
-    """Загружает все карточки каналов из папки channels/."""
+def _load_channels(include_inactive: bool = False, owner_id: int | None = None) -> list[dict]:
+    """Загружает карточки каналов из channels/. Если задан owner_id — отдаёт ТОЛЬКО
+    каналы этого владельца (изоляция; листинги строгие даже для админа, «всё» — отдельно)."""
     channels_dir = Path(__file__).parent / "channels"
+    only_owner = owner_id is not None
     channels = []
     for f in channels_dir.glob("*.json"):
         if f.name.startswith("example_"):
             continue
         try:
             ch = json.loads(f.read_text(encoding="utf-8"))
-            if include_inactive or ch.get("active", True):
-                channels.append(ch)
+            if not (include_inactive or ch.get("active", True)):
+                continue
+            if only_owner and ch.get("owner_id") != owner_id:
+                continue
+            channels.append(ch)
         except Exception as e:
             logger.error(f"Ошибка чтения {f.name}: {e}")
     return channels
@@ -170,7 +191,7 @@ async def _answer_or_send(query_or_message, text: str, reply_markup, parse_mode=
 
 async def screen_main(qm, context: ContextTypes.DEFAULT_TYPE):
     """Главное меню."""
-    channels = _load_channels()
+    channels = _load_channels(owner_id=_acting_uid(qm))
     active = len(channels)
     total_posts = sum(buffer.get_level(ch["channel_id"]) for ch in channels)
 
@@ -221,7 +242,8 @@ def _channel_button(ch: dict) -> InlineKeyboardButton:
 
 async def screen_channels(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
     """Список активных каналов: сверху действия, тумблеры состояния, пагинация по 10."""
-    channels = [c for c in _load_channels(include_inactive=True) if c.get("active", True)]
+    channels = [c for c in _load_channels(include_inactive=True, owner_id=_acting_uid(qm))
+                if c.get("active", True)]
 
     # Верхние кнопки-действия (как в референсе)
     top = [
@@ -262,7 +284,8 @@ async def screen_channels(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0)
 
 async def screen_channels_deleted(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
     """Удалённые (неактивные) каналы — с возможностью восстановить."""
-    deleted = [c for c in _load_channels(include_inactive=True) if not c.get("active", True)]
+    deleted = [c for c in _load_channels(include_inactive=True, owner_id=_acting_uid(qm))
+               if not c.get("active", True)]
 
     if not deleted:
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К каналам", callback_data="ui:channels")]])
@@ -322,7 +345,8 @@ async def prompt_channel_search(qm, context: ContextTypes.DEFAULT_TYPE):
 async def screen_channels_search(qm, context: ContextTypes.DEFAULT_TYPE, query: str):
     """Показывает каналы, совпавшие с запросом (по названию или @username)."""
     q = (query or "").strip().lower().lstrip("@")
-    channels = [c for c in _load_channels(include_inactive=True) if c.get("active", True)]
+    channels = [c for c in _load_channels(include_inactive=True, owner_id=_acting_uid(qm))
+                if c.get("active", True)]
     matched = [
         c for c in channels
         if q in (c.get("name", "") or "").lower() or q in c["channel_id"].lower().lstrip("@")
@@ -653,7 +677,7 @@ async def screen_status(qm, context: ContextTypes.DEFAULT_TYPE):
 
 async def screen_queue(qm, context: ContextTypes.DEFAULT_TYPE):
     """Выбор канала для просмотра очереди постов."""
-    channels = _load_channels()
+    channels = _load_channels(owner_id=_acting_uid(qm))
     buttons = []
     total = 0
     for ch in channels:
@@ -2207,11 +2231,11 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Центральный обработчик всех callback_data начинающихся с 'ui:'.
     Парсит callback_data и вызывает нужный экран/действие.
     """
-    from config import cfg as _cfg
     query = update.callback_query
+    uid = query.from_user.id
 
-    if query.from_user.id not in _cfg.ADMIN_CHAT_IDS:
-        await query.answer("Нет доступа.")
+    if not accounts.has_access(uid):
+        await query.answer("Доступ по приглашению — пришли /start.")
         return
 
     data = query.data  # например: "ui:ch:@hagenezykas"
@@ -2221,6 +2245,22 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "noop":
         await query.answer()
         return
+
+    # 🔒 Гард владельца (линчпин изоляции): если действие адресует конкретный канал
+    # (parts[2] = @handle) или пост (draft-действия по post_id) — проверяем владение.
+    # Пропуск хотя бы одного канало-зависимого действия = утечка в чужой канал.
+    _POST_ACTIONS = {"draft_edit", "draft_media", "draft_q", "draft_del", "draft_view"}
+    if len(parts) >= 3 and parts[2]:
+        _p2 = parts[2]
+        _ch = None
+        if _p2.startswith("@"):
+            _ch = _load_channel(_p2)
+        elif action in _POST_ACTIONS:
+            _cid = buffer.get_post_channel(_p2)
+            _ch = _load_channel(_cid) if _cid else None
+        if _ch is not None and not _owns(uid, _ch):
+            await query.answer("⛔ Это не твой канал.", show_alert=True)
+            return
 
     # Любой клик по кнопке = навигация → сбрасываем «залипшие» режимы ожидания текста
     # (правка черновика/настроек/поиск). Нужный режим экран-обработчик ниже поставит
