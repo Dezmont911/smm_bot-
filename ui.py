@@ -927,11 +927,24 @@ async def action_generate_run(qm, context, handle: str, count: int):
         channel = _gen._load_channel_by_id(handle)
         result = await _gen.run_for_channel(channel, target_count=count)
         generated = result.get("generated", 0)
-        text = (
-            f"✅ <b>Готово!</b>\n\n"
-            f"Канал: <b>{handle}</b>\n"
-            f"Запрошено: {count} · Сгенерировано: <b>{generated}</b>"
-        )
+        if generated == 0:
+            # Объясняем «0», а не показываем сухой ноль без причины
+            reason = result.get("reason") or (
+                "все темы уже использованы, отсеяны фильтром релевантности/цензуры "
+                "или тема канала запретная — поменяй тему/источники"
+            )
+            text = (
+                f"⚠️ <b>Посты не созданы</b>\n\n"
+                f"Канал: <b>{handle}</b>\n"
+                f"Запрошено: {count} · Создано: <b>0</b>\n"
+                f"Причина: {reason}."
+            )
+        else:
+            text = (
+                f"✅ <b>Готово!</b>\n\n"
+                f"Канал: <b>{handle}</b>\n"
+                f"Запрошено: {count} · Сгенерировано: <b>{generated}</b>"
+            )
     except Exception as e:
         text = f"❌ Ошибка генерации для {handle}:\n{e}"
 
