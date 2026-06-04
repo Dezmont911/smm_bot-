@@ -63,6 +63,7 @@ from ui import (
     handle_settings_text_input,
     handle_img_test_input,
     MENU_KEYBOARD,
+    admin_default_rsy_enabled,
 )
 import accounts
 from accounts import (
@@ -96,6 +97,11 @@ ADD_BULK = 27
 def is_admin(user_id: int) -> bool:
     """Проверяет что команду отправил администратор."""
     return user_id in cfg.ADMIN_CHAT_IDS
+
+
+def _default_rsy_for_owner(owner_id: int | None) -> bool:
+    """Для новых каналов superadmin можно включать РСЯ-перекрытие по умолчанию."""
+    return bool(owner_id and is_superadmin(owner_id) and admin_default_rsy_enabled())
 
 
 def assert_owns(user_id: int, channel) -> bool:
@@ -851,6 +857,8 @@ async def _finalize_new_channel(query, context: ContextTypes.DEFAULT_TYPE, count
     # update() не перезапишет уже установленные ключи в ch — используем reversed merge
     for k, v in base_defaults.items():
         ch.setdefault(k, v)
+    if _default_rsy_for_owner(ch.get("owner_id")):
+        ch["rsy_override"] = True
 
     # Авто-определение архетипа (стиль) и источника тем по описанию — для контента
     if channel_type == "content" and "archetype" not in ch:
@@ -1231,6 +1239,9 @@ async def handle_export_confirm(update: Update, context: ContextTypes.DEFAULT_TY
         channel_card["archetype"] = arch
         channel_card["topic_source"] = src
 
+    if _default_rsy_for_owner(channel_card.get("owner_id")):
+        channel_card["rsy_override"] = True
+
     save_channel_card(channel_card)
     buffer.add_evergreen_topics(channel_id, channel_card.get("evergreen_topics", []))
 
@@ -1323,6 +1334,9 @@ async def _create_channel_from_analysis(analysis: dict, channel_id: str, display
         arch, src = normalize_meta(analysis.get("archetype"), analysis.get("topic_source"))
         card["archetype"] = arch
         card["topic_source"] = src
+
+    if _default_rsy_for_owner(card.get("owner_id")):
+        card["rsy_override"] = True
 
     save_channel_card(card)
     buffer.add_evergreen_topics(channel_id, card.get("evergreen_topics", []))

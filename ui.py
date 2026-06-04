@@ -68,6 +68,30 @@ MENU_KEYBOARD = ReplyKeyboardMarkup(
     is_persistent=True,
 )
 
+ADMIN_SETTINGS_PATH = Path(__file__).parent / "admin_settings.json"
+
+
+def _load_admin_settings() -> dict:
+    """Локальные настройки админ-панели без миграции БД."""
+    try:
+        if ADMIN_SETTINGS_PATH.exists():
+            return json.loads(ADMIN_SETTINGS_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"Не удалось прочитать admin_settings.json: {e}")
+    return {}
+
+
+def _save_admin_settings(data: dict):
+    try:
+        ADMIN_SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.error(f"Не удалось сохранить admin_settings.json: {e}")
+
+
+def admin_default_rsy_enabled() -> bool:
+    """Включать ли РСЯ-перекрытие по умолчанию для новых каналов superadmin."""
+    return bool(_load_admin_settings().get("default_rsy_override", False))
+
 
 # ── Вспомогательные функции ────────────────────────────────────────────────
 
@@ -2592,12 +2616,18 @@ async def screen_help_section(qm, context: ContextTypes.DEFAULT_TYPE, key: str):
 
 async def screen_admin(qm, context: ContextTypes.DEFAULT_TYPE):
     """Меню админа: создать инвайт, список тестеров, каналы пользователей."""
+    uid = _acting_uid(qm)
     users = accounts.list_users()
-    tester_chans = _load_channels(include_inactive=True, owner_id=_acting_uid(qm), scope="testers")
+    tester_chans = _load_channels(include_inactive=True, owner_id=uid, scope="testers")
+    my_chans = [c for c in _load_channels(include_inactive=True, owner_id=uid, scope="mine")
+                if c.get("active", True) and c.get("owner_id") in (None, uid)]
+    rsy_state = "вкл ✅" if admin_default_rsy_enabled() else "выкл ⬜️"
     text = (
         "👑 <b>Админ-панель</b>\n\n"
         f"Зарегистрировано тестеров: <b>{len(users)}</b>\n"
         f"Каналов у тестеров: <b>{len(tester_chans)}</b>\n\n"
+        f"Моих активных каналов: <b>{len(my_chans)}</b>\n"
+        f"РСЯ по умолчанию для новых моих каналов: <b>{rsy_state}</b>\n\n"
         "🎟 Инвайт-ссылка <b>одноразовая</b> (на N человек): кто первый откроет — "
         "тот и зарегистрируется. Отправляй её тестеру <b>лично</b>."
     )
@@ -2606,6 +2636,8 @@ async def screen_admin(qm, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🎟 Инвайт (5 чел · 30 дней)", callback_data="ui:adm_inv:5:30")],
         [InlineKeyboardButton(f"👥 Пользователи ({len(users)})", callback_data="ui:adm_users")],
         [InlineKeyboardButton(f"📡 Каналы пользователей ({len(tester_chans)})", callback_data="ui:adm_chans:0")],
+        [InlineKeyboardButton(f"📢 РСЯ по умолчанию: {rsy_state}", callback_data="ui:adm_rsy_default")],
+        [InlineKeyboardButton(f"🗑 Удалить мои каналы ({len(my_chans)})", callback_data="ui:adm_del_my_chans")],
         [InlineKeyboardButton("💰 Расходы", callback_data="ui:adm_cost:today")],
         [InlineKeyboardButton("⚡ Генерить для всех", callback_data="ui:generate_all")],
         [InlineKeyboardButton("◀️ В меню", callback_data="ui:main")],
@@ -2632,6 +2664,59 @@ async def action_admin_invite(qm, context, uses: int, days: int):
         [InlineKeyboardButton("◀️ Админ-панель", callback_data="ui:admin")],
     ])
     await _answer_or_send(qm, text, kb)
+
+
+async def action_admin_rsy_default_toggle(qm, context):
+    """Переключает РСЯ-перекрытие по умолчанию для новых каналов superadmin."""
+    data = _load_admin_settings()
+    data["default_rsy_override"] = not bool(data.get("default_rsy_override", False))
+    _save_admin_settings(data)
+    state = "включено ✅" if data["default_rsy_override"] else "выключено ⬜️"
+    await qm.answer(f"РСЯ по умолчанию {state}")
+    await screen_admin(qm, context)
+
+
+async def action_admin_delete_my_channels_confirm(qm, context):
+    """Подтверждение массовой деактивации только админских каналов superadmin."""
+    uid = _acting_uid(qm)
+    chans = [c for c in _load_channels(include_inactive=True, owner_id=uid, scope="mine")
+             if c.get("active", True) and c.get("owner_id") in (None, uid)]
+    if not chans:
+        await _answer_or_send(
+            qm,
+            "🗑 <b>Мои каналы</b>\n\nАктивных каналов для удаления нет.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Админ-панель", callback_data="ui:admin")]]),
+        )
+        return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"✅ Да, удалить мои каналы ({len(chans)})", callback_data="ui:adm_del_my_chans_ok")],
+        [InlineKeyboardButton("◀️ Отмена", callback_data="ui:admin")],
+    ])
+    await _answer_or_send(
+        qm,
+        f"🗑 <b>Удалить мои каналы?</b>\n\n"
+        f"Будет деактивировано <b>{len(chans)}</b> каналов superadmin. "
+        f"Каналы тестеров не затрагиваются. Посты в БД не удаляются.",
+        kb,
+    )
+
+
+async def action_admin_delete_my_channels_ok(qm, context):
+    """Деактивирует все активные каналы superadmin, не трогая каналы тестеров."""
+    uid = _acting_uid(qm)
+    chans = [c for c in _load_channels(include_inactive=True, owner_id=uid, scope="mine")
+             if c.get("active", True) and c.get("owner_id") in (None, uid)]
+    count = 0
+    for ch in chans:
+        ch["active"] = False
+        _save_channel(ch)
+        count += 1
+    logger.info(f"Админские каналы superadmin деактивированы: {count}")
+    await _answer_or_send(
+        qm,
+        f"🗑 Деактивировано моих каналов: <b>{count}</b>.",
+        InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Админ-панель", callback_data="ui:admin")]]),
+    )
 
 
 async def _user_label(context, uid: int) -> str | None:
@@ -2828,7 +2913,8 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # 👑 Админ-действия — только для главного владельца (superadmin)
-    if action in ("admin", "adm_inv", "adm_users", "adm_revoke", "adm_pro", "adm_chans", "adm_cost"):
+    if action in ("admin", "adm_inv", "adm_users", "adm_revoke", "adm_pro", "adm_chans", "adm_cost",
+                  "adm_rsy_default", "adm_del_my_chans", "adm_del_my_chans_ok"):
         if not accounts.is_superadmin(uid):
             await query.answer("Только для владельца.", show_alert=True)
             return
@@ -2844,6 +2930,12 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action == "adm_cost":
             period = parts[2] if len(parts) >= 3 and parts[2] else "today"
             await screen_admin_costs(query, context, period)
+        elif action == "adm_rsy_default":
+            await action_admin_rsy_default_toggle(query, context)
+        elif action == "adm_del_my_chans":
+            await action_admin_delete_my_channels_confirm(query, context)
+        elif action == "adm_del_my_chans_ok":
+            await action_admin_delete_my_channels_ok(query, context)
         elif action == "adm_revoke" and len(parts) >= 3:
             await action_admin_revoke(query, context, parts[2])
         elif action == "adm_pro" and len(parts) >= 3:
