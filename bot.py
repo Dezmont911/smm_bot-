@@ -4254,15 +4254,16 @@ def main():
             max_instances=1,  # не запускать второй цикл, пока идёт первый
         )
 
-        # Импорт референсов — раз в день (08:00 UTC = 11:00 МСК): забираем
-        # новые посты каналов-доноров в буфер.
-        from reference_importer import import_all as import_references_all
+        # Авто-добор референсов — каждый час (:45), НО только для каналов, у которых
+        # буфер просел (< LOW_BUFFER_MIN). Слепого ежедневного импорта больше нет:
+        # ручной долив — кнопкой «📥 Взять», авто — лишь страховка от пустого буфера.
+        from reference_importer import import_low_buffer
         scheduler.add_job(
-            import_references_all,
-            CronTrigger(hour=8, minute=0),
-            id="reference_import",
-            name="Импорт референсов",
-            misfire_grace_time=3600,
+            import_low_buffer,
+            CronTrigger(minute=45),
+            id="reference_topup",
+            name="Авто-добор референсов (низкий буфер)",
+            misfire_grace_time=600,
             max_instances=1,
         )
 
@@ -4343,7 +4344,7 @@ def main():
             "Планировщик запущен:\n"
             "  • Постер: каждый час (:00)\n"
             "  • Ступенчатая генерация: каждый час (:30), только просевшие каналы\n"
-            "  • Импорт референсов: раз в день (08:00 UTC)\n"
+            "  • Авто-добор референсов: каждый час (:45), только если буфер < 5\n"
             "  • Чистка awaiting_media: каждый час (:15)\n"
             "  • РСЯ-перекрытия: каждую минуту (персистентно)\n"
             "  • Обновление chat_id/username: раз в день (+ на старте)\n"

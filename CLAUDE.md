@@ -138,7 +138,10 @@ loguru, paramiko, feedparser, fal-client, sentence-transformers + torch (CPU), t
 
 **Планировщик (bot.py on_startup, UTC; `job_defaults`: coalesce + max_instances=1 —
 после простоя нет burst-догонки/наложений):** poster.tick `:00`; run_top_up_cycle `:30`;
-reference_importer.import_all `08:00`; чистка `awaiting_media` `:15`; **process_due_ads
+reference_importer.import_low_buffer `:45` (авто-добор референсов ТОЛЬКО для каналов с
+буфером < `LOW_BUFFER_MIN`=5; слепого ежедневного импорта больше нет — ручной долив
+кнопкой «📥 Взять», `import_all` оставлен для ручного «импортнуть всё»);
+чистка `awaiting_media` `:15`; **process_due_ads
 каждую минуту** (РСЯ-перекрытия, персистентно); **monitor_channel_views каждые 36ч**
 (IntervalTrigger — первый запуск через 36ч, рестарты не спамят). На старте — реконсиляция:
 чистка осиротевших `awaiting_media`. РСЯ-перекрытие переживает рестарт (лежит в

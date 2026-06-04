@@ -315,8 +315,14 @@ def _load_active_channels() -> list[dict]:
     return channels
 
 
+# Порог «буфер просел» для авто-добора референсов. Слепого ежедневного импорта
+# больше нет — добираем ТОЛЬКО когда в очереди канала меньше LOW_BUFFER_MIN постов.
+LOW_BUFFER_MIN = 5
+
+
 async def import_all(count: int = DEFAULT_TAKE) -> dict:
-    """Ежедневный проход по всем каналам с референсами (берём новые/добираем старые)."""
+    """Проход по ВСЕМ каналам с референсами (берём новые/добираем старые).
+    Не на расписании — оставлен для ручного «импортнуть всё» при необходимости."""
     channels = _load_active_channels()
     total = 0
     for ch in channels:
@@ -326,5 +332,34 @@ async def import_all(count: int = DEFAULT_TAKE) -> dict:
         except Exception as e:
             logger.error(f"Импорт референсов [{ch.get('channel_id')}]: {e}")
             await _notify_admin(f"❌ <b>Импорт референсов</b> [{ch.get('channel_id')}]\n<code>{e}</code>")
-    logger.info(f"Ежедневный импорт референсов: каналов {len(channels)}, постов +{total}")
+    logger.info(f"Импорт референсов (все): каналов {len(channels)}, постов +{total}")
     return {"channels": len(channels), "added": total}
+
+
+async def import_low_buffer(min_level: int = LOW_BUFFER_MIN, count: int = DEFAULT_TAKE) -> dict:
+    """Авто-добор референсов ТОЛЬКО для каналов с просевшим буфером (< min_level).
+    Заменяет ежедневный слепой импорт: ручной долив — кнопкой «📥 Взять», а это —
+    страховка «буфер не пустеет» для каналов на референсах."""
+    channels = _load_active_channels()  # только активные с reference_channels
+    topped = 0
+    total = 0
+    for ch in channels:
+        cid = ch.get("channel_id")
+        try:
+            level = buffer.get_level(cid)
+        except Exception:
+            level = 0
+        if level >= min_level:
+            continue  # буфер в норме — не трогаем
+        try:
+            res = await import_for_channel(ch, count=count)
+            added = res.get("added", 0)
+            total += added
+            if added:
+                topped += 1
+            logger.info(f"Авто-добор референсов [{cid}]: буфер {level} < {min_level} → +{added}")
+        except Exception as e:
+            logger.error(f"Авто-добор референсов [{cid}]: {e}")
+            await _notify_admin(f"❌ <b>Авто-добор референсов</b> [{cid}]\n<code>{e}</code>")
+    logger.info(f"Авто-добор референсов (буфер < {min_level}): долито каналов {topped}, постов +{total}")
+    return {"topped": topped, "added": total}
