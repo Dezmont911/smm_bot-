@@ -57,3 +57,6 @@ screenshots/
 
 # --- Кэш Crawl4AI ---
 .crawl4ai/
+
+# Рантайм-настройки админ-панели (machine-specific, не коммитим)
+admin_settings.json
