@@ -22,7 +22,8 @@ loguru, paramiko, feedparser, fal-client, sentence-transformers + torch (CPU), t
 
 - **Локалка:** `C:\Projects\smm_bot\smm_bot` (Windows). Python-лаунчер: `py script.py`.
 - **VPS:** IP/пользователь/ключ — в локальном `.env` (`VPS_HOST`, `VPS_USER`, `VPS_KEY`); в коде
-  и git не хранятся. Папка `/opt/smm_bot`, venv `/opt/smm_bot/venv`. 2 vCPU / ~3.8 ГБ RAM / 48 ГБ + swap 4 ГБ.
+  и git не хранятся. Папка `/opt/smm_bot`, venv `/opt/smm_bot/venv`. 6 vCPU / ~11.6 ГБ RAM / 193 ГБ + swap 2 ГБ
+  (бот занимает ~1.6 ГБ — резидентный torch + модель эмбеддингов; CPU почти простаивает, входящих портов не слушает).
 - **Сервис:** systemd `smm_bot.service` (`systemctl restart smm_bot`), запускает `bot.py`.
 - **БД:** SQLite `/opt/smm_bot/data/content_factory.db` (WAL + busy_timeout=15000).
 - **Деплой:** `py deploy_fixes.py` — paramiko/SFTP заливает список `FILES`, гоняет миграции
