@@ -802,17 +802,23 @@ async def screen_queue(qm, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def action_clear_all_confirm(qm, context: ContextTypes.DEFAULT_TYPE):
-    """Запрашивает подтверждение очистки буфера ВСЕХ каналов."""
+    """Запрашивает подтверждение очистки буфера каналов текущего пользователя."""
     from database import db
-    with db.connect() as conn:
-        count = conn.execute(
-            "SELECT COUNT(*) FROM posts WHERE status IN ('ready','pending_review')"
-        ).fetchone()[0]
+    channel_ids = [ch["channel_id"] for ch in _load_channels(owner_id=_acting_uid(qm), scope="mine")]
+    if channel_ids:
+        placeholders = ",".join("?" for _ in channel_ids)
+        with db.connect() as conn:
+            count = conn.execute(
+                f"SELECT COUNT(*) FROM posts WHERE channel_id IN ({placeholders}) AND status IN ('ready','pending_review')",
+                channel_ids,
+            ).fetchone()[0]
+    else:
+        count = 0
 
     if count == 0:
         await _answer_or_send(
             qm,
-            "📭 Буфер всех каналов уже пуст.",
+            "📭 Буфер ваших каналов уже пуст.",
             InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="ui:queue")]]),
         )
         return
@@ -823,28 +829,33 @@ async def action_clear_all_confirm(qm, context: ContextTypes.DEFAULT_TYPE):
     ])
     await _answer_or_send(
         qm,
-        f"🧹 <b>Очистить буфер ВСЕХ каналов?</b>\n\n"
+        f"🧹 <b>Очистить буфер ваших каналов?</b>\n\n"
         f"Будет удалено <b>{count} постов</b> со статусом «готов» и «на проверке» "
-        f"по всем каналам разом.\nОпубликованные посты не затрагиваются.",
+        f"по вашим каналам разом.\nОпубликованные посты не затрагиваются.",
         kb,
     )
 
 
 async def action_clear_all_ok(qm, context: ContextTypes.DEFAULT_TYPE):
-    """Очищает буфер всех каналов: ready/pending_review → skipped."""
+    """Очищает буфер каналов текущего пользователя: ready/pending_review -> skipped."""
     from database import db
-    with db.connect() as conn:
-        count = conn.execute(
-            "UPDATE posts SET status='skipped' WHERE status IN ('ready','pending_review')"
-        ).rowcount
-        conn.commit()
+    channel_ids = [ch["channel_id"] for ch in _load_channels(owner_id=_acting_uid(qm), scope="mine")]
+    if channel_ids:
+        placeholders = ",".join("?" for _ in channel_ids)
+        with db.connect() as conn:
+            count = conn.execute(
+                f"UPDATE posts SET status='skipped' WHERE channel_id IN ({placeholders}) AND status IN ('ready','pending_review')",
+                channel_ids,
+            ).rowcount
+            conn.commit()
+    else:
+        count = 0
 
-    logger.info(f"Буфер очищен по ВСЕМ каналам, удалено {count} постов")
+    logger.info(f"Буфер очищен по каналам пользователя, удалено {count} постов")
     await _answer_or_send(
         qm,
-        f"🧹 Буфер очищен по всем каналам — удалено <b>{count} постов</b>.",
+        f"🧹 Буфер очищен по вашим каналам — удалено <b>{count} постов</b>.",
         InlineKeyboardMarkup([
-            [InlineKeyboardButton("⚡ Генерить для всех", callback_data="ui:generate_all")],
             [InlineKeyboardButton("◀️ Назад", callback_data="ui:main")],
         ]),
     )
@@ -2842,14 +2853,26 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # (parts[2] = @handle) или пост (draft-действия по post_id) — проверяем владение.
     # Пропуск хотя бы одного канало-зависимого действия = утечка в чужой канал.
     _POST_ACTIONS = {"draft_edit", "draft_media", "draft_q", "draft_del", "draft_view"}
+    _CHANNEL_ACTIONS = {
+        "ch", "ch_settings", "ch_topic_redo", "ch_pause", "ch_delete", "ch_delete_ok",
+        "ch_clear", "ch_clear_ok", "ch_generate", "ch_gen_run", "ch_postnow",
+        "ch_review", "ch_schedule", "ch_sched_toggle", "ch_sched_clear",
+        "ch_sched_custom", "ch_sched_copy", "ch_sched_copy_ok", "ch_images_toggle",
+        "ch_history", "ch_set", "ch_set_img", "ch_folder", "ch_setfold",
+        "ch_newfold", "ch_restore", "ch_draft", "draft_new", "draft_qlast",
+        "draft_qall", "draft_clear", "draft_clearok", "rsy_toggle",
+        "ch_archetype", "ch_set_arche", "ch_source_toggle", "ch_src_mode",
+        "ch_refs", "ref_tgl", "ref_del", "ref_add", "ref_take", "ref_go",
+        "ref_import", "rss_del", "rss_clear", "rss_add", "rss_ai", "rss_ai_ok",
+    }
     if len(parts) >= 3 and parts[2]:
         _p2 = parts[2]
         _ch = None
-        if _p2.startswith("@"):
-            _ch = _load_channel(_p2)
-        elif action in _POST_ACTIONS:
+        if action in _POST_ACTIONS:
             _cid = buffer.get_post_channel(_p2)
             _ch = _load_channel(_cid) if _cid else None
+        elif action in _CHANNEL_ACTIONS or _p2.startswith("@"):
+            _ch = _load_channel(_p2)
         if _ch is not None and not _owns(uid, _ch):
             await query.answer("⛔ Это не твой канал.", show_alert=True)
             return
@@ -2980,6 +3003,9 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await action_clear_all_ok(query, context)
 
     elif action == "generate_all":
+        if not accounts.is_superadmin(uid):
+            await query.answer("Только для владельца.", show_alert=True)
+            return
         await query.answer("⚡ Запускаю генерацию для всех каналов...")
         try:
             from content_generator import generator as gen
@@ -3102,10 +3128,12 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         src_handle  = parts[3]
         ch_dst = _load_channel(handle)
         ch_src = _load_channel(src_handle)
-        if ch_dst and ch_src:
-            ch_dst["post_times_utc"] = ch_src.get("post_times_utc", [6, 9, 13, 17])
-            _save_channel(ch_dst)
-            await query.answer("✅ Расписание скопировано!")
+        if not ch_dst or not ch_src or not _owns(uid, ch_dst) or not _owns(uid, ch_src):
+            await query.answer("⛔ Нет доступа к одному из каналов.", show_alert=True)
+            return
+        ch_dst["post_times_utc"] = ch_src.get("post_times_utc", [6, 9, 13, 17])
+        _save_channel(ch_dst)
+        await query.answer("✅ Расписание скопировано!")
         await screen_schedule(query, context, handle)
 
     elif action == "ch_history" and len(parts) >= 3:
