@@ -3574,15 +3574,21 @@ async def handle_userbot_forward(update: Update, context: ContextTypes.DEFAULT_T
             logger.info(f"Relay: привязал {media_type} к {topic} → ready")
             matched = True
         else:
-            logger.debug(f"Relay: нет awaiting_media для {topic} (уже привязано/чужой форвард)")
+            logger.info(
+                f"Relay: нет awaiting_media для {topic} — несматченный форвард "
+                f"(донор-репост/дубль?), чищу из ЛС"
+            )
 
-    # Чистим ЛС бота: file_id уже сохранён и остаётся валидным после удаления,
-    # поэтому удаляем пересланное сообщение, чтобы не засорять чат с ботом.
-    if matched:
-        try:
-            await msg.delete()
-        except Exception as e:
-            logger.debug(f"Relay: не смог удалить служебное сообщение из ЛС: {e}")
+    # Чистим ЛС бота ВСЕГДА (а не только при matched): сюда доходят лишь форварды
+    # с forward_from_chat-username — это медиа доноров, пересланные юзерботом,
+    # т.е. мусор после обработки. Несматченные (напр. донор-репост: Telegram ставит
+    # forward_from_chat на ОРИГИНАЛ, и ключ ref:донор:id не совпадает) раньше
+    # оставались висеть в диалоге с ботом — теперь удаляем тоже. file_id, если
+    # сматчился, уже сохранён и остаётся валидным после удаления сообщения.
+    try:
+        await msg.delete()
+    except Exception as e:
+        logger.debug(f"Relay: не смог удалить служебное сообщение из ЛС: {e}")
 
 
 # ============================================================
