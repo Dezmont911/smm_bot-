@@ -3786,6 +3786,37 @@ def _is_tester_channel(ch: dict) -> bool:
     return oid is not None and not is_admin(oid)
 
 
+def _channel_username(ch: dict) -> str | None:
+    """Текущий @username канала (для t.me-ссылок), без @. None — если только числовой id."""
+    u = (ch.get("username") or "").strip().lstrip("@")
+    if not u:
+        cid = (ch.get("channel_id") or "").strip().lstrip("@")
+        u = cid if cid and not cid.lstrip("-").isdigit() else ""
+    return u or None
+
+
+def _channel_link(ch: dict) -> str | None:
+    """Ссылка на канал: t.me/<username> или t.me/c/<internal> (приватный)."""
+    u = _channel_username(ch)
+    if u:
+        return f"https://t.me/{u}"
+    num = str(ch.get("chat_id_num") or "")
+    if num.startswith("-100"):
+        return f"https://t.me/c/{num[4:]}"
+    return None
+
+
+def _post_link(ch: dict, msg_id: int) -> str | None:
+    """Прямая ссылка на пост: t.me/<username>/<id> или t.me/c/<internal>/<id>."""
+    u = _channel_username(ch)
+    if u:
+        return f"https://t.me/{u}/{msg_id}"
+    num = str(ch.get("chat_id_num") or "")
+    if num.startswith("-100"):
+        return f"https://t.me/c/{num[4:]}/{msg_id}"
+    return None
+
+
 async def monitor_channel_views(bot):
     """Сводный дайджест по охватам моих каналов (раз в 36ч)."""
     import userbot_reader
@@ -3835,19 +3866,30 @@ async def monitor_channel_views(bot):
         logger.info("views-monitor: всё в норме, алерт не нужен")
         return
 
+    await send_alert(bot, _views_digest_text(flagged))
+    logger.info(f"views-monitor: алерт отправлен, каналов в списке {len(flagged)}")
+
+
+def _views_digest_text(flagged: list) -> str:
+    """Собирает HTML-дайджест со ссылками на канал и недобравшие посты.
+    flagged: [(ch, subs|None, [{'id','views'}, ...]), ...]."""
     import html as _html
     lines = [f"📊 <b>Мониторинг охватов</b> (посты ~48ч, порог {VIEWS_MIN} показов / {SUBS_MIN} подписчиков)\n"]
-    for ch, subs, low_posts in flagged[:30]:
-        name = _html.escape(ch.get("name") or ch.get("channel_id"))
-        handle = _html.escape(ch.get("channel_id", ""))
+    for ch, subs, low_posts in flagged[:20]:
+        name = _html.escape(ch.get("name") or ch.get("channel_id") or "?")
+        clink = _channel_link(ch)
+        title = f'<a href="{clink}">{name}</a>' if clink else f"<b>{name}</b>"
         subs_s = f"{subs} подписчиков" if subs is not None else "подписчики ?"
-        mark = " ⚠️<1550" if (subs is not None and subs < SUBS_MIN) else ""
-        lines.append(f"• <b>{name}</b> <code>{handle}</code> — {subs_s}{mark}")
-        if low_posts:
-            worst = ", ".join(f"#{p['id']} ({p['views']})" for p in low_posts[:5])
-            lines.append(f"   📉 посты с &lt;{VIEWS_MIN} показов: {worst}")
-    await send_alert(bot, "\n".join(lines))
-    logger.info(f"views-monitor: алерт отправлен, каналов в списке {len(flagged)}")
+        mark = " ⚠️ &lt;1550" if (subs is not None and subs < SUBS_MIN) else ""
+        lines.append(f"• {title} — {subs_s}{mark}")
+        for p in low_posts[:5]:
+            plink = _post_link(ch, p["id"])
+            label = f"пост #{p['id']}"
+            link = f'<a href="{plink}">{label}</a>' if plink else label
+            lines.append(f"   📉 {link} — {p['views']} показов")
+    if len(flagged) > 20:
+        lines.append(f"\n…и ещё {len(flagged) - 20} каналов")
+    return "\n".join(lines)
 
 
 # ============================================================
