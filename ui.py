@@ -234,8 +234,9 @@ async def screen_main(qm, context: ContextTypes.DEFAULT_TYPE):
     active = len(channels)
     total_posts = sum(buffer.get_level(ch["channel_id"]) for ch in channels)
 
-    # Иконки уровня буфера
-    buf_icon = "✅" if total_posts >= cfg.BUFFER_MIN * active else (
+    # Иконки уровня буфера (порог здоровья = целевой уровень добора)
+    _buf_ok = getattr(cfg, "BUFFER_TARGET", cfg.BUFFER_MIN)
+    buf_icon = "✅" if total_posts >= _buf_ok * active else (
         "⚠️" if total_posts > 0 else "🔴"
     )
 

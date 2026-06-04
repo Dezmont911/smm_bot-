@@ -336,10 +336,18 @@ async def import_all(count: int = DEFAULT_TAKE) -> dict:
     return {"channels": len(channels), "added": total}
 
 
-async def import_low_buffer(min_level: int = LOW_BUFFER_MIN, count: int = DEFAULT_TAKE) -> dict:
-    """Авто-добор референсов ТОЛЬКО для каналов с просевшим буфером (< min_level).
-    Заменяет ежедневный слепой импорт: ручной долив — кнопкой «📥 Взять», а это —
-    страховка «буфер не пустеет» для каналов на референсах."""
+async def import_low_buffer(min_level: int = LOW_BUFFER_MIN, target: int | None = None) -> dict:
+    """Авто-добор для каналов с ДОНОРОМ и просевшим буфером (< min_level).
+
+    Приоритет источника: сначала добираем с донора (референсы) ДО `target`. Если
+    донор пуст/исчерпан и буфер всё ещё ниже target — фолбэк: добиваем генерацией
+    (для marketplace — WB-парсером) через generator.run_for_channel. Так донорский
+    контент в приоритете, но буфер не пустеет.
+
+    Слепого ежедневного импорта нет: ручной долив — кнопкой «📥 Взять».
+    """
+    from config import cfg
+    target = target or getattr(cfg, "BUFFER_TARGET", LOW_BUFFER_MIN)
     channels = _load_active_channels()  # только активные с reference_channels
     topped = 0
     total = 0
@@ -351,15 +359,38 @@ async def import_low_buffer(min_level: int = LOW_BUFFER_MIN, count: int = DEFAUL
             level = 0
         if level >= min_level:
             continue  # буфер в норме — не трогаем
+        gap = target - level
+        if gap <= 0:
+            continue
+
+        # 1) приоритет — донор
         try:
-            res = await import_for_channel(ch, count=count)
+            res = await import_for_channel(ch, count=gap)
             added = res.get("added", 0)
             total += added
             if added:
                 topped += 1
-            logger.info(f"Авто-добор референсов [{cid}]: буфер {level} < {min_level} → +{added}")
+            logger.info(f"Авто-добор [{cid}]: буфер {level} < {min_level}, с донора +{added}")
         except Exception as e:
-            logger.error(f"Авто-добор референсов [{cid}]: {e}")
+            logger.error(f"Авто-добор [{cid}] (донор): {e}")
             await _notify_admin(f"❌ <b>Авто-добор референсов</b> [{cid}]\n<code>{e}</code>")
-    logger.info(f"Авто-добор референсов (буфер < {min_level}): долито каналов {topped}, постов +{total}")
+
+        # 2) фолбэк — донор не закрыл нехватку → генерация/WB до target
+        try:
+            new_level = buffer.get_level(cid)
+        except Exception:
+            new_level = level
+        if new_level < target:
+            need = target - new_level
+            try:
+                from content_generator import generator
+                r = await generator.run_for_channel(ch, target_count=need)
+                gen = r.get("generated", 0)
+                total += gen
+                if gen:
+                    logger.info(f"Авто-добор [{cid}]: фолбэк (донор пуст) +{gen} генерацией/WB")
+            except Exception as e:
+                logger.error(f"Авто-добор [{cid}] (фолбэк генерация): {e}")
+
+    logger.info(f"Авто-добор (буфер < {min_level}, цель {target}): затронуто каналов {topped}, постов +{total}")
     return {"topped": topped, "added": total}

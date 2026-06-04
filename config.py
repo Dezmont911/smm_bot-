@@ -101,6 +101,11 @@ class Config:
     BUFFER_CRITICAL: int = field(
         default_factory=lambda: int(_optional("BUFFER_CRITICAL", "2"))
     )
+    # Целевой уровень добора: при буфере ниже него докручиваем очередь ДО него
+    # (и генерация, и референсы добивают именно до BUFFER_TARGET, не переполняя).
+    BUFFER_TARGET: int = field(
+        default_factory=lambda: int(_optional("BUFFER_TARGET", "5"))
+    )
 
     # --- Задержка публикации (в секундах) ---
     POST_DELAY_MIN: int = field(

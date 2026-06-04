@@ -401,16 +401,23 @@ class ContentGenerator:
     # Ступенчатая генерация (вместо ночного батча на все каналы)
     # --------------------------------------------------------
 
-    async def run_top_up_cycle(self, batch_per_channel: int = 3, max_total: int = 30) -> dict:
+    async def run_top_up_cycle(self, batch_per_channel: int = 5, max_total: int = 30) -> dict:
         """
         Подливает посты понемногу: раз в час догенерирует небольшими порциями
         ТОЛЬКО каналы с просевшим буфером. Распределяет нагрузку по дню вместо
         одного большого батча ночью и держит темы свежими.
 
+        Каналы с донором (reference_channels) ЗДЕСЬ ПРОПУСКАЕМ — у них приоритет
+        добора с донора, ими занимается reference_importer.import_low_buffer
+        (с фолбэком на генерацию, если донор пуст). Иначе был бы двойной залив.
+
         batch_per_channel — сколько постов максимум за раз на канал.
         max_total — потолок постов за один цикл (чтобы не было пика).
         """
+        target = getattr(cfg, "BUFFER_TARGET", cfg.BUFFER_MIN)
         channels = self._load_all_channels()
+        # доноры — мимо (их добирает import_low_buffer, приоритет донора)
+        channels = [c for c in channels if not c.get("reference_channels")]
         # сначала самые «голодные» каналы
         channels.sort(key=lambda c: buffer.get_level(c["channel_id"]))
 
@@ -421,9 +428,9 @@ class ContentGenerator:
                 break
             cid = ch["channel_id"]
             level = buffer.get_level(cid)
-            if level >= cfg.BUFFER_MIN:
+            if level >= target:
                 continue  # буфер в норме — пропускаем
-            need = min(batch_per_channel, max_total - total, cfg.BUFFER_MIN - level)
+            need = min(batch_per_channel, max_total - total, target - level)
             if need <= 0:
                 continue
             try:
