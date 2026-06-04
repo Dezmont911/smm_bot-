@@ -81,6 +81,11 @@ async def generate_image(
         url = images[0].get("url")
         if url:
             logger.info(f"fal.ai OK | {url[:80]}...")
+            try:
+                from cost_tracker import record_fal
+                record_fal(1)
+            except Exception:
+                pass
         return url
 
     except ImportError:

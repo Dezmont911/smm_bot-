@@ -40,6 +40,7 @@ FILES = [
     "userbot_reader.py",  # НОВЫЙ модуль — чтение канала по @username через Telethon
     "reference_importer.py",  # НОВЫЙ модуль — импорт постов из каналов-доноров
     "accounts.py",        # НОВЫЙ модуль — SaaS: пользователи, инвайты, планы, доступ
+    "cost_tracker.py",    # НОВЫЙ модуль — учёт расходов на Claude/fal.ai
 ]
 
 # (локальный путь относительно LOCAL_BASE, удалённый путь относительно REMOTE_BASE, метка)

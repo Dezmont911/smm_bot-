@@ -158,6 +158,25 @@ class Database:
                 );
 
                 -- --------------------------------------------------------
+                -- Учёт расходов на платные сервисы (Claude, fal.ai)
+                -- Пишется на каждый вызов; для просмотра «сколько потрачено»
+                -- за период (сегодня / 7 / 30 дней / всё время / произвольно).
+                -- --------------------------------------------------------
+                CREATE TABLE IF NOT EXISTS usage_costs (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts            TEXT NOT NULL,        -- UTC '%Y-%m-%dT%H:%M:%S'
+                    service       TEXT NOT NULL,        -- 'claude' | 'fal'
+                    model         TEXT,                 -- модель / endpoint
+                    purpose       TEXT,                 -- generate/analyze/topic/image/...
+                    input_tokens  INTEGER DEFAULT 0,
+                    output_tokens INTEGER DEFAULT 0,
+                    units         INTEGER DEFAULT 0,    -- кол-во картинок (fal)
+                    cost_usd      REAL NOT NULL DEFAULT 0
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_usage_costs_ts ON usage_costs(ts);
+
+                -- --------------------------------------------------------
                 -- Индексы для быстрых запросов
                 -- --------------------------------------------------------
                 CREATE INDEX IF NOT EXISTS idx_posts_channel_status

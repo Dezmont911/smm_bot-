@@ -54,6 +54,7 @@ async def claude_text(
     model: str | None = None,
     temperature: float | None = None,
     retries: int = 2,
+    purpose: str = "",
 ) -> str:
     """
     Вызывает Claude и возвращает текст ответа.
@@ -76,6 +77,19 @@ async def claude_text(
     for attempt in range(retries + 1):
         try:
             message = await aclient.messages.create(**kwargs)
+            # Учёт расходов (мягко — не ломаем вызов при сбое учёта)
+            try:
+                from cost_tracker import record_claude
+                u = getattr(message, "usage", None)
+                if u is not None:
+                    record_claude(
+                        model,
+                        getattr(u, "input_tokens", 0) or 0,
+                        getattr(u, "output_tokens", 0) or 0,
+                        purpose=purpose,
+                    )
+            except Exception:
+                pass
             return _extract_text(message)
         except (anthropic.APIConnectionError, anthropic.APIStatusError) as e:
             last_err = e

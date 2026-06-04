@@ -435,6 +435,45 @@ async def read_channel(username: str, limit: int = 40) -> dict:
         await client.disconnect()
 
 
+@_userbot_op
+async def read_post_views(username: str, limit: int = 25) -> dict:
+    """
+    Читает последние посты канала и их счётчики просмотров (для мониторинга охватов).
+    Просмотры публичны — юзербот видит их без подписки. Bot API просмотры НЕ отдаёт,
+    поэтому только через Telethon.
+
+    Возвращает: {"handle", "posts": [{"id", "date": ISO-UTC, "views": int|None}]}.
+    Посты — от новых к старым.
+    """
+    uname = normalize_handle(username).lstrip("@")
+    if not uname:
+        raise ValueError("Пустой username")
+
+    client = _make_client()
+    await client.connect()
+    try:
+        if not await client.is_user_authorized():
+            raise UserbotNotAuthorized("Сессия юзербота не авторизована")
+
+        entity = await client.get_entity(uname)
+        real_username = getattr(entity, "username", None) or uname
+
+        posts = []
+        async for msg in client.iter_messages(entity, limit=limit):
+            if getattr(msg, "action", None) is not None:
+                continue  # служебные сообщения (вступления и т.п.)
+            dt = getattr(msg, "date", None)
+            posts.append({
+                "id": msg.id,
+                "date": dt.strftime("%Y-%m-%dT%H:%M:%S") if dt else None,
+                "views": getattr(msg, "views", None),
+            })
+        logger.info(f"read_post_views @{real_username}: {len(posts)} постов")
+        return {"handle": "@" + real_username, "posts": posts}
+    finally:
+        await client.disconnect()
+
+
 def _media_kind(msg) -> str | None:
     """Тип медиа сообщения: 'photo' / 'video' / None (текст или неподдерживаемое)."""
     if getattr(msg, "photo", None):

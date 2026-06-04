@@ -109,13 +109,22 @@ loguru, paramiko, feedparser, fal-client, sentence-transformers + torch (CPU), t
   `drafts_to_ready_all`, `set_draft_content/media`, `delete[_all]_draft(s)`), РСЯ
   (`record_pending_ad`, `get_due_ads`, `mark_ad_published/failed`, `has_pending_overlay`).
 - `database.py` — `posts` (+ `tg_file_id` relay-медиа), `processed_ads` (+ `due_at` —
-  персистентное РСЯ-перекрытие), channels, topic_cache, evergreen_topics, error_log.
+  персистентное РСЯ-перекрытие), channels, topic_cache, evergreen_topics, error_log,
+  `users`/`invite_codes` (SaaS), `usage_costs` (учёт расходов на сервисы).
+- `cost_tracker.py` — учёт фактических трат: `record_claude(model,in,out)` (цена по
+  семейству модели: haiku $1/$5, sonnet $3/$15, opus $15/$75 за Mtok) + `record_fal(n)`
+  ($0.003/картинка) пишут в `usage_costs`; `summary(since)` — сводка за период. Запись
+  «мягкая» (в try, не ломает генерацию). Зовётся из `claude_helper`/`image_generator`.
+  Баланс/остаток сервисы не отдают → считаем САМИ по факту. Пинга нет — только просмотр.
 - `config.py` — `cfg` (dataclass из .env). CLAUDE_MODEL=claude-haiku-4-5-20251001.
+  Цены сервисов: `CLAUDE_INPUT/OUTPUT_USD_PER_MTOK`, `FAL_IMAGE_USD` (переопределяемы в .env).
 - `ui.py` — inline-меню. «Мои каналы»: верх (➕ Добавить · 🔍 Поиск · 🗑 Удалённые),
   тумблеры 🔵/⚪, пагинация по 10. Карточка: Генерить/Постнуть/🔗 Референсы/✍️ Черновик/
   Настройки. **Черновик** = ручные посты (текст/фото/видео, карточки с медиа, ✏️ текст/
   🖼 медиа, в очередь по одному/все, очистить). Референсы: «📥 Взять» → выбор N (5/10/20/50
-  или число, кап 50).
+  или число, кап 50). **Админ-панель** (только superadmin): инвайты, 👥 Пользователи,
+  📡 Каналы пользователей (тестерские, отдельно от своих), 💰 Расходы (Claude/fal.ai за
+  сегодня/7/30 дней/всё время/свой период — ввод числа дней через `awaiting_cost_days`).
 - `wb_parser.py` — маркетплейс WB (ЕДИНСТВЕННЫЙ парсер; `wb_partner_parser` удалён).
   **Гибрид подбора артикулов:** (1) `search_articles`/`_discover_articles` — ЖИВОЙ поиск
   товаров через `search.wb.ru` по `wb_categories` канала (НАПРЯМУЮ с VPS, БЕЗ прокси —
@@ -130,8 +139,17 @@ loguru, paramiko, feedparser, fal-client, sentence-transformers + torch (CPU), t
 **Планировщик (bot.py on_startup, UTC; `job_defaults`: coalesce + max_instances=1 —
 после простоя нет burst-догонки/наложений):** poster.tick `:00`; run_top_up_cycle `:30`;
 reference_importer.import_all `08:00`; чистка `awaiting_media` `:15`; **process_due_ads
-каждую минуту** (РСЯ-перекрытия, персистентно). На старте — реконсиляция: чистка осиротевших
-`awaiting_media`. РСЯ-перекрытие переживает рестарт (лежит в `processed_ads`, не в asyncio.Task).
+каждую минуту** (РСЯ-перекрытия, персистентно); **monitor_channel_views каждые 36ч**
+(IntervalTrigger — первый запуск через 36ч, рестарты не спамят). На старте — реконсиляция:
+чистка осиротевших `awaiting_media`. РСЯ-перекрытие переживает рестарт (лежит в
+`processed_ads`, не в asyncio.Task).
+
+**Мониторинг охватов (`monitor_channel_views` в bot.py, раз в 36ч):** только МОИ
+(админские) каналы (не тестерские). Подписчики — `bot.get_chat_member_count`; просмотры —
+`userbot_reader.read_post_views` (Bot API просмотры не отдаёт, только Telethon). Правило
+**ИЛИ**: пост возрастом 48–96ч с `<VIEWS_MIN`=300 показов ИЛИ канал с `<SUBS_MIN`=1550
+подписчиков → один сводный дайджест в ЛС админа (`send_alert`). Маленькие каналы попадают
+в дайджест всегда (следствие ИЛИ).
 
 ---
 

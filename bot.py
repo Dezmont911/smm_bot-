@@ -50,6 +50,7 @@ from loguru import logger
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from config import cfg
 from database import db
@@ -3232,6 +3233,12 @@ async def handle_image_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await screen_channels_search(update.message, context, update.message.text or "")
         return
 
+    # Свой период для «💰 Расходы» (ввод числа дней) — только админ ставит этот режим
+    if context.user_data.pop("awaiting_cost_days", False):
+        from ui import screen_admin_costs_custom
+        await screen_admin_costs_custom(update.message, context, update.message.text or "")
+        return
+
     # Сначала пробуем обработать как ввод настроек (ui.py)
     if context.user_data.get("editing"):
         handled = await handle_settings_text_input(update, context)
@@ -3763,6 +3770,86 @@ async def send_alert(bot, message: str):
         logger.error(f"Не удалось отправить алерт: {e}")
 
 
+# ── Мониторинг охватов админских каналов ────────────────────────────────────
+# Раз в 36ч смотрим посты, которым исполнилось ~48ч, и подписчиков. Пингуем по
+# правилу ИЛИ: пост с <VIEWS_MIN показов ИЛИ канал с <SUBS_MIN подписчиков.
+# Только МОИ (админские) каналы — тестерские не трогаем.
+VIEWS_MIN = 300
+SUBS_MIN = 1550
+MATURE_MIN_H = 48     # пост уже «дозрел» (было ≥48ч на набор показов)
+MATURE_MAX_H = 96     # но не слишком старый (чтобы не дёргать одно и то же неделями)
+
+
+def _is_tester_channel(ch: dict) -> bool:
+    """Канал тестера: есть owner_id и это не админ (см. ui._is_tester_channel)."""
+    oid = ch.get("owner_id")
+    return oid is not None and not is_admin(oid)
+
+
+async def monitor_channel_views(bot):
+    """Сводный дайджест по охватам моих каналов (раз в 36ч)."""
+    import userbot_reader
+    from datetime import datetime, timezone
+
+    channels = [c for c in load_all_channels() if not _is_tester_channel(c)]
+    now = datetime.now(timezone.utc)
+    flagged = []  # [(ch, subs, low_posts)]
+
+    for ch in channels:
+        handle = ch.get("channel_id")
+        if not handle:
+            continue
+        target = ch.get("chat_id_num") or handle
+
+        # Подписчики через Bot API (бот — админ канала)
+        subs = None
+        try:
+            subs = await bot.get_chat_member_count(target)
+        except Exception as e:
+            logger.debug(f"views-monitor: нет числа подписчиков {handle}: {e}")
+
+        # Просмотры через юзербот (Bot API их не отдаёт)
+        low_posts = []
+        try:
+            data = await userbot_reader.read_post_views(handle, limit=25)
+            for p in data.get("posts", []):
+                views = p.get("views")
+                ds = p.get("date")
+                if views is None or not ds:
+                    continue
+                try:
+                    pdt = datetime.strptime(ds, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+                age_h = (now - pdt).total_seconds() / 3600
+                if MATURE_MIN_H <= age_h <= MATURE_MAX_H and views < VIEWS_MIN:
+                    low_posts.append({"id": p["id"], "views": views})
+        except Exception as e:
+            logger.debug(f"views-monitor: нет просмотров {handle}: {e}")
+
+        subs_low = subs is not None and subs < SUBS_MIN
+        if subs_low or low_posts:   # правило ИЛИ
+            flagged.append((ch, subs, low_posts))
+
+    if not flagged:
+        logger.info("views-monitor: всё в норме, алерт не нужен")
+        return
+
+    import html as _html
+    lines = [f"📊 <b>Мониторинг охватов</b> (посты ~48ч, порог {VIEWS_MIN} показов / {SUBS_MIN} подписчиков)\n"]
+    for ch, subs, low_posts in flagged[:30]:
+        name = _html.escape(ch.get("name") or ch.get("channel_id"))
+        handle = _html.escape(ch.get("channel_id", ""))
+        subs_s = f"{subs} подписчиков" if subs is not None else "подписчики ?"
+        mark = " ⚠️<1550" if (subs is not None and subs < SUBS_MIN) else ""
+        lines.append(f"• <b>{name}</b> <code>{handle}</code> — {subs_s}{mark}")
+        if low_posts:
+            worst = ", ".join(f"#{p['id']} ({p['views']})" for p in low_posts[:5])
+            lines.append(f"   📉 посты с &lt;{VIEWS_MIN} показов: {worst}")
+    await send_alert(bot, "\n".join(lines))
+    logger.info(f"views-monitor: алерт отправлен, каналов в списке {len(flagged)}")
+
+
 # ============================================================
 # Глобальный обработчик ошибок
 # ============================================================
@@ -4172,6 +4259,20 @@ def main():
             misfire_grace_time=3600,
         )
 
+        # Мониторинг охватов моих каналов — раз в 36ч. Первый запуск через 36ч
+        # после старта (IntervalTrigger), чтобы рестарты не спамили алертами.
+        async def _monitor_views():
+            await monitor_channel_views(application.bot)
+
+        scheduler.add_job(
+            _monitor_views,
+            IntervalTrigger(hours=36),
+            id="views_monitor",
+            name="Мониторинг охватов каналов",
+            misfire_grace_time=3600,
+            max_instances=1,
+        )
+
         scheduler.start()
         application.bot_data["scheduler"] = scheduler
 
@@ -4197,7 +4298,8 @@ def main():
             "  • Импорт референсов: раз в день (08:00 UTC)\n"
             "  • Чистка awaiting_media: каждый час (:15)\n"
             "  • РСЯ-перекрытия: каждую минуту (персистентно)\n"
-            "  • Обновление chat_id/username: раз в день (+ на старте)"
+            "  • Обновление chat_id/username: раз в день (+ на старте)\n"
+            "  • Мониторинг охватов моих каналов: раз в 36ч"
         )
 
     async def on_shutdown(application):

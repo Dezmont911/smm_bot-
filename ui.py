@@ -2594,6 +2594,7 @@ async def screen_admin(qm, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🎟 Инвайт (5 чел · 30 дней)", callback_data="ui:adm_inv:5:30")],
         [InlineKeyboardButton(f"👥 Пользователи ({len(users)})", callback_data="ui:adm_users")],
         [InlineKeyboardButton(f"📡 Каналы пользователей ({len(tester_chans)})", callback_data="ui:adm_chans:0")],
+        [InlineKeyboardButton("💰 Расходы", callback_data="ui:adm_cost:today")],
         [InlineKeyboardButton("◀️ В меню", callback_data="ui:main")],
     ])
     await _answer_or_send(qm, text, kb)
@@ -2704,6 +2705,75 @@ async def screen_admin_user_channels(qm, context: ContextTypes.DEFAULT_TYPE, pag
     await _answer_or_send(qm, f"{header}\n\n{legend}", InlineKeyboardMarkup(rows))
 
 
+def _costs_text(title: str, since: str | None) -> str:
+    """Рендер сводки расходов за период."""
+    import cost_tracker
+    s = cost_tracker.summary(since)
+    cl, fl = s["claude"], s["fal"]
+    return (
+        f"💰 <b>Расходы</b> · {title}\n\n"
+        f"🤖 <b>Claude</b>: ${cl['cost']:.2f}\n"
+        f"    {cl['calls']} вызовов · {cl['in_tok']:,} вход / {cl['out_tok']:,} выход токенов\n\n"
+        f"🎨 <b>fal.ai (FLUX)</b>: ${fl['cost']:.2f}\n"
+        f"    {fl['units']} картинок\n\n"
+        f"━━━━━━━━━━━━━\n"
+        f"<b>Итого: ${s['total']:.2f}</b>"
+    ).replace(",", " ")
+
+
+def _costs_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Сегодня", callback_data="ui:adm_cost:today"),
+            InlineKeyboardButton("7 дней",  callback_data="ui:adm_cost:7"),
+            InlineKeyboardButton("30 дней", callback_data="ui:adm_cost:30"),
+        ],
+        [
+            InlineKeyboardButton("Всё время",   callback_data="ui:adm_cost:all"),
+            InlineKeyboardButton("📅 Свой период", callback_data="ui:adm_cost:custom"),
+        ],
+        [InlineKeyboardButton("◀️ Админ-панель", callback_data="ui:admin")],
+    ])
+
+
+async def screen_admin_costs(qm, context: ContextTypes.DEFAULT_TYPE, period: str = "today"):
+    """Расходы на сервисы за период: сегодня / 7 / 30 дней / всё время / свой период."""
+    import cost_tracker
+    if period == "custom":
+        context.user_data["awaiting_cost_days"] = True
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="ui:adm_cost:today")]])
+        await _answer_or_send(
+            qm, "📅 <b>Свой период</b>\n\nПришли число дней (например <code>14</code>) — "
+                "посчитаю расходы за последние N дней.", kb)
+        return
+
+    if period == "today":
+        title, since = "сегодня", cost_tracker.since_today_msk()
+    elif period == "all":
+        title, since = "всё время", None
+    elif period.isdigit():
+        n = int(period)
+        title, since = f"{n} дней", cost_tracker.since_days(n)
+    else:
+        title, since = "сегодня", cost_tracker.since_today_msk()
+
+    await _answer_or_send(qm, _costs_text(title, since), _costs_keyboard())
+
+
+async def screen_admin_costs_custom(qm, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Обработка ввода числа дней для произвольного периода расходов."""
+    import cost_tracker
+    digits = "".join(ch for ch in (text or "") if ch.isdigit())
+    if not digits:
+        context.user_data["awaiting_cost_days"] = True
+        await _answer_or_send(
+            qm, "❌ Нужно число дней. Пришли, например, <code>14</code>.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="ui:adm_cost:today")]]))
+        return
+    n = max(1, min(int(digits), 3650))
+    await _answer_or_send(qm, _costs_text(f"{n} дней", cost_tracker.since_days(n)), _costs_keyboard())
+
+
 async def action_admin_revoke(qm, context, uid: str):
     try:
         accounts.revoke_user(int(uid))
@@ -2745,7 +2815,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # 👑 Админ-действия — только для главного владельца (superadmin)
-    if action in ("admin", "adm_inv", "adm_users", "adm_revoke", "adm_pro", "adm_chans"):
+    if action in ("admin", "adm_inv", "adm_users", "adm_revoke", "adm_pro", "adm_chans", "adm_cost"):
         if not accounts.is_superadmin(uid):
             await query.answer("Только для владельца.", show_alert=True)
             return
@@ -2758,6 +2828,9 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action == "adm_chans":
             page = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 0
             await screen_admin_user_channels(query, context, page)
+        elif action == "adm_cost":
+            period = parts[2] if len(parts) >= 3 and parts[2] else "today"
+            await screen_admin_costs(query, context, period)
         elif action == "adm_revoke" and len(parts) >= 3:
             await action_admin_revoke(query, context, parts[2])
         elif action == "adm_pro" and len(parts) >= 3:

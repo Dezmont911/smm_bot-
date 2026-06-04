@@ -152,6 +152,20 @@ class Config:
         default_factory=lambda: _optional("FAL_API_KEY", "")
     )
 
+    # --- Учёт расходов на сервисы (цены в USD, можно переопределить в .env) ---
+    # Claude — цена за 1 млн токенов (вход/выход). По умолчанию — Haiku 4.5 ($1/$5).
+    # Для sonnet/opus цена выбирается автоматически по имени модели (см. cost_tracker).
+    CLAUDE_INPUT_USD_PER_MTOK: float = field(
+        default_factory=lambda: float(_optional("CLAUDE_INPUT_USD_PER_MTOK", "1.0"))
+    )
+    CLAUDE_OUTPUT_USD_PER_MTOK: float = field(
+        default_factory=lambda: float(_optional("CLAUDE_OUTPUT_USD_PER_MTOK", "5.0"))
+    )
+    # fal.ai FLUX schnell — цена за одну картинку.
+    FAL_IMAGE_USD: float = field(
+        default_factory=lambda: float(_optional("FAL_IMAGE_USD", "0.003"))
+    )
+
     # --- Кэш тем из веб-поиска ---
     # За один поиск берём с запасом, лишнее кладём в кэш и переиспользуем,
     # пока не протухнет (TTL). Срезает число обращений к веб-поиску.
