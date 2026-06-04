@@ -71,11 +71,24 @@ MENU_KEYBOARD = ReplyKeyboardMarkup(
 
 # ── Вспомогательные функции ────────────────────────────────────────────────
 
-def _load_channels(include_inactive: bool = False, owner_id: int | None = None) -> list[dict]:
+def _is_tester_channel(ch: dict) -> bool:
+    """Канал принадлежит тестеру: есть owner_id и это НЕ админ. Каналы без owner_id
+    (легаси/«домовые») и каналы, созданные админом, тестерскими не считаются."""
+    oid = ch.get("owner_id")
+    return oid is not None and not accounts.is_admin(oid)
+
+
+def _load_channels(include_inactive: bool = False, owner_id: int | None = None,
+                   scope: str | None = None) -> list[dict]:
     """Загружает карточки каналов из channels/. Тестер (owner_id, не админ) видит ТОЛЬКО
-    свои каналы; админы (оба прописанных id) видят ВСЕ каналы — общее пространство."""
+    свои каналы. Для админа `scope` разделяет общее пространство:
+      None      — все каналы (легаси-поведение);
+      'mine'    — только свои/«домовые» (без owner_id или owner=админ) — БЕЗ тестерских;
+      'testers' — только тестерские (owner_id есть и это не админ).
+    Для тестеров `scope` игнорируется (они и так видят лишь свои каналы)."""
     channels_dir = Path(__file__).parent / "channels"
     only_owner = owner_id is not None and not accounts.is_admin(owner_id)
+    admin_view = owner_id is not None and accounts.is_admin(owner_id)
     channels = []
     for f in channels_dir.glob("*.json"):
         if f.name.startswith("example_"):
@@ -86,6 +99,12 @@ def _load_channels(include_inactive: bool = False, owner_id: int | None = None) 
                 continue
             if only_owner and ch.get("owner_id") != owner_id:
                 continue
+            if scope and admin_view:
+                tester = _is_tester_channel(ch)
+                if scope == "mine" and tester:
+                    continue
+                if scope == "testers" and not tester:
+                    continue
             channels.append(ch)
         except Exception as e:
             logger.error(f"Ошибка чтения {f.name}: {e}")
@@ -95,7 +114,7 @@ def _load_channels(include_inactive: bool = False, owner_id: int | None = None) 
 def _folders(owner_id: int | None) -> list[str]:
     """Список папок (непустые `folder`) среди каналов владельца, отсортирован."""
     seen = set()
-    for c in _load_channels(include_inactive=True, owner_id=owner_id):
+    for c in _load_channels(include_inactive=True, owner_id=owner_id, scope="mine"):
         f = (c.get("folder") or "").strip()
         if f:
             seen.add(f)
@@ -211,7 +230,7 @@ async def _answer_or_send(query_or_message, text: str, reply_markup, parse_mode=
 
 async def screen_main(qm, context: ContextTypes.DEFAULT_TYPE):
     """Главное меню."""
-    channels = _load_channels(owner_id=_acting_uid(qm))
+    channels = _load_channels(owner_id=_acting_uid(qm), scope="mine")
     active = len(channels)
     total_posts = sum(buffer.get_level(ch["channel_id"]) for ch in channels)
 
@@ -266,7 +285,7 @@ def _channel_button(ch: dict) -> InlineKeyboardButton:
 
 async def screen_channels(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
     """Список активных каналов: сверху действия, тумблеры состояния, пагинация по 10."""
-    channels = [c for c in _load_channels(include_inactive=True, owner_id=_acting_uid(qm))
+    channels = [c for c in _load_channels(include_inactive=True, owner_id=_acting_uid(qm), scope="mine")
                 if c.get("active", True)]
 
     # Фильтр по папке (из user_data): None=все, "__none__"=без папки, иначе имя папки
@@ -323,7 +342,7 @@ async def screen_channels(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0)
 
 async def screen_channels_deleted(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
     """Удалённые (неактивные) каналы — с возможностью восстановить."""
-    deleted = [c for c in _load_channels(include_inactive=True, owner_id=_acting_uid(qm))
+    deleted = [c for c in _load_channels(include_inactive=True, owner_id=_acting_uid(qm), scope="mine")
                if not c.get("active", True)]
 
     if not deleted:
@@ -384,7 +403,7 @@ async def prompt_channel_search(qm, context: ContextTypes.DEFAULT_TYPE):
 async def screen_channels_search(qm, context: ContextTypes.DEFAULT_TYPE, query: str):
     """Показывает каналы, совпавшие с запросом (по названию или @username)."""
     q = (query or "").strip().lower().lstrip("@")
-    channels = [c for c in _load_channels(include_inactive=True, owner_id=_acting_uid(qm))
+    channels = [c for c in _load_channels(include_inactive=True, owner_id=_acting_uid(qm), scope="mine")
                 if c.get("active", True)]
     matched = [
         c for c in channels
@@ -405,7 +424,7 @@ async def screen_channels_search(qm, context: ContextTypes.DEFAULT_TYPE, query: 
 async def screen_folders(qm, context: ContextTypes.DEFAULT_TYPE):
     """Обзор папок: все каналы / по папкам / без папки. Выбор → фильтрует список."""
     uid = _acting_uid(qm)
-    allch = [c for c in _load_channels(include_inactive=True, owner_id=uid) if c.get("active", True)]
+    allch = [c for c in _load_channels(include_inactive=True, owner_id=uid, scope="mine") if c.get("active", True)]
     folders = _folders(uid)
     nofolder = sum(1 for c in allch if not (c.get("folder") or "").strip())
 
@@ -728,7 +747,7 @@ async def action_schedule_clear(qm, context, handle: str):
 
 async def screen_status(qm, context: ContextTypes.DEFAULT_TYPE):
     """Общий статус всех буферов."""
-    channels = _load_channels(owner_id=_acting_uid(qm))
+    channels = _load_channels(owner_id=_acting_uid(qm), scope="mine")
     if not channels:
         await _answer_or_send(qm, "📊 Каналов нет.", InlineKeyboardMarkup([[
             InlineKeyboardButton("◀️ Назад", callback_data="ui:main")
@@ -756,7 +775,7 @@ async def screen_status(qm, context: ContextTypes.DEFAULT_TYPE):
 
 async def screen_queue(qm, context: ContextTypes.DEFAULT_TYPE):
     """Выбор канала для просмотра очереди постов."""
-    channels = _load_channels(owner_id=_acting_uid(qm))
+    channels = _load_channels(owner_id=_acting_uid(qm), scope="mine")
     buttons = []
     total = 0
     for ch in channels:
@@ -2560,11 +2579,13 @@ async def screen_help_section(qm, context: ContextTypes.DEFAULT_TYPE, key: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def screen_admin(qm, context: ContextTypes.DEFAULT_TYPE):
-    """Меню админа: создать инвайт, список тестеров."""
+    """Меню админа: создать инвайт, список тестеров, каналы пользователей."""
     users = accounts.list_users()
+    tester_chans = _load_channels(include_inactive=True, owner_id=_acting_uid(qm), scope="testers")
     text = (
         "👑 <b>Админ-панель</b>\n\n"
-        f"Зарегистрировано тестеров: <b>{len(users)}</b>\n\n"
+        f"Зарегистрировано тестеров: <b>{len(users)}</b>\n"
+        f"Каналов у тестеров: <b>{len(tester_chans)}</b>\n\n"
         "🎟 Инвайт-ссылка <b>одноразовая</b> (на N человек): кто первый откроет — "
         "тот и зарегистрируется. Отправляй её тестеру <b>лично</b>."
     )
@@ -2572,6 +2593,7 @@ async def screen_admin(qm, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🎟 Инвайт (1 чел · 30 дней)", callback_data="ui:adm_inv:1:30")],
         [InlineKeyboardButton("🎟 Инвайт (5 чел · 30 дней)", callback_data="ui:adm_inv:5:30")],
         [InlineKeyboardButton(f"👥 Пользователи ({len(users)})", callback_data="ui:adm_users")],
+        [InlineKeyboardButton(f"📡 Каналы пользователей ({len(tester_chans)})", callback_data="ui:adm_chans:0")],
         [InlineKeyboardButton("◀️ В меню", callback_data="ui:main")],
     ])
     await _answer_or_send(qm, text, kb)
@@ -2638,6 +2660,50 @@ async def screen_admin_users(qm, context: ContextTypes.DEFAULT_TYPE):
     await _answer_or_send(qm, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
+async def screen_admin_user_channels(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+    """Каналы тестеров (для админа) — отдельно от собственных. С пометкой владельца."""
+    chans = [c for c in _load_channels(include_inactive=True, owner_id=_acting_uid(qm), scope="testers")
+             if c.get("active", True)]
+    if not chans:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Админ-панель", callback_data="ui:admin")]])
+        await _answer_or_send(qm, "📡 <b>Каналы пользователей</b>\n\nУ тестеров пока нет каналов.", kb)
+        return
+
+    # Группируем по владельцу для читаемости
+    chans.sort(key=lambda c: (c.get("owner_id") or 0, c.get("name") or c["channel_id"]))
+    total = len(chans)
+    pages = (total + CHANNELS_PAGE_SIZE - 1) // CHANNELS_PAGE_SIZE
+    page = max(0, min(page, pages - 1))
+    chunk = chans[page * CHANNELS_PAGE_SIZE:(page + 1) * CHANNELS_PAGE_SIZE]
+
+    # Подписи владельцев (кэшируем в рамках экрана, чтобы не дёргать get_chat по разу на канал)
+    owner_labels: dict[int, str] = {}
+    rows = []
+    for ch in chunk:
+        oid = ch.get("owner_id")
+        if oid and oid not in owner_labels:
+            owner_labels[oid] = (await _user_label(context, oid)) or str(oid)
+        suffix = f" · {owner_labels[oid]}" if oid else ""
+        name = ch.get("name") or ch["channel_id"]
+        rows.append([InlineKeyboardButton(
+            f"{_toggle_icon(ch)} {name}{suffix}", callback_data=f"ui:ch:{ch['channel_id']}")])
+
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀️", callback_data=f"ui:adm_chans:{page - 1}"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"ui:adm_chans:{page + 1}"))
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("◀️ Админ-панель", callback_data="ui:admin")])
+
+    header = f"📡 <b>Каналы пользователей</b> ({total})"
+    if pages > 1:
+        header += f" · стр. {page + 1}/{pages}"
+    legend = "🟢 публикует · ⏸ пауза (РСЯ вкл) · 🔴 остановлен"
+    await _answer_or_send(qm, f"{header}\n\n{legend}", InlineKeyboardMarkup(rows))
+
+
 async def action_admin_revoke(qm, context, uid: str):
     try:
         accounts.revoke_user(int(uid))
@@ -2679,7 +2745,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # 👑 Админ-действия — только для главного владельца (superadmin)
-    if action in ("admin", "adm_inv", "adm_users", "adm_revoke", "adm_pro"):
+    if action in ("admin", "adm_inv", "adm_users", "adm_revoke", "adm_pro", "adm_chans"):
         if not accounts.is_superadmin(uid):
             await query.answer("Только для владельца.", show_alert=True)
             return
@@ -2689,6 +2755,9 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await action_admin_invite(query, context, int(parts[2]), int(parts[3]))
         elif action == "adm_users":
             await screen_admin_users(query, context)
+        elif action == "adm_chans":
+            page = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 0
+            await screen_admin_user_channels(query, context, page)
         elif action == "adm_revoke" and len(parts) >= 3:
             await action_admin_revoke(query, context, parts[2])
         elif action == "adm_pro" and len(parts) >= 3:
