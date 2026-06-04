@@ -2607,6 +2607,7 @@ async def screen_admin(qm, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(f"👥 Пользователи ({len(users)})", callback_data="ui:adm_users")],
         [InlineKeyboardButton(f"📡 Каналы пользователей ({len(tester_chans)})", callback_data="ui:adm_chans:0")],
         [InlineKeyboardButton("💰 Расходы", callback_data="ui:adm_cost:today")],
+        [InlineKeyboardButton("⚡ Генерить для всех", callback_data="ui:generate_all")],
         [InlineKeyboardButton("◀️ В меню", callback_data="ui:main")],
     ])
     await _answer_or_send(qm, text, kb)
@@ -2852,6 +2853,14 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 🔒 Гард владельца (линчпин изоляции): если действие адресует конкретный канал
     # (parts[2] = @handle) или пост (draft-действия по post_id) — проверяем владение.
     # Пропуск хотя бы одного канало-зависимого действия = утечка в чужой канал.
+    #
+    # Основной предохранитель — это `_p2.startswith("@")` ниже: хэндлы каналов всегда
+    # начинаются с «@», поэтому ЛЮБОЕ действие с handle в parts[2] гардится автоматически.
+    # `_CHANNEL_ACTIONS` — явный список «на всякий случай» (читаемость + страховка, если
+    # вдруг появится канало-действие с идентификатором БЕЗ «@»). НЕ полагайся на него как
+    # на единственную защиту: забыть дописать сюда новый ch_* не страшно, пока handle с «@».
+    # Действия с ДВУМЯ каналами (напр. ch_sched_copy_ok: dst в parts[2], src в parts[3])
+    # этот общий гард прикрывает только по parts[2] — второй канал проверяй вручную (_owns).
     _POST_ACTIONS = {"draft_edit", "draft_media", "draft_q", "draft_del", "draft_view"}
     _CHANNEL_ACTIONS = {
         "ch", "ch_settings", "ch_topic_redo", "ch_pause", "ch_delete", "ch_delete_ok",
