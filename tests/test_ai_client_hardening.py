@@ -41,6 +41,27 @@ class AiClientHardeningTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("SAFE_TOPIC_ONLY", captured["user_prompt"])
         self.assertNotIn("RAW_TOPIC_SHOULD_NOT_APPEAR", captured["user_prompt"])
 
+    async def test_refusal_markers_reject_editor_meta_explanation(self):
+        self.assertTrue(ai_client._looks_like_refusal(
+            "Пояснение: я оставил структуру поста, если нужна более развёрнутая версия — дай исходный текст."
+        ))
+        self.assertTrue(ai_client._looks_like_refusal(
+            "Если нужен исходный текст, пришлите ссылку и я перепишу пост."
+        ))
+
+    async def test_clean_post_output_strips_tail_explanation(self):
+        text = (
+            "Полезная находка для дома: органайзер помогает держать вещи под рукой.\n\n"
+            "Ссылка на товар ниже.\n\n"
+            "---\n"
+            "**Пояснение:** я оставил CTA и сократил текст."
+        )
+        cleaned = ai_client._clean_post_output(text)
+        self.assertIn("Полезная находка", cleaned)
+        self.assertIn("Ссылка на товар ниже.", cleaned)
+        self.assertNotIn("Пояснение", cleaned)
+        self.assertNotIn("я оставил", cleaned)
+
 
 if __name__ == "__main__":
     unittest.main()

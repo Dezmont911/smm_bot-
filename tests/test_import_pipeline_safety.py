@@ -142,9 +142,13 @@ class ImportPipelineSafetyTest(unittest.IsolatedAsyncioTestCase):
         class FakeParser:
             async def generate_posts(self, channel, count):
                 return [{
-                    "content": "Полезная находка для дома: компактный органайзер помогает держать вещи под рукой.",
+                    "content": (
+                        "Полезная находка для дома: компактный органайзер помогает держать вещи под рукой.\n\n"
+                        '🔗 <a href="https://www.wildberries.ru/catalog/456/detail.aspx">Смотреть на Wildberries</a>'
+                    ),
                     "wb_article": "456",
                     "wb_category": "home",
+                    "parse_mode": "HTML",
                 }]
 
         sys.modules["wb_parser"] = types.SimpleNamespace(wb_parser=FakeParser())
@@ -168,6 +172,41 @@ class ImportPipelineSafetyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["generated"], 1)
         self.assertEqual(len(fake_buffer.posts), 1)
         self.assertEqual(fake_buffer.posts[0]["format"], "wb_product")
+
+    async def test_marketplace_post_without_href_is_not_buffered(self):
+        fake_buffer = FakeBuffer()
+        original_buffer = content_generator.buffer
+        original_wb = sys.modules.get("wb_parser")
+
+        class FakeParser:
+            async def generate_posts(self, channel, count):
+                return [{
+                    "content": "Полезная находка для дома. Ссылка: смотрите в описании.",
+                    "wb_article": "789",
+                    "wb_category": "home",
+                    "parse_mode": "HTML",
+                }]
+
+        sys.modules["wb_parser"] = types.SimpleNamespace(wb_parser=FakeParser())
+        content_generator.buffer = fake_buffer
+        gen = content_generator.ContentGenerator()
+        original_dup = gen._wb_article_in_buffer
+        gen._wb_article_in_buffer = lambda channel_id, article: False
+        try:
+            result = await gen._run_marketplace(
+                {"channel_id": "@shop", "topic": "товары для дома", "channel_type": "marketplace"},
+                1,
+            )
+        finally:
+            gen._wb_article_in_buffer = original_dup
+            content_generator.buffer = original_buffer
+            if original_wb is None:
+                sys.modules.pop("wb_parser", None)
+            else:
+                sys.modules["wb_parser"] = original_wb
+
+        self.assertEqual(result["generated"], 0)
+        self.assertEqual(fake_buffer.posts, [])
 
 
 if __name__ == "__main__":

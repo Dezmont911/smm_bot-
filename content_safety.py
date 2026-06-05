@@ -394,6 +394,21 @@ def _unsupported_fact_claim(channel: dict, content: str) -> str | None:
     return None
 
 
+def _requires_marketplace_link(channel: dict, post: dict) -> bool:
+    fmt = _low(post.get("format"))
+    return (
+        fmt == "wb_product"
+        or (
+            channel.get("channel_type") == "marketplace"
+            and fmt in {"reference", "marketplace", "wb_product"}
+        )
+    )
+
+
+def _has_html_link(content: str) -> bool:
+    return bool(re.search(r'<a\s+href=["\']https?://[^"\']+["\']', content or "", re.IGNORECASE))
+
+
 def validate_generated_post(channel: dict, post: dict, safety: dict, brief: dict) -> dict:
     """Output Validator before buffer.add()."""
     content = _clean_text(post.get("content", ""), 5000)
@@ -414,6 +429,15 @@ def validate_generated_post(channel: dict, post: dict, safety: dict, brief: dict
 
     if _blocked_content(content):
         result.update({"allowed": False, "decision": "blocked", "reason_code": "blocked_output_content"})
+        return result
+
+    if _requires_marketplace_link(channel, post) and not _has_html_link(content):
+        result.update({
+            "allowed": False,
+            "decision": "review",
+            "reason_code": "missing_marketplace_link",
+            "notes": "marketplace/reference post has no real <a href> link",
+        })
         return result
 
     unsupported_fact = _unsupported_fact_claim(channel, content)
