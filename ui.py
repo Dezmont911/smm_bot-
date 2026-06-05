@@ -456,15 +456,76 @@ async def screen_folders(qm, context: ContextTypes.DEFAULT_TYPE):
     rows = [[InlineKeyboardButton(f"📋 Все каналы ({len(allch)})", callback_data="ui:chfold:all")]]
     for i, f in enumerate(folders):
         cnt = sum(1 for c in allch if (c.get("folder") or "").strip() == f)
-        rows.append([InlineKeyboardButton(f"📁 {f} ({cnt})", callback_data=f"ui:chfold:{i}")])
+        rows.append([
+            InlineKeyboardButton(f"📁 {f} ({cnt})", callback_data=f"ui:chfold:{i}"),
+            InlineKeyboardButton("➕", callback_data=f"ui:fold_add:{i}:0"),
+        ])
     if nofolder:
         rows.append([InlineKeyboardButton(f"📂 Без папки ({nofolder})", callback_data="ui:chfold:none")])
+    rows.append([InlineKeyboardButton("➕ Новая папка", callback_data="ui:fold_new")])
     rows.append([InlineKeyboardButton("◀️ К каналам", callback_data="ui:channels")])
 
-    hint = ("Каналы раскидываются по папкам в настройках канала → «📁 Папка»."
+    hint = ("Тапни папку, чтобы открыть список. Кнопка «➕» рядом с папкой добавляет каналы массово."
             if folders else
-            "Папок пока нет. Зайди в любой канал → ⚙️ Настройки → «📁 Папка» и создай папку.")
+            "Папок пока нет. Нажми «➕ Новая папка» и выбери каналы для неё.")
     await _answer_or_send(qm, f"📁 <b>Папки</b>\n\n{hint}", InlineKeyboardMarkup(rows))
+
+
+def _folder_bulk_channels(uid: int | None) -> list[dict]:
+    channels = [c for c in _load_channels(include_inactive=True, owner_id=uid, scope="mine") if c.get("active", True)]
+    return sorted(channels, key=lambda c: ((c.get("name") or c.get("channel_id") or "").lower()))
+
+
+async def screen_folder_bulk(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+    """Массовый выбор каналов для папки."""
+    state = context.user_data.get("folder_bulk") or {}
+    folder = (state.get("folder") or "").strip()
+    if not folder:
+        context.user_data.pop("folder_bulk", None)
+        await screen_folders(qm, context)
+        return
+
+    uid = _acting_uid(qm)
+    channels = _folder_bulk_channels(uid)
+    selected = set(state.get("selected") or [])
+    page_size = 8
+    total = len(channels)
+    max_page = max((total - 1) // page_size, 0)
+    page = max(0, min(page, max_page))
+    start = page * page_size
+    chunk = channels[start:start + page_size]
+
+    rows = []
+    for idx, ch in enumerate(chunk, start=start):
+        cid = ch["channel_id"]
+        mark = "✅" if cid in selected else "⬜️"
+        cur = (ch.get("folder") or "").strip()
+        suffix = f" · {cur[:18]}" if cur and cur != folder else ""
+        label = f"{mark} {(ch.get('name') or cid)[:28]}{suffix}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"ui:fold_pick:{page}:{idx}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("← Назад", callback_data=f"ui:fold_bulk:{page - 1}"))
+    if start + page_size < total:
+        nav.append(InlineKeyboardButton("Дальше →", callback_data=f"ui:fold_bulk:{page + 1}"))
+    if nav:
+        rows.append(nav)
+
+    rows.append([
+        InlineKeyboardButton(f"✅ Добавить ({len(selected)})", callback_data="ui:fold_apply"),
+        InlineKeyboardButton("Сброс", callback_data=f"ui:fold_reset:{page}"),
+    ])
+    rows.append([InlineKeyboardButton("◀️ Папки", callback_data="ui:folders")])
+
+    text = (
+        f"📁 <b>Добавить каналы в папку</b>\n"
+        f"Папка: <b>{folder}</b>\n\n"
+        f"Выбрано: <b>{len(selected)}</b>\n"
+        f"Страница {page + 1}/{max_page + 1}\n\n"
+        "Отмеченные каналы будут перенесены в эту папку."
+    )
+    await _answer_or_send(qm, text, InlineKeyboardMarkup(rows))
 
 
 async def screen_set_folder(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
@@ -2061,9 +2122,20 @@ async def handle_settings_text_input(update: Update, context: ContextTypes.DEFAU
     if not editing:
         return False
 
-    handle = editing["handle"]
     field  = editing["field"]
     text   = update.message.text.strip()
+
+    if field == "bulk_folder":
+        name = re.sub(r"\s+", " ", text).strip()[:40]
+        if not name or name.lower() in ("нет", "убрать", "очистить"):
+            await update.message.reply_text("⚠️ Напиши название папки.")
+            return True
+        context.user_data.pop("editing", None)
+        context.user_data["folder_bulk"] = {"folder": name, "selected": []}
+        await screen_folder_bulk(update.message, context, 0)
+        return True
+
+    handle = editing["handle"]
 
     ch = _load_channel(handle)
     if not ch:
@@ -2986,9 +3058,11 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop(_k, None)
 
     if action == "main":
+        context.user_data.pop("folder_bulk", None)
         await screen_main(query, context)
 
     elif action == "channels":
+        context.user_data.pop("folder_bulk", None)
         # Вход из меню (без страницы) сбрасывает фильтр папки; пагинация — сохраняет
         if len(parts) < 3:
             context.user_data.pop("chfolder", None)
@@ -3002,6 +3076,71 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await screen_help(query, context)
 
     elif action == "folders":
+        context.user_data.pop("folder_bulk", None)
+        await screen_folders(query, context)
+
+    elif action == "fold_new":
+        context.user_data["editing"] = {"field": "bulk_folder"}
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Папки", callback_data="ui:folders")]])
+        await _answer_or_send(
+            query,
+            "➕ <b>Новая папка</b>\n\nНапиши название папки. Потом выберешь каналы, которые нужно туда добавить.",
+            kb,
+        )
+
+    elif action == "fold_add" and len(parts) >= 3:
+        folders = _folders(uid)
+        idx = int(parts[2]) if parts[2].isdigit() else -1
+        page = int(parts[3]) if len(parts) >= 4 and parts[3].isdigit() else 0
+        if 0 <= idx < len(folders):
+            context.user_data["folder_bulk"] = {"folder": folders[idx], "selected": []}
+            await screen_folder_bulk(query, context, page)
+        else:
+            await query.answer("Папка не найдена.", show_alert=True)
+
+    elif action == "fold_bulk" and len(parts) >= 3:
+        page = int(parts[2]) if parts[2].isdigit() else 0
+        await screen_folder_bulk(query, context, page)
+
+    elif action == "fold_pick" and len(parts) >= 4:
+        page = int(parts[2]) if parts[2].isdigit() else 0
+        idx = int(parts[3]) if parts[3].isdigit() else -1
+        state = context.user_data.get("folder_bulk") or {}
+        channels = _folder_bulk_channels(uid)
+        if state.get("folder") and 0 <= idx < len(channels):
+            cid = channels[idx]["channel_id"]
+            selected = set(state.get("selected") or [])
+            if cid in selected:
+                selected.remove(cid)
+            else:
+                selected.add(cid)
+            state["selected"] = sorted(selected)
+            context.user_data["folder_bulk"] = state
+        await screen_folder_bulk(query, context, page)
+
+    elif action == "fold_reset":
+        page = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 0
+        state = context.user_data.get("folder_bulk") or {}
+        if state:
+            state["selected"] = []
+            context.user_data["folder_bulk"] = state
+        await screen_folder_bulk(query, context, page)
+
+    elif action == "fold_apply":
+        state = context.user_data.get("folder_bulk") or {}
+        folder = (state.get("folder") or "").strip()
+        selected = set(state.get("selected") or [])
+        changed = 0
+        if folder and selected:
+            allowed = {c["channel_id"] for c in _folder_bulk_channels(uid)}
+            for cid in sorted(selected & allowed):
+                ch = _load_channel(cid)
+                if not ch or not _owns(uid, ch):
+                    continue
+                ch["folder"] = folder
+                _save_channel(ch)
+                changed += 1
+        context.user_data.pop("folder_bulk", None)
         await screen_folders(query, context)
 
     elif action == "chfold" and len(parts) >= 3:
