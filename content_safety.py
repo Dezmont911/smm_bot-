@@ -138,7 +138,13 @@ def _profile_text(channel: dict) -> str:
     return _low(" ".join(p for p in parts if p))
 
 
+def _is_marketplace_channel(channel: dict) -> bool:
+    return _low(channel.get("channel_type")) == "marketplace"
+
+
 def is_kids_education_channel(channel: dict) -> bool:
+    if _is_marketplace_channel(channel):
+        return False
     dna = _channel_dna(channel)
     if channel.get("archetype") in KIDS_EDU_ARCHETYPES:
         return True
@@ -242,6 +248,15 @@ def evaluate_topic_candidate(channel: dict, topic_data: dict) -> dict:
             "safe_topic": None,
             "reason_code": "blocked_content",
             "notes": f"source={source}; candidate contains restricted content",
+        })
+        return result
+
+    if _is_marketplace_channel(channel):
+        result.update({
+            "decision": "allowed_safe",
+            "safe_angle": "сохранить товарную пользу и реальную ссылку на товар",
+            "reason_code": "marketplace_product_fit",
+            "notes": f"source={source}; marketplace channel",
         })
         return result
 

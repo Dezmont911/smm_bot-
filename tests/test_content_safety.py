@@ -1,7 +1,14 @@
 import unittest
 
 from channel_dna import attach_channel_dna, build_channel_dna
-from content_safety import build_content_brief, build_safe_channel_profile, dry_run_topic, validate_generated_post
+from content_safety import (
+    build_content_brief,
+    build_safe_channel_profile,
+    dry_run_topic,
+    evaluate_topic_candidate,
+    is_kids_education_channel,
+    validate_generated_post,
+)
 
 
 ROBO_CHANNEL = {
@@ -47,6 +54,32 @@ class ContentSafetyTest(unittest.TestCase):
         result = dry_run_topic(channel, "Как вести семейный бюджет")
         self.assertEqual(result["safety"]["decision"], "allowed")
         self.assertEqual(result["safety"]["safe_topic"], "Как вести семейный бюджет")
+
+    def test_marketplace_with_kids_category_is_not_kids_education(self):
+        channel = {
+            "channel_id": "@shop",
+            "channel_type": "marketplace",
+            "topic": "wb_categories = [косметика, игрушки для детей, бижутерия]",
+            "wb_categories": ["косметика", "игрушки для детей", "бижутерия"],
+        }
+        self.assertFalse(is_kids_education_channel(channel))
+
+    def test_marketplace_wb_topic_uses_marketplace_fit(self):
+        channel = {
+            "channel_id": "@shop",
+            "channel_type": "marketplace",
+            "topic": "wb_categories = [косметика, игрушки для детей, бижутерия]",
+            "wb_categories": ["косметика", "игрушки для детей", "бижутерия"],
+        }
+        result = evaluate_topic_candidate(
+            channel,
+            {"topic": "WB арт.271598054 [бижутерия]", "source": "wb_parser"},
+        )
+        self.assertEqual(result["decision"], "allowed_safe")
+        self.assertEqual(result["reason_code"], "marketplace_product_fit")
+
+    def test_kids_education_classifier_still_detects_robo_channel(self):
+        self.assertTrue(is_kids_education_channel(ROBO_CHANNEL))
 
     def test_output_validator_rejects_refusal(self):
         safety_and_brief = dry_run_topic(
