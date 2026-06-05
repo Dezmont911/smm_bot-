@@ -28,6 +28,7 @@ from pathlib import Path
 from loguru import logger
 
 from buffer_manager import buffer
+from content_safety import build_content_brief, evaluate_topic_candidate, validate_generated_post
 from userbot_reader import (
     read_candidates, forward_to_bot, normalize_handle,
 )
@@ -138,15 +139,29 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
     Возвращает список msg_id для пересылки боту (медиа), пустой список для
     текстового поста, или None если пост пустой (не добавлен).
     """
-    from ai_client import rephrase_text  # ленивый импорт (тяжёлая зависимость)
-
     # Ключ — по ЭФФЕКТИВНОМУ источнику (что увидит бот в forward_from_*): если донор
     # репостит из другого канала, это оригинальный канал+id. Иначе — сам донор+id.
     topic = ref_topic(p.get("match_user") or handle, p.get("match_id") or p["id"])
     raw = p.get("text", "")
+    raw_for_safety = raw or re.sub(r"<[^>]+>", " ", p.get("text_html") or "")
+
+    safety = None
+    brief = None
+    if raw_for_safety.strip():
+        safety = evaluate_topic_candidate(
+            channel, {"topic": raw_for_safety, "source": "reference_import"}
+        )
+        if safety["decision"] in ("blocked", "review") or not safety.get("safe_topic"):
+            logger.warning(
+                f"Reference skipped [{channel_id}] {handle}/{p.get('id')}: "
+                f"{safety.get('reason_code')}"
+            )
+            return None
+        brief = build_content_brief(channel, safety, "reference")
 
     # «Как есть» — HTML (со ссылками); перефраз — простой текст без формата
     if do_rephrase and raw:
+        from ai_client import rephrase_text  # ленивый импорт (тяжёлая зависимость)
         try:
             content = await rephrase_text(raw, channel)
         except Exception as e:
@@ -174,6 +189,30 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
     kind = p.get("media_kind")
     if not content and not kind:
         return None  # пустой пост без медиа
+    if content:
+        if safety is None:
+            safety = evaluate_topic_candidate(
+                channel, {"topic": content, "source": "reference_import"}
+            )
+            if safety["decision"] in ("blocked", "review") or not safety.get("safe_topic"):
+                logger.warning(
+                    f"Reference skipped [{channel_id}] {handle}/{p.get('id')}: "
+                    f"{safety.get('reason_code')}"
+                )
+                return None
+            brief = build_content_brief(channel, safety, "reference")
+        validation = validate_generated_post(
+            channel,
+            {"channel_id": channel_id, "content": content, "format": "reference", "topic": topic},
+            safety,
+            brief or {},
+        )
+        if not validation.get("allowed"):
+            logger.warning(
+                f"Reference validation skipped [{channel_id}] {handle}/{p.get('id')}: "
+                f"{validation.get('reason_code')}"
+            )
+            return None
 
     if kind == "album":
         # members в JSON — origin-id (как увидит бот), для пересылки — id донора

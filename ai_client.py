@@ -399,8 +399,15 @@ def _build_system_prompt(
     # Санитизируем и обрезаем все поля канала (защита от раздувания/инъекций)
     name = sanitize_field(channel.get("name", ""), FIELD_LIMITS["name"])
     topic = sanitize_field(channel.get("topic", ""), FIELD_LIMITS["topic"])
-    audience = sanitize_field(channel.get("audience", ""), FIELD_LIMITS["audience"])
-    tone = sanitize_field(channel.get("tone", ""), FIELD_LIMITS["tone"])
+    channel_dna = channel.get("channel_dna") if isinstance(channel.get("channel_dna"), dict) else {}
+    audience = sanitize_field(
+        channel_dna.get("audience") or channel.get("audience", ""),
+        FIELD_LIMITS["audience"],
+    )
+    tone = sanitize_field(
+        channel_dna.get("tone") or channel.get("tone", ""),
+        FIELD_LIMITS["tone"],
+    )
     post_length_raw = sanitize_field(
         channel.get("post_length", "100–200 слов"), FIELD_LIMITS["post_length"]
     )
@@ -442,9 +449,10 @@ def _build_system_prompt(
     return f"""Ты — редактор Telegram-канала.
 
 <профиль_канала>
-Название: {name}
+Название канала (только display name, НЕ источник темы): {name}
 Тема канала: {topic}
 Аудитория: {audience}
+Тон: {tone}
 Длина поста: {post_length}
 Использовать эмодзи: {'да' if use_emoji else 'нет'}
 Запрещённые темы (НЕ упоминать даже вскользь, не намекать): {forbidden}{examples_text}{dedup_text}
@@ -462,6 +470,7 @@ def _build_system_prompt(
 - Пиши только текст поста — никаких вступлений типа "Вот пост:" или "Конечно!"
 - Не добавляй хэштеги, если не попросят
 - Не упоминай конкурентов и запрещённые темы
+- Не выводи тему поста из названия канала. Название — только контекст отображения.
 - Никогда не отвечай мета-комментариями, отказами или списком «альтернативных тем».
   Если конкретная тема не подходит — просто напиши хороший пост по смежному
   аспекту темы канала
@@ -505,14 +514,63 @@ async def rephrase_text(original: str, channel: dict) -> str:
         return original
 
 
-def _build_user_prompt(format_name: str, topic: str, hook: str | None = None) -> str:
+def _brief_prompt_block(content_brief: dict | None) -> str:
+    if not content_brief:
+        return ""
+
+    def field(name, default=""):
+        return sanitize_field(content_brief.get(name, default), 500)
+
+    def list_lines(name):
+        values = content_brief.get(name) or []
+        if isinstance(values, str):
+            values = [values]
+        if not isinstance(values, list):
+            return ""
+        cleaned = [sanitize_field(v, 180) for v in values[:8] if sanitize_field(v, 180)]
+        return "\n".join(f"- {v}" for v in cleaned)
+
+    must_include = list_lines("must_include") or "- раскрыть безопасную тему через пользу для аудитории"
+    must_avoid = list_lines("must_avoid") or "- не уходить в запрещённые или нерелевантные углы"
+    cta = field("cta")
+    cta_line = f"\nCTA: {cta}" if cta else ""
+    tone = field("tone")
+    tone_line = f"\nТон: {tone}" if tone else ""
+
+    return f"""
+
+<content_brief>
+Безопасная тема: {field("topic")}
+Безопасный угол: {field("angle")}
+Целевой читатель: {field("target_reader")}
+Цель поста: {field("post_goal")}{cta_line}{tone_line}
+Обязательно учесть:
+{must_include}
+Избегать:
+{must_avoid}
+</content_brief>
+
+Пиши только по безопасной теме и углу из <content_brief>. Не используй сырой исходный
+инфоповод, если он был переформулирован.
+"""
+
+
+def _build_user_prompt(
+    format_name: str,
+    topic: str,
+    hook: str | None = None,
+    content_brief: dict | None = None,
+) -> str:
     """
     Строит запрос пользователя: формат + тема/инфоповод (+ структурный хук).
     hook — подсказка «как начать пост», ротируется ради разнообразия структуры.
     """
     format_instruction = POST_FORMATS.get(format_name, POST_FORMATS["совет"])
     hook_line = f"\nСтруктура: {hook}." if hook else ""
-    return f"""{format_instruction}{hook_line}
+    brief_block = _brief_prompt_block(content_brief)
+    if content_brief and content_brief.get("topic"):
+        topic = sanitize_field(content_brief.get("topic"), FIELD_LIMITS["topic"])
+    return f"""{format_instruction}{hook_line}{brief_block}
 
 Тема/инфоповод: {topic}
 
@@ -531,6 +589,7 @@ async def generate_post(
     used_topics: list[str] | None = None,
     strategy: dict | None = None,
     hook: str | None = None,
+    content_brief: dict | None = None,
 ) -> dict:
     """
     Генерирует один пост для канала.
@@ -546,6 +605,29 @@ async def generate_post(
 
     Возвращает словарь: {"content", "format", "channel_id", "topic"}
     """
+    raw_topic_arg = topic
+    if content_brief is None:
+        # Defense-in-depth: direct callers must not pass raw input straight to writer.
+        from content_safety import build_content_brief, evaluate_topic_candidate
+
+        safety = evaluate_topic_candidate(
+            channel, {"topic": topic, "source": "generate_post_direct"}
+        )
+        if safety["decision"] in ("blocked", "review") or not safety.get("safe_topic"):
+            raise PostGenerationError(f"topic safety: {safety.get('reason_code')}")
+        topic = safety["safe_topic"]
+        content_brief = build_content_brief(channel, safety, format_name)
+    elif content_brief.get("topic"):
+        brief_topic = sanitize_field(content_brief.get("topic"), FIELD_LIMITS["topic"])
+        raw_topic_clean = sanitize_field(raw_topic_arg, FIELD_LIMITS["topic"])
+        if raw_topic_clean and raw_topic_clean != brief_topic:
+            logger.warning(
+                f"generate_post topic overridden by content_brief "
+                f"[{channel.get('channel_id')}]: raw={raw_topic_clean[:60]} "
+                f"safe={brief_topic[:60]}"
+            )
+        topic = brief_topic
+
     # Резолвим стратегию канала (стиль/temperature/веса форматов)
     if strategy is None:
         from content_router import resolve, pick_format, pick_hook
@@ -564,7 +646,9 @@ async def generate_post(
     temperature = min(strategy.get("temperature") or 0.9, 0.9)
 
     system_prompt = _build_system_prompt(channel, used_topics=used_topics, style=style)
-    user_prompt = _build_user_prompt(format_name, topic, hook=hook)
+    user_prompt = _build_user_prompt(
+        format_name, topic, hook=hook, content_brief=content_brief
+    )
 
     # Потолок токенов под заданную длину поста (короткие посты не «разносит»)
     _, max_tokens = _parse_post_length(channel.get("post_length", "100–200 слов"))

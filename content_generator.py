@@ -40,6 +40,11 @@ from rss_parser import rss
 from web_scraper import scraper as web_scraper
 from topic_search import get_topics
 from content_router import resolve, pick_format, pick_hook
+from content_safety import (
+    build_content_brief,
+    evaluate_topic_candidate,
+    validate_generated_post,
+)
 import dedup
 from config import cfg
 
@@ -101,6 +106,23 @@ class ContentGenerator:
         """
         channel_id = channel["channel_id"]
         current_level = buffer.get_level(channel_id)
+        safe_profile = channel.get("safe_profile") if isinstance(channel.get("safe_profile"), dict) else {}
+        if safe_profile and (
+            safe_profile.get("supported") is False
+            or safe_profile.get("risk_level") == "blocked"
+        ):
+            logger.warning(
+                f"Генерация отклонена [{channel_id}]: safe_profile="
+                f"{safe_profile.get('risk_level')} supported={safe_profile.get('supported')}"
+            )
+            return {
+                "channel_id": channel_id,
+                "generated": 0,
+                "skipped": 0,
+                "buffer_level": current_level,
+                "sources_used": [],
+                "reason": "safe_profile запрещает автогенерацию",
+            }
 
         # Считаем сколько нужно догенерировать
         daily_target = channel.get("daily_posts_count", self.POSTS_PER_MORNING)
@@ -208,10 +230,22 @@ class ContentGenerator:
             try:
                 # Пропускаем темы, которые уже использовались: иначе Claude получит
                 # противоречие ("напиши про X" + "не повторяй X") и вернёт мета-ответ.
-                if self._topic_already_used(topic_data["topic"], used_topics):
+                safety = evaluate_topic_candidate(channel, topic_data)
+                logger.info(
+                    f"Topic safety [{channel_id}]: source={safety.get('source')} "
+                    f"decision={safety.get('decision')} reason={safety.get('reason_code')} "
+                    f"raw={safety.get('raw_topic', '')[:70]}"
+                )
+                if safety["decision"] in ("blocked", "review") or not safety.get("safe_topic"):
+                    skipped += 1
+                    continue
+
+                safe_topic = safety["safe_topic"]
+
+                if self._topic_already_used(safe_topic, used_topics):
                     logger.info(
                         f"Пропускаю уже использованную тему [{channel_id}]: "
-                        f"{topic_data['topic'][:50]}"
+                        f"{safe_topic[:50]}"
                     )
                     skipped += 1
                     continue
@@ -219,11 +253,17 @@ class ContentGenerator:
                 # Формат — по весам архетипа (не повторяя предыдущий), хук — ротация структуры
                 format_name = pick_format(strategy, last_format)
                 hook = pick_hook(strategy)
+                content_brief = build_content_brief(channel, safety, format_name)
+                logger.debug(
+                    f"Content brief [{channel_id}]: topic={content_brief.get('topic')} "
+                    f"angle={content_brief.get('angle')} goal={content_brief.get('post_goal')}"
+                )
 
-                # Генерируем пост — передаём историю тем, стратегию и хук
+                # Генерируем пост — writer получает только safe_topic/content_brief, не raw_topic
                 post = await generate_post(
-                    channel, topic_data["topic"], format_name,
+                    channel, safe_topic, format_name,
                     used_topics=used_topics, strategy=strategy, hook=hook,
+                    content_brief=content_brief,
                 )
 
                 # ── Выбор картинки по image_source ─────────────────────────
@@ -244,7 +284,7 @@ class ContentGenerator:
                 # Картинку подбираем по СОДЕРЖАНИЮ поста, а не по сырому заголовку
                 # темы (заголовки вроде «Almost ready to go!» давали картинку не в
                 # тему — чемодан вместо томатов). Контент — источник истины.
-                image_basis = (post.get("content") or "").strip()[:500] or topic_data["topic"]
+                image_basis = (post.get("content") or "").strip()[:500] or safe_topic
 
                 image_url = None
 
@@ -295,12 +335,26 @@ class ContentGenerator:
                 post["image_url"] = image_url
                 post["has_image"] = bool(image_url)
 
+                validation = validate_generated_post(channel, post, safety, content_brief)
+                logger.info(
+                    f"Output validation [{channel_id}]: decision={validation.get('decision')} "
+                    f"reason={validation.get('reason_code')}"
+                )
+                if not validation.get("allowed"):
+                    skipped += 1
+                    await self._log_error(
+                        channel_id,
+                        "generation_validation",
+                        f"{validation.get('reason_code')}: {validation.get('notes', '')}",
+                    )
+                    continue
+
                 # Считаем эмбеддинг поста (для семантич. дедупа и хранения)
                 cand_vec = await dedup.aembed(post["content"])
 
                 # Анти-повтор: семантически (по смыслу), с лексическим фолбэком
                 if await self._is_duplicate(channel_id, post["content"], cand_vec):
-                    logger.info(f"Пропускаю дубликат по смыслу [{channel_id}]: {topic_data['topic'][:40]}")
+                    logger.info(f"Пропускаю дубликат по смыслу [{channel_id}]: {safe_topic[:40]}")
                     skipped += 1
                     continue
 
@@ -315,11 +369,11 @@ class ContentGenerator:
                 generated += 1
                 # Запоминаем тему внутри батча — чтобы следующие итерации
                 # не взяли её же под другим форматом
-                used_topics.append(topic_data["topic"])
+                used_topics.append(safe_topic)
 
                 logger.success(
                     f"Пост добавлен [{channel_id}] "
-                    f"формат={format_name} тема={topic_data['topic'][:40]}"
+                    f"формат={format_name} тема={safe_topic[:40]}"
                 )
 
             except Exception as e:
@@ -395,6 +449,15 @@ class ContentGenerator:
             "channels_processed": len(channels),
             "elapsed_seconds": elapsed,
             "channels": results,
+        }
+
+    async def run_for_all_channels(self, force: bool = True) -> dict:
+        """Совместимый alias для UI: массовая генерация через безопасный batch path."""
+        batch = await self.run_morning_batch(force=force)
+        return {
+            r.get("channel_id"): r
+            for r in batch.get("channels", [])
+            if isinstance(r, dict) and r.get("channel_id")
         }
 
     # --------------------------------------------------------
@@ -529,6 +592,25 @@ class ContentGenerator:
                     # на товар <a href> публикуется голым текстом.
                     "parse_mode": post_data.get("parse_mode", "HTML"),
                 }
+                safety = evaluate_topic_candidate(
+                    channel, {"topic": buf_post["topic"], "source": "wb_parser"}
+                )
+                if safety["decision"] in ("blocked", "review") or not safety.get("safe_topic"):
+                    logger.warning(
+                        f"WB-pipeline [{channel_id}]: пост пропущен safety="
+                        f"{safety.get('reason_code')} арт. {article}"
+                    )
+                    skipped += 1
+                    continue
+                brief = build_content_brief(channel, safety, "wb_product")
+                validation = validate_generated_post(channel, buf_post, safety, brief)
+                if not validation.get("allowed"):
+                    logger.warning(
+                        f"WB-pipeline [{channel_id}]: пост пропущен validation="
+                        f"{validation.get('reason_code')} арт. {article}"
+                    )
+                    skipped += 1
+                    continue
                 buffer.add(buf_post)
                 generated += 1
                 logger.success(f"WB-пост добавлен [{channel_id}]: арт. {article}")
@@ -681,7 +763,7 @@ class ContentGenerator:
         # вечнозелёных в карточке). Гарантирует, что буфер не останется пустым:
         # лучше пост по теме канала, чем ничего. Темы из живого тона выйдут норм.
         if len(topics) < count:
-            base = _meaningful_base(channel.get("topic", ""), channel.get("name", ""))
+            base = _meaningful_base(channel.get("topic", ""))
             if base:
                 ANGLES = [
                     "интересный неочевидный факт", "разбор для новичка",
@@ -750,9 +832,14 @@ class ContentGenerator:
             return topics  # без эмбеддингов гейт не работает — пропускаем как есть
 
         channel_id = channel["channel_id"]
+        dna = channel.get("channel_dna") if isinstance(channel.get("channel_dna"), dict) else {}
         profile = " ".join(p for p in [
             channel.get("topic", ""),
-            channel.get("name", ""),
+            channel.get("audience", ""),
+            dna.get("audience", ""),
+            dna.get("goal", ""),
+            dna.get("offer", ""),
+            ", ".join(dna.get("allowed_topic_types", []) or []),
             ", ".join(channel.get("image_keywords", []) or []),
         ] if p).strip()
         if not profile:

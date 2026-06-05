@@ -32,6 +32,7 @@ from loguru import logger
 
 from config import cfg
 from claude_helper import claude_text
+from content_safety import build_safe_channel_profile
 
 
 # ============================================================
@@ -159,6 +160,8 @@ class ChannelAnalyzer:
         analysis["analyzed_posts"] = len(sample)
         analysis["post_frequency"] = self._estimate_frequency(messages)
 
+        analysis["safe_profile"] = build_safe_channel_profile(analysis)
+
         logger.success(
             f"Анализ завершён: type={analysis.get('channel_type')}, "
             f"confidence={analysis.get('confidence')}"
@@ -192,6 +195,7 @@ class ChannelAnalyzer:
         analysis["analyzed_posts"] = len(sample)
         analysis.setdefault("post_frequency", 4)
         analysis.setdefault("forbidden", False)
+        analysis["safe_profile"] = build_safe_channel_profile(analysis)
         logger.success(
             f"Анализ по постам завершён: type={analysis.get('channel_type')}, "
             f"archetype={analysis.get('archetype')}, conf={analysis.get('confidence')}"

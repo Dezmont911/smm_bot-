@@ -1213,6 +1213,7 @@ async def handle_export_confirm(update: Update, context: ContextTypes.DEFAULT_TY
         "daily_posts_count": analysis.get("post_frequency", 4),
         "rss_sources": rss_urls,
         "evergreen_topics": analysis.get("evergreen_topics", []),
+        "safe_profile": analysis.get("safe_profile", {}),
         "forbidden_topics": [],
         "audience": "широкая аудитория",
         "post_length": "100–200 слов",
@@ -1310,6 +1311,7 @@ async def _create_channel_from_analysis(analysis: dict, channel_id: str, display
         "daily_posts_count": analysis.get("post_frequency", 4),
         "rss_sources": rss_urls,
         "evergreen_topics": analysis.get("evergreen_topics", []),
+        "safe_profile": analysis.get("safe_profile", {}),
         "forbidden_topics": [],
         "audience": "широкая аудитория",
         "post_length": "100–200 слов",
@@ -1649,6 +1651,7 @@ async def handle_add_channel_type(update: Update, context: ContextTypes.DEFAULT_
                     logger.warning(f"/add: запретная тематика [{ch['channel_id']}]: {reason}")
                 else:
                     ch["topic"] = (analysis.get("topic") or "").strip()
+                    ch["safe_profile"] = analysis.get("safe_profile", {})
                     arch, src = normalize_meta(analysis.get("archetype"), analysis.get("topic_source"))
                     ch["archetype"] = arch
                     ch.setdefault("topic_source", src)
@@ -2452,12 +2455,35 @@ async def _run_preview_background(bot, chat_id: int, channel: dict):
     import uuid, random
     try:
         from ai_client import generate_post
+        from content_safety import (
+            build_content_brief,
+            evaluate_topic_candidate,
+            validate_generated_post,
+        )
 
         # Берём случайную тему из вечнозелёных или используем общую
         evergreen = channel.get("evergreen_topics", [])
-        topic = random.choice(evergreen) if evergreen else channel.get("topic", "полезный совет")
+        raw_topic = random.choice(evergreen) if evergreen else channel.get("topic", "полезный совет")
+        safety = evaluate_topic_candidate(
+            channel, {"topic": raw_topic, "source": "preview"}
+        )
+        if safety["decision"] in ("blocked", "review") or not safety.get("safe_topic"):
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ Превью не сгенерировано: {safety.get('reason_code')}",
+            )
+            return
+        topic = safety["safe_topic"]
+        content_brief = build_content_brief(channel, safety)
 
-        post = await generate_post(channel, topic)
+        post = await generate_post(channel, topic, content_brief=content_brief)
+        validation = validate_generated_post(channel, post, safety, content_brief)
+        if not validation.get("allowed"):
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ Превью отклонено: {validation.get('reason_code')}",
+            )
+            return
 
         # Сохраняем пост во временное хранилище (module-level dict, не в БД)
         preview_id = str(uuid.uuid4())
@@ -3162,6 +3188,11 @@ async def regen_post_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     from ai_client import generate_post, PostGenerationError
+    from content_safety import (
+        build_content_brief,
+        evaluate_topic_candidate,
+        validate_generated_post,
+    )
     from content_router import resolve, pick_hook
 
     channel = next((c for c in load_all_channels() if c["channel_id"] == channel_id), {})
@@ -3169,9 +3200,20 @@ async def regen_post_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         strategy = resolve(channel) if channel else None
         hook = pick_hook(strategy) if strategy else None
         used = buffer.get_used_topics(channel_id) if hasattr(buffer, "get_used_topics") else []
-        post = await generate_post(
-            channel, topic, fmt, used_topics=used, strategy=strategy, hook=hook,
+        safety = evaluate_topic_candidate(
+            channel, {"topic": topic, "source": "regen_existing_post"}
         )
+        if safety["decision"] in ("blocked", "review") or not safety.get("safe_topic"):
+            raise PostGenerationError(f"topic safety: {safety.get('reason_code')}")
+        content_brief = build_content_brief(channel, safety, fmt)
+        post = await generate_post(
+            channel, safety["safe_topic"], fmt,
+            used_topics=used, strategy=strategy, hook=hook,
+            content_brief=content_brief,
+        )
+        validation = validate_generated_post(channel, post, safety, content_brief)
+        if not validation.get("allowed"):
+            raise PostGenerationError(f"output validation: {validation.get('reason_code')}")
         new_text = (post.get("content") if isinstance(post, dict) else str(post)) or ""
         new_text = new_text.strip()
         if not new_text:
