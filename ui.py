@@ -26,6 +26,7 @@ import asyncio
 import html
 import json
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1448,6 +1449,7 @@ async def action_ref_import(qm, context, handle: str, count: int = 10):
 
 _NUM_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 DRAFT_BATCH_LIMIT = 20
+DRAFT_BATCH_WINDOW_SEC = 8
 _MANUAL_DEDUP_STATUSES = ("draft", "ready", "pending_review", "awaiting_media", "published")
 
 
@@ -1506,7 +1508,19 @@ async def _warn_manual_duplicate(msg, duplicate: dict):
         "awaiting_media": "уже ждёт медиа",
         "published": "уже был опубликован",
     }
-    await msg.reply_text(f"⚠️ Такой пост {labels.get(status, 'уже есть')}. Повтор не добавляю.")
+    await _reply_and_cleanup_user_msg(msg, f"⚠️ Такой пост {labels.get(status, 'уже есть')}. Повтор не добавляю.")
+
+
+async def _delete_message_silent(message):
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.debug(f"message cleanup skipped: {e}")
+
+
+async def _reply_and_cleanup_user_msg(msg, text: str):
+    await msg.reply_text(text)
+    await _delete_message_silent(msg)
 
 
 def _manual_import_rejection_message(validation: dict) -> str:
@@ -1523,7 +1537,7 @@ def _manual_import_rejection_message(validation: dict) -> str:
 
 
 async def _warn_manual_import_rejected(msg, validation: dict):
-    await msg.reply_text(_manual_import_rejection_message(validation))
+    await _reply_and_cleanup_user_msg(msg, _manual_import_rejection_message(validation))
 
 
 def _draft_batch_state(context: ContextTypes.DEFAULT_TYPE, handle: str, reset: bool = False) -> dict:
@@ -1544,11 +1558,29 @@ def _draft_batch_used(context: ContextTypes.DEFAULT_TYPE, handle: str) -> int:
     return len(state.get("ids") or []) + len(state.get("pending_albums") or [])
 
 
+def _draft_batch_burst(context: ContextTypes.DEFAULT_TYPE, handle: str) -> dict:
+    state = _draft_batch_state(context, handle)
+    burst = state.setdefault("burst", {"count": 0, "last_at": 0.0, "overflow_warned": False})
+    return burst
+
+
+def _draft_batch_burst_count(context: ContextTypes.DEFAULT_TYPE, handle: str) -> int:
+    return int((_draft_batch_burst(context, handle).get("count") or 0))
+
+
 def _draft_batch_add(context: ContextTypes.DEFAULT_TYPE, handle: str, post_id: str):
     state = _draft_batch_state(context, handle)
     ids = state.setdefault("ids", [])
     if post_id not in ids:
         ids.append(post_id)
+
+
+def _draft_batch_remove(context: ContextTypes.DEFAULT_TYPE, post_id: str):
+    state = context.user_data.get("draft_batch") or {}
+    ids = state.get("ids") or []
+    if post_id in ids:
+        state["ids"] = [x for x in ids if x != post_id]
+        context.user_data["draft_batch"] = state
 
 
 def _draft_batch_track_album(context: ContextTypes.DEFAULT_TYPE, handle: str, gid: str):
@@ -1565,14 +1597,29 @@ def _draft_batch_untrack_album(context: ContextTypes.DEFAULT_TYPE, handle: str, 
 
 async def _draft_batch_limit_reached(msg, context: ContextTypes.DEFAULT_TYPE, handle: str) -> bool:
     state = _draft_batch_state(context, handle)
-    if _draft_batch_used(context, handle) < DRAFT_BATCH_LIMIT:
+    now = time.monotonic()
+    burst = _draft_batch_burst(context, handle)
+    last_at = float(burst.get("last_at") or 0.0)
+    if not last_at or now - last_at > DRAFT_BATCH_WINDOW_SEC:
+        burst = {"count": 0, "last_at": now, "overflow_warned": False}
+        state["burst"] = burst
+    else:
+        burst["last_at"] = now
+
+    if int(burst.get("count") or 0) < DRAFT_BATCH_LIMIT:
+        burst["count"] = int(burst.get("count") or 0) + 1
+        context.user_data["draft_batch"] = state
         return False
-    if not state.get("overflow_warned"):
-        state["overflow_warned"] = True
-        await msg.reply_text(
+    if not burst.get("overflow_warned"):
+        burst["overflow_warned"] = True
+        context.user_data["draft_batch"] = state
+        await _reply_and_cleanup_user_msg(
+            msg,
             f"⚠️ За один раз можно переслать не более {DRAFT_BATCH_LIMIT} постов. "
             f"Первые {DRAFT_BATCH_LIMIT} сохранены, лишние не добавляю."
         )
+    else:
+        await _delete_message_silent(msg)
     return True
 
 
@@ -1826,6 +1873,7 @@ async def _flush_album_draft(context, gid: str, reply_msg):
             created=True,
             batch_count=batch_count,
         )
+        await _delete_message_silent(reply_msg)
     except Exception:
         pass
 
@@ -1905,10 +1953,12 @@ async def create_draft_from_message(update: Update, context: ContextTypes.DEFAUL
     post["id"] = post_id
     _draft_batch_add(context, handle, post_id)
     batch_count = _draft_batch_count(context, handle)
+    burst_count = _draft_batch_burst_count(context, handle)
 
     kind = {"photo": "фото", "video": "видео", "document": "документ", "animation": "гиф"}.get(media_type, "текст")
-    await msg.reply_text(f"✅ Черновик создан ({kind}). В этой пачке: {batch_count}/{DRAFT_BATCH_LIMIT}.")
+    await msg.reply_text(f"✅ Черновик создан ({kind}). В этом пересыле: {burst_count}/{DRAFT_BATCH_LIMIT}.")
     await _reply_draft_card(msg, post, "👀 Превью", created=True, batch_count=batch_count)
+    await _delete_message_silent(msg)
     return True
 
 
@@ -1981,6 +2031,25 @@ def _validate_draft_for_queue(draft: dict) -> tuple[bool, str]:
     return False, f"⚠️ Черновик не прошёл проверку: {reason}"
 
 
+def _manual_queue_done_kb(handle: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Ещё пост", callback_data=f"ui:draft_new:{handle}")],
+        [InlineKeyboardButton("✍️ Черновики", callback_data=f"ui:ch_draft:{handle}")],
+        [InlineKeyboardButton("◀️ Создать пост", callback_data=f"ui:ch_create:{handle}")],
+    ])
+
+
+async def _send_manual_queue_done(qm, context: ContextTypes.DEFAULT_TYPE, handle: str, text: str):
+    from telegram import CallbackQuery
+    if isinstance(qm, CallbackQuery):
+        await _delete_message_silent(qm.message)
+        await context.bot.send_message(
+            chat_id=qm.message.chat_id,
+            text=text,
+            reply_markup=_manual_queue_done_kb(handle),
+        )
+
+
 async def action_draft_queue(qm, context: ContextTypes.DEFAULT_TYPE, post_id: str):
     """Отправляет один черновик в очередь. Правит кнопки этой карточки на месте."""
     from telegram import CallbackQuery
@@ -1995,12 +2064,16 @@ async def action_draft_queue(qm, context: ContextTypes.DEFAULT_TYPE, post_id: st
     ok = buffer.draft_to_ready(post_id)
     if isinstance(qm, CallbackQuery):
         await qm.answer("⬆️ В очереди" if ok else "Уже не черновик")
-        try:
-            await qm.edit_message_reply_markup(
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ В очереди", callback_data="ui:noop")]])
-            )
-        except Exception:
-            pass
+        if ok and handle:
+            _draft_batch_remove(context, post_id)
+            await _send_manual_queue_done(qm, context, handle, "✅ Пост добавлен в очередь.")
+        else:
+            try:
+                await qm.edit_message_reply_markup(
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ В очереди", callback_data="ui:noop")]])
+                )
+            except Exception:
+                pass
 
 
 async def action_draft_queue_last(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
@@ -2060,6 +2133,8 @@ async def action_draft_queue_batch(qm, context: ContextTypes.DEFAULT_TYPE, handl
     if isinstance(qm, CallbackQuery):
         suffix = f", пропущено: {skipped}" if skipped else ""
         await qm.answer(f"⬆️ В очередь: {n}{suffix}")
+        await _send_manual_queue_done(qm, context, handle, f"✅ Созданные посты добавлены в очередь: {n}{suffix}.")
+        return
     await screen_drafts(qm, context, handle)
 
 
