@@ -313,10 +313,13 @@ async def screen_channels(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0)
     channels = [c for c in _load_channels(include_inactive=True, owner_id=_acting_uid(qm), scope="mine")
                 if c.get("active", True)]
 
-    # Фильтр по папке (из user_data): None=все, "__none__"=без папки, иначе имя папки
+    # Фильтр по папке (из user_data): None/"__none__"=без папки, "__all__"=все, иначе имя папки.
+    # Так каналы, разложенные по папкам, не захламляют главный экран «Мои каналы».
     folder = context.user_data.get("chfolder")
-    if folder == "__none__":
+    if folder in (None, "__none__"):
         channels = [c for c in channels if not (c.get("folder") or "").strip()]
+    elif folder == "__all__":
+        pass
     elif folder:
         channels = [c for c in channels if (c.get("folder") or "").strip() == folder]
 
@@ -327,11 +330,12 @@ async def screen_channels(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0)
         InlineKeyboardButton("🗑 Удалённые",  callback_data="ui:ch_deleted:0"),
     ]
     folder_row = [InlineKeyboardButton("📁 Папки", callback_data="ui:folders")]
-    if folder:  # внутри папки — кнопка сброса фильтра
+    if folder != "__all__":
         folder_row.append(InlineKeyboardButton("📋 Все каналы", callback_data="ui:chfold:all"))
 
     folder_title = (
-        f" · 📂 без папки" if folder == "__none__" else (f" · 📁 {folder}" if folder else "")
+        f" · 📋 все" if folder == "__all__" else
+        (f" · 📁 {folder}" if folder and folder != "__none__" else " · 📂 без папки")
     )
 
     if not channels:
@@ -3146,7 +3150,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "chfold" and len(parts) >= 3:
         sel = parts[2]
         if sel == "all":
-            context.user_data.pop("chfolder", None)
+            context.user_data["chfolder"] = "__all__"
         elif sel == "none":
             context.user_data["chfolder"] = "__none__"
         else:
