@@ -262,12 +262,12 @@ class BufferManager:
             )
             return cur.rowcount
 
-    def set_draft_content(self, post_id: str, content: str) -> bool:
+    def set_draft_content(self, post_id: str, content: str, parse_mode: str | None = None) -> bool:
         """Меняет текст/подпись черновика."""
         with db.connect() as conn:
             cur = conn.execute(
-                "UPDATE posts SET content = ? WHERE id = ? AND status = 'draft'",
-                (content, post_id),
+                "UPDATE posts SET content = ?, parse_mode = ? WHERE id = ? AND status = 'draft'",
+                (content, parse_mode, post_id),
             )
             return cur.rowcount > 0
 

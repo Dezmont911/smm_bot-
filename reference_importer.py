@@ -43,11 +43,18 @@ DEFAULT_TAKE = 10  # сколько постов добираем за один 
 MIN_REF_TEXT_CHARS = 25
 
 # Лёгкий фильтр: пропускаем явную рекламу (ссылки/цены НЕ трогаем — иначе режем WB)
-AD_MARKERS = ("реклама", "рекламa", "erid", "ерид", "по вопросам рекламы", "#ad", "промокод")
+AD_MARKERS = (
+    "реклама", "рекламa", "erid", "ерид", "по вопросам рекламы", "#ad", "промокод",
+    "пост не совсем по нашей теме", "не совсем по нашей теме", "финансовая рекомендация",
+    "комиссия для продавцов", "для продавцов", "стоматолог", "клиник", "имплант",
+    "лечение зуб", "трансфер", "проживание", "путевка", "путёвка",
+    "ссылка на чат в whatsapp", "telegram / whatsapp",
+)
 
 
 def _is_ad(text: str) -> bool:
     t = (text or "").lower()
+    t = re.sub(r"https?://\S+", " ", t)
     return any(m in t for m in AD_MARKERS)
 
 
@@ -304,7 +311,8 @@ async def import_for_channel(channel: dict, count: int = DEFAULT_TAKE) -> dict:
                     skipped_dups += 1
                     continue
                 raw = p.get("text", "")
-                if q["ref"].get("skip_ads", True) and raw and _is_ad(raw):
+                raw_html = p.get("text_html", "")
+                if q["ref"].get("skip_ads", True) and (raw or raw_html) and _is_ad(f"{raw}\n{raw_html}"):
                     logger.debug(f"Референс {q['handle']}: пропуск рекламы (id={p['id']})")
                     continue
                 # Текст-только пост (без медиа) короче порога → навигационная шелуха

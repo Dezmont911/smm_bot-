@@ -84,6 +84,26 @@ PRICE_MARKERS = (
     "₽", "руб", "стоимость", "цена", "от 990", "от 1500",
 )
 
+MARKETPLACE_PRODUCT_LINK_MARKERS = (
+    "wildberries.ru", "wb.ru", "ozon.ru", "ozon.onelink.me",
+    "aliexpress", "ali.click", "market.yandex", "yandex.ru/cc",
+    "reelsmarket.ru", "takprdm.ru", "dplnk.ru", "megamarket",
+    "lamoda.ru", "kazanexpress.ru",
+)
+
+MARKETPLACE_OFFTOPIC_MARKERS = (
+    "пост не совсем по нашей теме", "не совсем по нашей теме",
+    "финансовая рекомендация", "комиссия для продавцов", "комиссию для продавцов",
+    "для продавцов", "налоги", "логистика", "упаковка", "бензин",
+    "цены на всё", "окно возможностей", "загляните на маркетплейсы",
+)
+
+MARKETPLACE_SERVICE_AD_MARKERS = (
+    "стоматолог", "клиник", "имплант", "лечение зуб", "трансфер",
+    "проживание", "путевка", "путёвка", "бесплатная линия",
+    "ссылка на чат в whatsapp", "telegram / whatsapp",
+)
+
 
 def _clean_text(value: Any, limit: int = 500) -> str:
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", str(value or ""))
@@ -415,13 +435,33 @@ def _requires_marketplace_link(channel: dict, post: dict) -> bool:
         fmt == "wb_product"
         or (
             channel.get("channel_type") == "marketplace"
-            and fmt in {"reference", "marketplace", "wb_product"}
+            and fmt in {"manual", "reference", "marketplace", "wb_product"}
         )
     )
 
 
+def _html_links(content: str) -> list[str]:
+    return re.findall(r'<a\s+href=["\'](https?://[^"\']+)["\']', content or "", re.IGNORECASE)
+
+
 def _has_html_link(content: str) -> bool:
-    return bool(re.search(r'<a\s+href=["\']https?://[^"\']+["\']', content or "", re.IGNORECASE))
+    return bool(_html_links(content))
+
+
+def _has_marketplace_product_link(content: str) -> bool:
+    links = _html_links(content)
+    if not links:
+        return False
+    return any(
+        marker in url.lower()
+        for url in links
+        for marker in MARKETPLACE_PRODUCT_LINK_MARKERS
+    )
+
+
+def _looks_like_marketplace_offtopic(content: str) -> bool:
+    low = _low(content)
+    return any(marker in low for marker in MARKETPLACE_OFFTOPIC_MARKERS + MARKETPLACE_SERVICE_AD_MARKERS)
 
 
 def validate_generated_post(channel: dict, post: dict, safety: dict, brief: dict) -> dict:
@@ -452,6 +492,24 @@ def validate_generated_post(channel: dict, post: dict, safety: dict, brief: dict
             "decision": "review",
             "reason_code": "missing_marketplace_link",
             "notes": "marketplace/reference post has no real <a href> link",
+        })
+        return result
+
+    if _requires_marketplace_link(channel, post) and not _has_marketplace_product_link(content):
+        result.update({
+            "allowed": False,
+            "decision": "review",
+            "reason_code": "missing_marketplace_product_link",
+            "notes": "marketplace post has links, but no recognized product/marketplace link",
+        })
+        return result
+
+    if channel.get("channel_type") == "marketplace" and _looks_like_marketplace_offtopic(content):
+        result.update({
+            "allowed": False,
+            "decision": "review",
+            "reason_code": "marketplace_offtopic_or_service_ad",
+            "notes": "marketplace post looks like service ad or advisory content, not a product card",
         })
         return result
 

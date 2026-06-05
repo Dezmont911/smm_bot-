@@ -1575,6 +1575,22 @@ def _extract_msg_media(msg) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _message_html_content(msg) -> tuple[str, str | None]:
+    """Текст/подпись с сохранением Telegram text_link/url entities как HTML."""
+    raw = (msg.caption or msg.text or "").strip()
+    html_text = None
+    if msg.caption:
+        html_text = getattr(msg, "caption_html", None)
+    elif msg.text:
+        html_text = getattr(msg, "text_html", None)
+    if callable(html_text):
+        html_text = html_text()
+    html_text = (html_text or "").strip()
+    if html_text:
+        return html_text, "HTML"
+    return raw, None
+
+
 def _draft_done_kb(handle: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⬆️ Сразу в очередь", callback_data=f"ui:draft_qlast:{handle}")],
@@ -1603,7 +1619,7 @@ async def _flush_album_draft(context, gid: str, reply_msg):
         "topic": "manual draft",
         "status": "draft",
         "media_type": "album",
-        "parse_mode": None,
+        "parse_mode": slot.get("parse_mode"),
         "tg_file_id": json.dumps({"members": members, "items": items}),
     })
     try:
@@ -1633,17 +1649,20 @@ async def create_draft_from_message(update: Update, context: ContextTypes.DEFAUL
     if not msg:
         return False
 
-    caption = (msg.caption or msg.text or "").strip()
+    caption, parse_mode = _message_html_content(msg)
     file_id, media_type = _extract_msg_media(msg)
 
     # --- Альбом: копим кадры, флашим одним черновиком после паузы ---
     gid = getattr(msg, "media_group_id", None)
     if gid and file_id:
         slots = context.user_data.setdefault("_album_slots", {})
-        slot = slots.setdefault(str(gid), {"items": [], "caption": "", "handle": handle, "task": None})
+        slot = slots.setdefault(str(gid), {
+            "items": [], "caption": "", "parse_mode": None, "handle": handle, "task": None
+        })
         slot["items"].append((file_id, media_type))
         if caption and not slot["caption"]:
             slot["caption"] = caption
+            slot["parse_mode"] = parse_mode
         if slot.get("task"):
             slot["task"].cancel()
         slot["task"] = asyncio.create_task(_flush_album_draft(context, str(gid), msg))
@@ -1660,7 +1679,7 @@ async def create_draft_from_message(update: Update, context: ContextTypes.DEFAUL
         "format": "manual",
         "topic": "manual draft",
         "status": "draft",
-        "parse_mode": None,  # ручной текст — без разметки, чтобы не ловить parse-ошибки
+        "parse_mode": parse_mode,
     }
     if file_id:
         post["tg_file_id"] = file_id
@@ -1683,13 +1702,13 @@ async def apply_draft_edit_message(update: Update, context: ContextTypes.DEFAULT
 
     pid = context.user_data.get("draft_edit")
     if pid:
-        text = (msg.text or msg.caption or "").strip()
+        text, parse_mode = _message_html_content(msg)
         if not text:
             await msg.reply_text("⚠️ Пришли текст.")
             return True
         context.user_data.pop("draft_edit", None)
         handle = buffer.get_post_channel(pid)
-        buffer.set_draft_content(pid, text)
+        buffer.set_draft_content(pid, text, parse_mode)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К черновикам", callback_data=f"ui:ch_draft:{handle}")]])
         await msg.reply_text("✅ Текст черновика обновлён.", reply_markup=kb)
         return True
@@ -1718,10 +1737,44 @@ async def apply_draft_edit_message(update: Update, context: ContextTypes.DEFAULT
     return False
 
 
+def _validate_draft_for_queue(draft: dict) -> tuple[bool, str]:
+    """Не выпускает marketplace manual/reference draft без товарной ссылки."""
+    ch = _load_channel(draft.get("channel_id"))
+    if not ch or ch.get("channel_type") != "marketplace":
+        return True, ""
+    from content_safety import validate_generated_post
+    validation = validate_generated_post(
+        ch,
+        {
+            "content": draft.get("content") or "",
+            "format": draft.get("format") or "manual",
+            "topic": draft.get("topic") or "manual draft",
+        },
+        {"decision": "allowed", "safe_topic": draft.get("topic") or "manual draft"},
+        {},
+    )
+    if validation.get("allowed"):
+        return True, ""
+    reason = validation.get("reason_code") or "invalid_marketplace_post"
+    if reason in {"missing_marketplace_link", "missing_marketplace_product_link"}:
+        return False, "⚠️ Для marketplace-поста нужна активная товарная ссылка."
+    if reason == "marketplace_offtopic_or_service_ad":
+        return False, "⚠️ Пост не похож на товарную карточку marketplace."
+    return False, f"⚠️ Черновик не прошёл проверку: {reason}"
+
+
 async def action_draft_queue(qm, context: ContextTypes.DEFAULT_TYPE, post_id: str):
     """Отправляет один черновик в очередь. Правит кнопки этой карточки на месте."""
-    ok = buffer.draft_to_ready(post_id)
     from telegram import CallbackQuery
+    handle = buffer.get_post_channel(post_id)
+    draft = next((x for x in buffer.get_drafts(handle) if x["id"] == post_id), None) if handle else None
+    if draft:
+        valid, message = _validate_draft_for_queue(draft)
+        if not valid:
+            if isinstance(qm, CallbackQuery):
+                await qm.answer(message, show_alert=True)
+            return
+    ok = buffer.draft_to_ready(post_id)
     if isinstance(qm, CallbackQuery):
         await qm.answer("⬆️ В очереди" if ok else "Уже не черновик")
         try:
@@ -1737,6 +1790,12 @@ async def action_draft_queue_last(qm, context: ContextTypes.DEFAULT_TYPE, handle
     drafts = buffer.get_drafts(handle)
     from telegram import CallbackQuery
     if drafts:
+        valid, message = _validate_draft_for_queue(drafts[-1])
+        if not valid:
+            if isinstance(qm, CallbackQuery):
+                await qm.answer(message, show_alert=True)
+            await screen_drafts(qm, context, handle)
+            return
         buffer.draft_to_ready(drafts[-1]["id"])
         if isinstance(qm, CallbackQuery):
             await qm.answer("⬆️ В очереди")
@@ -1745,10 +1804,17 @@ async def action_draft_queue_last(qm, context: ContextTypes.DEFAULT_TYPE, handle
 
 async def action_draft_queue_all(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
     """Отправляет ВСЕ черновики канала в очередь."""
-    n = buffer.drafts_to_ready_all(handle)
+    n = skipped = 0
+    for draft in buffer.get_drafts(handle):
+        valid, _ = _validate_draft_for_queue(draft)
+        if valid and buffer.draft_to_ready(draft["id"]):
+            n += 1
+        else:
+            skipped += 1
     from telegram import CallbackQuery
     if isinstance(qm, CallbackQuery):
-        await qm.answer(f"⬆️ В очередь: {n}")
+        suffix = f", пропущено: {skipped}" if skipped else ""
+        await qm.answer(f"⬆️ В очередь: {n}{suffix}")
     await screen_drafts(qm, context, handle)
 
 
@@ -1777,18 +1843,19 @@ async def action_draft_view(qm, context: ContextTypes.DEFAULT_TYPE, post_id: str
         return
     chat_id = qm.message.chat_id if isinstance(qm, CallbackQuery) else qm.chat_id
     cap = (d.get("content") or "") or None
+    parse_mode = d.get("parse_mode")
     fid, mt = d.get("tg_file_id"), d.get("media_type")
     try:
         if mt == "photo":
-            await context.bot.send_photo(chat_id, fid, caption=cap)
+            await context.bot.send_photo(chat_id, fid, caption=cap, parse_mode=parse_mode)
         elif mt == "video":
-            await context.bot.send_video(chat_id, fid, caption=cap)
+            await context.bot.send_video(chat_id, fid, caption=cap, parse_mode=parse_mode)
         elif mt == "animation":
-            await context.bot.send_animation(chat_id, fid, caption=cap)
+            await context.bot.send_animation(chat_id, fid, caption=cap, parse_mode=parse_mode)
         elif mt == "document":
-            await context.bot.send_document(chat_id, fid, caption=cap)
+            await context.bot.send_document(chat_id, fid, caption=cap, parse_mode=parse_mode)
         else:
-            await context.bot.send_message(chat_id, cap or "(пустой пост)")
+            await context.bot.send_message(chat_id, cap or "(пустой пост)", parse_mode=parse_mode)
     except Exception as e:
         await context.bot.send_message(chat_id, f"⚠️ Не показать превью: {e}")
 

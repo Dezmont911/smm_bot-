@@ -25,6 +25,13 @@ ROBO_CHANNEL = {
 }
 
 
+MARKETPLACE_CHANNEL = {
+    "channel_id": "@wb_bomb",
+    "channel_type": "marketplace",
+    "topic": "товары Wildberries, Ozon, AliExpress со ссылками на покупку",
+}
+
+
 class ContentSafetyTest(unittest.TestCase):
     def test_kids_education_topic_allowed(self):
         result = dry_run_topic(
@@ -417,6 +424,68 @@ class ContentSafetyTest(unittest.TestCase):
             safety_and_brief["content_brief"],
         )
         self.assertTrue(validation["allowed"])
+
+    def test_marketplace_reference_requires_product_link(self):
+        validation = validate_generated_post(
+            MARKETPLACE_CHANNEL,
+            {
+                "format": "reference",
+                "content": (
+                    'Чайный сервиз на 4 персоны\n\n'
+                    'Заказать на <a href="https://ozon.ru/product/525022324">OZON</a>'
+                ),
+            },
+            {"decision": "allowed", "safe_topic": "товар"},
+            {},
+        )
+        self.assertTrue(validation["allowed"])
+
+    def test_marketplace_manual_placeholder_link_is_rejected(self):
+        validation = validate_generated_post(
+            MARKETPLACE_CHANNEL,
+            {
+                "format": "manual",
+                "content": "Набор колец\nцена 676₽\n\n🔗 ссылка на товар",
+            },
+            {"decision": "allowed", "safe_topic": "manual draft"},
+            {},
+        )
+        self.assertFalse(validation["allowed"])
+        self.assertEqual(validation["reason_code"], "missing_marketplace_link")
+
+    def test_marketplace_reference_service_ad_is_rejected(self):
+        validation = validate_generated_post(
+            MARKETPLACE_CHANNEL,
+            {
+                "format": "reference",
+                "content": (
+                    "Стоматологическая клиника в Китае. Бесплатный трансфер и проживание.\n"
+                    '<a href="https://stomkitay.ru/kak-dobratsya/">Сайт клиники</a>\n'
+                    '<a href="https://chat.whatsapp.com/example">WhatsApp</a>'
+                ),
+            },
+            {"decision": "allowed", "safe_topic": "reference"},
+            {},
+        )
+        self.assertFalse(validation["allowed"])
+        self.assertEqual(validation["reason_code"], "missing_marketplace_product_link")
+
+    def test_marketplace_reference_advisory_post_is_rejected(self):
+        validation = validate_generated_post(
+            MARKETPLACE_CHANNEL,
+            {
+                "format": "reference",
+                "content": (
+                    "Пост не совсем по нашей теме, но важный для кошелька. "
+                    "Озон поднял комиссию для продавцов, налоги и логистика дорожают. "
+                    "Это не финансовая рекомендация. Загляните на маркетплейсы."
+                ),
+            },
+            {"decision": "allowed", "safe_topic": "reference"},
+            {},
+        )
+        self.assertFalse(validation["allowed"])
+        self.assertEqual(validation["reason_code"], "missing_marketplace_link")
 
 
 if __name__ == "__main__":
