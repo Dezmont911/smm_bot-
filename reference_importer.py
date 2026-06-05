@@ -28,7 +28,12 @@ from pathlib import Path
 from loguru import logger
 
 from buffer_manager import buffer
-from content_safety import build_content_brief, evaluate_topic_candidate, validate_generated_post
+from content_safety import (
+    build_content_brief,
+    evaluate_topic_candidate,
+    validate_generated_post,
+    validate_imported_post,
+)
 from userbot_reader import (
     read_candidates, forward_to_bot, normalize_handle,
 )
@@ -157,6 +162,24 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
     topic = ref_topic(p.get("match_user") or handle, p.get("match_id") or p["id"])
     raw = p.get("text", "")
     raw_for_safety = raw or re.sub(r"<[^>]+>", " ", p.get("text_html") or "")
+    kind = p.get("media_kind")
+
+    import_validation = validate_imported_post(
+        channel,
+        {
+            "channel_id": channel_id,
+            "content": p.get("text_html") or raw,
+            "format": "reference",
+            "topic": topic,
+            "media_type": "album" if p.get("group_id") else kind,
+        },
+    )
+    if not import_validation.get("allowed"):
+        logger.warning(
+            f"Reference import skipped [{channel_id}] {handle}/{p.get('id')}: "
+            f"{import_validation.get('reason_code')}"
+        )
+        return None
 
     safety = None
     brief = None
@@ -199,7 +222,6 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
 
     content = _strip_filtered_sentences(content)  # вырезаем «MAX» и пр.
 
-    kind = p.get("media_kind")
     if not content and not kind:
         return None  # пустой пост без медиа
     if content:

@@ -104,6 +104,17 @@ MARKETPLACE_SERVICE_AD_MARKERS = (
     "ссылка на чат в whatsapp", "telegram / whatsapp",
 )
 
+IMPORT_AD_MARKERS = (
+    "по вопросам рекламы", "erid", "ерид", "#ad", "промокод",
+    "партнерский материал", "партнёрский материал", "рекламная интеграция",
+    "бесплатная линия", "telegram / whatsapp", "ссылка на чат в whatsapp",
+)
+
+NAV_ONLY_MARKERS = (
+    "смотреть тут", "читать тут", "серия тут", "продолжение тут",
+    "тут", "здесь", "по ссылке", "ссылка ниже",
+)
+
 
 def _clean_text(value: Any, limit: int = 500) -> str:
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", str(value or ""))
@@ -444,6 +455,13 @@ def _html_links(content: str) -> list[str]:
     return re.findall(r'<a\s+href=["\'](https?://[^"\']+)["\']', content or "", re.IGNORECASE)
 
 
+def _plain_from_html(content: str) -> str:
+    text = re.sub(r"<a\b[^>]*>(.*?)</a>", r"\1", content or "", flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"https?://\S+", " ", text, flags=re.IGNORECASE)
+    return _clean_text(text, 5000)
+
+
 def _has_html_link(content: str) -> bool:
     return bool(_html_links(content))
 
@@ -462,6 +480,81 @@ def _has_marketplace_product_link(content: str) -> bool:
 def _looks_like_marketplace_offtopic(content: str) -> bool:
     low = _low(content)
     return any(marker in low for marker in MARKETPLACE_OFFTOPIC_MARKERS + MARKETPLACE_SERVICE_AD_MARKERS)
+
+
+def _looks_like_import_ad_or_offtopic(content: str) -> bool:
+    low = _plain_from_html(content).lower()
+    return any(
+        marker in low
+        for marker in IMPORT_AD_MARKERS + MARKETPLACE_OFFTOPIC_MARKERS + MARKETPLACE_SERVICE_AD_MARKERS
+    )
+
+
+def _looks_like_navigation_only(content: str, has_media: bool) -> bool:
+    plain = _plain_from_html(content).lower().strip(" .,:;!؟?—-–«»\"'")
+    if not plain:
+        return False
+    if plain in NAV_ONLY_MARKERS:
+        return True
+    if not has_media and len(plain) < 25 and any(marker in plain for marker in NAV_ONLY_MARKERS):
+        return True
+    return False
+
+
+def validate_imported_post(channel: dict, post: dict) -> dict:
+    """Lightweight guard for manual forwards and reference imports before buffer.add()."""
+    content = post.get("content") or ""
+    media_type = post.get("media_type")
+    has_media = bool(media_type or post.get("tg_file_id") or post.get("media_path"))
+    result = {"allowed": True, "decision": "allowed", "reason_code": "valid_imported_post", "notes": ""}
+
+    if not content and not has_media:
+        result.update({"allowed": False, "decision": "blocked", "reason_code": "empty_imported_post"})
+        return result
+
+    if content and _looks_like_refusal(content):
+        result.update({"allowed": False, "decision": "blocked", "reason_code": "meta_or_refusal_output"})
+        return result
+
+    if content and _blocked_content(content):
+        result.update({"allowed": False, "decision": "blocked", "reason_code": "blocked_imported_content"})
+        return result
+
+    if content and _looks_like_navigation_only(content, has_media):
+        result.update({"allowed": False, "decision": "review", "reason_code": "navigation_only_import"})
+        return result
+
+    if content and _looks_like_import_ad_or_offtopic(content):
+        result.update({"allowed": False, "decision": "review", "reason_code": "import_ad_or_offtopic"})
+        return result
+
+    if _requires_marketplace_link(channel, post) and not _has_html_link(content):
+        result.update({
+            "allowed": False,
+            "decision": "review",
+            "reason_code": "missing_marketplace_link",
+            "notes": "marketplace imported post has no real <a href> link",
+        })
+        return result
+
+    if _requires_marketplace_link(channel, post) and not _has_marketplace_product_link(content):
+        result.update({
+            "allowed": False,
+            "decision": "review",
+            "reason_code": "missing_marketplace_product_link",
+            "notes": "marketplace imported post has links, but no recognized product/marketplace link",
+        })
+        return result
+
+    if channel.get("channel_type") == "marketplace" and content and _looks_like_marketplace_offtopic(content):
+        result.update({
+            "allowed": False,
+            "decision": "review",
+            "reason_code": "marketplace_offtopic_or_service_ad",
+        })
+        return result
+
+    return result
 
 
 def validate_generated_post(channel: dict, post: dict, safety: dict, brief: dict) -> dict:

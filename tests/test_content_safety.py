@@ -8,6 +8,7 @@ from content_safety import (
     evaluate_topic_candidate,
     is_kids_education_channel,
     validate_generated_post,
+    validate_imported_post,
 )
 
 
@@ -483,6 +484,63 @@ class ContentSafetyTest(unittest.TestCase):
             },
             {"decision": "allowed", "safe_topic": "reference"},
             {},
+        )
+        self.assertFalse(validation["allowed"])
+        self.assertEqual(validation["reason_code"], "missing_marketplace_link")
+
+    def test_import_guard_rejects_navigation_only_text(self):
+        validation = validate_imported_post(
+            {"channel_id": "@plain", "topic": "сериал"},
+            {"format": "manual", "content": "Серия тут"},
+        )
+        self.assertFalse(validation["allowed"])
+        self.assertEqual(validation["reason_code"], "navigation_only_import")
+
+    def test_import_guard_rejects_service_ad(self):
+        validation = validate_imported_post(
+            {"channel_id": "@plain", "topic": "товары"},
+            {
+                "format": "reference",
+                "content": (
+                    "Стоматологическая клиника в Китае. Бесплатный трансфер и проживание. "
+                    "Telegram / WhatsApp: +7 999 000-00-00"
+                ),
+            },
+        )
+        self.assertFalse(validation["allowed"])
+        self.assertEqual(validation["reason_code"], "import_ad_or_offtopic")
+
+    def test_import_guard_rejects_marketplace_advisory_offtopic(self):
+        validation = validate_imported_post(
+            MARKETPLACE_CHANNEL,
+            {
+                "format": "reference",
+                "content": (
+                    "Пост не совсем по нашей теме. Озон поднял комиссию для продавцов, "
+                    "налоги и логистика дорожают. Это не финансовая рекомендация."
+                ),
+            },
+        )
+        self.assertFalse(validation["allowed"])
+        self.assertEqual(validation["reason_code"], "import_ad_or_offtopic")
+
+    def test_import_guard_allows_marketplace_product_with_html_link(self):
+        validation = validate_imported_post(
+            MARKETPLACE_CHANNEL,
+            {
+                "format": "manual",
+                "content": (
+                    "Набор колец\nцена 676₽\n\n"
+                    '<a href="https://www.wildberries.ru/catalog/123/detail.aspx">ссылка на товар</a>'
+                ),
+            },
+        )
+        self.assertTrue(validation["allowed"])
+
+    def test_import_guard_rejects_marketplace_placeholder_link(self):
+        validation = validate_imported_post(
+            MARKETPLACE_CHANNEL,
+            {"format": "manual", "content": "Набор колец\nцена 676₽\n\n🔗 ссылка на товар"},
         )
         self.assertFalse(validation["allowed"])
         self.assertEqual(validation["reason_code"], "missing_marketplace_link")

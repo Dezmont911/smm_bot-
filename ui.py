@@ -1509,6 +1509,23 @@ async def _warn_manual_duplicate(msg, duplicate: dict):
     await msg.reply_text(f"⚠️ Такой пост {labels.get(status, 'уже есть')}. Повтор не добавляю.")
 
 
+def _manual_import_rejection_message(validation: dict) -> str:
+    reason = validation.get("reason_code") or "invalid_imported_post"
+    if reason in {"missing_marketplace_link", "missing_marketplace_product_link"}:
+        return "⚠️ Для marketplace-поста нужна активная товарная ссылка."
+    if reason in {"import_ad_or_offtopic", "marketplace_offtopic_or_service_ad"}:
+        return "⚠️ Похоже на рекламу или оффтоп. Такой пост не добавляю."
+    if reason == "navigation_only_import":
+        return "⚠️ В посте нет самостоятельного содержимого. Такой пост не добавляю."
+    if reason == "blocked_imported_content":
+        return "⚠️ Такой контент нельзя добавлять по политике бота."
+    return f"⚠️ Пост не прошёл проверку: {reason}"
+
+
+async def _warn_manual_import_rejected(msg, validation: dict):
+    await msg.reply_text(_manual_import_rejection_message(validation))
+
+
 def _draft_batch_state(context: ContextTypes.DEFAULT_TYPE, handle: str, reset: bool = False) -> dict:
     state = context.user_data.get("draft_batch") or {}
     if reset or state.get("handle") != handle:
@@ -1780,6 +1797,16 @@ async def _flush_album_draft(context, gid: str, reply_msg):
         "tg_file_id": json.dumps({"members": members, "items": items}),
     }
     _draft_batch_untrack_album(context, handle, gid)
+    ch = _load_channel(handle)
+    if ch:
+        from content_safety import validate_imported_post
+        validation = validate_imported_post(ch, post)
+        if not validation.get("allowed"):
+            try:
+                await _warn_manual_import_rejected(reply_msg, validation)
+            except Exception:
+                pass
+            return
     duplicate = _manual_post_duplicate(handle, post["content"], post["media_type"], post["tg_file_id"])
     if duplicate:
         try:
@@ -1863,6 +1890,13 @@ async def create_draft_from_message(update: Update, context: ContextTypes.DEFAUL
     if file_id:
         post["tg_file_id"] = file_id
         post["media_type"] = media_type
+    ch = _load_channel(handle)
+    if ch:
+        from content_safety import validate_imported_post
+        validation = validate_imported_post(ch, post)
+        if not validation.get("allowed"):
+            await _warn_manual_import_rejected(msg, validation)
+            return True
     duplicate = _manual_post_duplicate(handle, post["content"], post.get("media_type"), post.get("tg_file_id"))
     if duplicate:
         await _warn_manual_duplicate(msg, duplicate)
