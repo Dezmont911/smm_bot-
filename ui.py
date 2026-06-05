@@ -1450,6 +1450,7 @@ async def action_ref_import(qm, context, handle: str, count: int = 10):
 _NUM_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 DRAFT_BATCH_LIMIT = 20
 DRAFT_BATCH_WINDOW_SEC = 8
+DRAFT_BATCH_SUMMARY_DELAY_SEC = 2.5
 _MANUAL_DEDUP_STATUSES = ("draft", "ready", "pending_review", "awaiting_media", "published")
 
 
@@ -1543,6 +1544,9 @@ async def _warn_manual_import_rejected(msg, validation: dict):
 def _draft_batch_state(context: ContextTypes.DEFAULT_TYPE, handle: str, reset: bool = False) -> dict:
     state = context.user_data.get("draft_batch") or {}
     if reset or state.get("handle") != handle:
+        task = (state.get("summary") or {}).get("task")
+        if task and not task.done():
+            task.cancel()
         state = {"handle": handle, "ids": [], "pending_albums": [], "overflow_warned": False}
         context.user_data["draft_batch"] = state
     return state
@@ -1566,6 +1570,14 @@ def _draft_batch_burst(context: ContextTypes.DEFAULT_TYPE, handle: str) -> dict:
 
 def _draft_batch_burst_count(context: ContextTypes.DEFAULT_TYPE, handle: str) -> int:
     return int((_draft_batch_burst(context, handle).get("count") or 0))
+
+
+def _draft_batch_summary_state(context: ContextTypes.DEFAULT_TYPE, handle: str) -> dict:
+    state = _draft_batch_state(context, handle)
+    summary = state.setdefault("summary", {
+        "ids": [], "accepted": 0, "rejected": 0, "duplicates": 0, "overflow": 0, "last_reason": "", "chat_id": None,
+    })
+    return summary
 
 
 def _draft_batch_add(context: ContextTypes.DEFAULT_TYPE, handle: str, post_id: str):
@@ -1595,6 +1607,103 @@ def _draft_batch_untrack_album(context: ContextTypes.DEFAULT_TYPE, handle: str, 
     state["pending_albums"] = [x for x in state.get("pending_albums", []) if x != gid]
 
 
+def _draft_batch_summary_kb(handle: str, batch_count: int) -> InlineKeyboardMarkup:
+    rows = []
+    if batch_count:
+        rows.append([InlineKeyboardButton("👀 Показать превью", callback_data=f"ui:draft_preview_batch:{handle}")])
+        rows.append([InlineKeyboardButton(f"📤 Все созданные в очередь ({batch_count})", callback_data=f"ui:draft_qbatch:{handle}")])
+    rows.extend([
+        [InlineKeyboardButton("✍️ Черновики", callback_data=f"ui:ch_draft:{handle}")],
+        [InlineKeyboardButton("◀️ Создать пост", callback_data=f"ui:ch_create:{handle}")],
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _draft_batch_summary_text(summary: dict, batch_count: int) -> str:
+    lines = ["✅ <b>Пересыл обработан</b>"]
+    accepted = int(summary.get("accepted") or 0)
+    rejected = int(summary.get("rejected") or 0)
+    duplicates = int(summary.get("duplicates") or 0)
+    overflow = int(summary.get("overflow") or 0)
+    if accepted:
+        lines.append(f"Черновиков создано: <b>{accepted}</b>")
+    if rejected:
+        lines.append(f"Отклонено проверкой: <b>{rejected}</b>")
+    if duplicates:
+        lines.append(f"Дублей пропущено: <b>{duplicates}</b>")
+    if overflow:
+        lines.append(f"Лишних сверх лимита {DRAFT_BATCH_LIMIT}: <b>{overflow}</b>")
+    if batch_count:
+        lines.append(f"\nВ текущей пачке: <b>{batch_count}</b> черновиков.")
+    else:
+        lines.append("\nНовых черновиков не создано.")
+    reason = (summary.get("last_reason") or "").strip()
+    if reason and not accepted:
+        lines.append(reason)
+    return "\n".join(lines)
+
+
+async def _flush_draft_batch_summary(context: ContextTypes.DEFAULT_TYPE, handle: str):
+    try:
+        await asyncio.sleep(DRAFT_BATCH_SUMMARY_DELAY_SEC)
+    except asyncio.CancelledError:
+        return
+    state = context.user_data.get("draft_batch") or {}
+    if state.get("handle") != handle:
+        return
+    summary = state.get("summary") or {}
+    chat_id = summary.get("chat_id")
+    if not chat_id:
+        return
+    batch_count = _draft_batch_count(context, handle)
+    text = _draft_batch_summary_text(summary, batch_count)
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=_draft_batch_summary_kb(handle, batch_count),
+    )
+    state["summary"] = {
+        "ids": [], "accepted": 0, "rejected": 0, "duplicates": 0, "overflow": 0, "last_reason": "", "chat_id": chat_id,
+    }
+    context.user_data["draft_batch"] = state
+
+
+def _draft_batch_note(
+    context: ContextTypes.DEFAULT_TYPE,
+    handle: str,
+    msg,
+    *,
+    post_id: str | None = None,
+    rejected: bool = False,
+    duplicate: bool = False,
+    overflow: bool = False,
+    reason: str = "",
+):
+    state = _draft_batch_state(context, handle)
+    summary = _draft_batch_summary_state(context, handle)
+    summary["chat_id"] = msg.chat_id
+    if post_id:
+        ids = summary.setdefault("ids", [])
+        if post_id not in ids:
+            ids.append(post_id)
+        summary["accepted"] = int(summary.get("accepted") or 0) + 1
+    if rejected:
+        summary["rejected"] = int(summary.get("rejected") or 0) + 1
+    if duplicate:
+        summary["duplicates"] = int(summary.get("duplicates") or 0) + 1
+    if overflow:
+        summary["overflow"] = int(summary.get("overflow") or 0) + 1
+    if reason:
+        summary["last_reason"] = reason
+    task = summary.get("task")
+    if task and not task.done():
+        task.cancel()
+    summary["task"] = asyncio.create_task(_flush_draft_batch_summary(context, handle))
+    state["summary"] = summary
+    context.user_data["draft_batch"] = state
+
+
 async def _draft_batch_limit_reached(msg, context: ContextTypes.DEFAULT_TYPE, handle: str) -> bool:
     state = _draft_batch_state(context, handle)
     now = time.monotonic()
@@ -1613,12 +1722,14 @@ async def _draft_batch_limit_reached(msg, context: ContextTypes.DEFAULT_TYPE, ha
     if not burst.get("overflow_warned"):
         burst["overflow_warned"] = True
         context.user_data["draft_batch"] = state
-        await _reply_and_cleanup_user_msg(
-            msg,
-            f"⚠️ За один раз можно переслать не более {DRAFT_BATCH_LIMIT} постов. "
-            f"Первые {DRAFT_BATCH_LIMIT} сохранены, лишние не добавляю."
+        _draft_batch_note(
+            context, handle, msg,
+            overflow=True,
+            reason=f"⚠️ За один раз можно переслать не более {DRAFT_BATCH_LIMIT} постов. Лишние не добавляю.",
         )
+        await _delete_message_silent(msg)
     else:
+        _draft_batch_note(context, handle, msg, overflow=True)
         await _delete_message_silent(msg)
     return True
 
@@ -1849,33 +1960,25 @@ async def _flush_album_draft(context, gid: str, reply_msg):
         from content_safety import validate_imported_post
         validation = validate_imported_post(ch, post)
         if not validation.get("allowed"):
-            try:
-                await _warn_manual_import_rejected(reply_msg, validation)
-            except Exception:
-                pass
+            _draft_batch_note(
+                context,
+                handle,
+                reply_msg,
+                rejected=True,
+                reason=_manual_import_rejection_message(validation),
+            )
+            await _delete_message_silent(reply_msg)
             return
     duplicate = _manual_post_duplicate(handle, post["content"], post["media_type"], post["tg_file_id"])
     if duplicate:
-        try:
-            await _warn_manual_duplicate(reply_msg, duplicate)
-        except Exception:
-            pass
+        _draft_batch_note(context, handle, reply_msg, duplicate=True)
+        await _delete_message_silent(reply_msg)
         return
     post_id = buffer.add(post)
     post["id"] = post_id
     _draft_batch_add(context, handle, post_id)
-    batch_count = _draft_batch_count(context, handle)
-    try:
-        await _reply_draft_card(
-            reply_msg,
-            post,
-            f"✅ Черновик-альбом создан ({len(members)} медиа)",
-            created=True,
-            batch_count=batch_count,
-        )
-        await _delete_message_silent(reply_msg)
-    except Exception:
-        pass
+    _draft_batch_note(context, handle, reply_msg, post_id=post_id)
+    await _delete_message_silent(reply_msg)
 
 
 async def create_draft_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1943,21 +2046,24 @@ async def create_draft_from_message(update: Update, context: ContextTypes.DEFAUL
         from content_safety import validate_imported_post
         validation = validate_imported_post(ch, post)
         if not validation.get("allowed"):
-            await _warn_manual_import_rejected(msg, validation)
+            _draft_batch_note(
+                context,
+                handle,
+                msg,
+                rejected=True,
+                reason=_manual_import_rejection_message(validation),
+            )
+            await _delete_message_silent(msg)
             return True
     duplicate = _manual_post_duplicate(handle, post["content"], post.get("media_type"), post.get("tg_file_id"))
     if duplicate:
-        await _warn_manual_duplicate(msg, duplicate)
+        _draft_batch_note(context, handle, msg, duplicate=True)
+        await _delete_message_silent(msg)
         return True
     post_id = buffer.add(post)
     post["id"] = post_id
     _draft_batch_add(context, handle, post_id)
-    batch_count = _draft_batch_count(context, handle)
-    burst_count = _draft_batch_burst_count(context, handle)
-
-    kind = {"photo": "фото", "video": "видео", "document": "документ", "animation": "гиф"}.get(media_type, "текст")
-    await msg.reply_text(f"✅ Черновик создан ({kind}). В этом пересыле: {burst_count}/{DRAFT_BATCH_LIMIT}.")
-    await _reply_draft_card(msg, post, "👀 Превью", created=True, batch_count=batch_count)
+    _draft_batch_note(context, handle, msg, post_id=post_id)
     await _delete_message_silent(msg)
     return True
 
@@ -2048,6 +2154,30 @@ async def _send_manual_queue_done(qm, context: ContextTypes.DEFAULT_TYPE, handle
             text=text,
             reply_markup=_manual_queue_done_kb(handle),
         )
+
+
+async def action_draft_preview_batch(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
+    """Показывает превью черновиков, созданных в текущей ручной пачке, только по кнопке."""
+    from telegram import CallbackQuery
+    state = context.user_data.get("draft_batch") or {}
+    ids = list(state.get("ids") or []) if state.get("handle") == handle else []
+    drafts_by_id = {d["id"]: d for d in buffer.get_drafts(handle)}
+    drafts = [drafts_by_id[pid] for pid in ids if pid in drafts_by_id]
+    if isinstance(qm, CallbackQuery):
+        if not drafts:
+            await qm.answer("Нет созданных черновиков для показа.", show_alert=True)
+            return
+        await qm.answer("Показываю превью")
+        try:
+            await qm.edit_message_text(
+                f"👀 <b>Превью созданных черновиков</b>\nПостов: <b>{len(drafts)}</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_draft_batch_summary_kb(handle, len(drafts)),
+            )
+        except Exception:
+            pass
+        for i, draft in enumerate(drafts, start=1):
+            await _reply_draft_card(qm.message, draft, f"👀 Превью {i}/{len(drafts)}", created=True, batch_count=len(drafts))
 
 
 async def action_draft_queue(qm, context: ContextTypes.DEFAULT_TYPE, post_id: str):
@@ -3424,7 +3554,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ch_sched_custom", "ch_sched_copy", "ch_sched_copy_ok", "ch_images_toggle",
         "ch_history", "ch_set", "ch_set_img", "ch_folder", "ch_setfold",
         "ch_newfold", "ch_restore", "ch_draft", "draft_new", "draft_qlast",
-        "draft_qall", "draft_qbatch", "draft_clear", "draft_clearok", "rsy_toggle",
+        "draft_qall", "draft_qbatch", "draft_preview_batch", "draft_clear", "draft_clearok", "rsy_toggle",
         "ch_archetype", "ch_set_arche", "ch_source_toggle", "ch_src_mode",
         "ch_refs", "ref_tgl", "ref_del", "ref_add", "ref_take", "ref_go",
         "ref_import", "rss_del", "rss_clear", "rss_add", "rss_ai", "rss_ai_ok",
@@ -3605,6 +3735,9 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "draft_qbatch" and len(parts) >= 3:
         await action_draft_queue_batch(query, context, parts[2])
+
+    elif action == "draft_preview_batch" and len(parts) >= 3:
+        await action_draft_preview_batch(query, context, parts[2])
 
     elif action == "draft_clear" and len(parts) >= 3:
         await action_draft_clear_confirm(query, context, parts[2])
