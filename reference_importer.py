@@ -36,6 +36,12 @@ from userbot_reader import (
 CHANNELS_DIR = Path(__file__).parent / "channels"
 DEFAULT_TAKE = 10  # сколько постов добираем за один «возьми ещё»
 
+# Минимальная длина ТЕКСТ-ТОЛЬКО референса (без медиа). Короче — это навигационная
+# шелуха донора («Серия тут», «Прошлая серия тут», пустые посты): стандалоном выглядит
+# пусто, поэтому не импортируем. Посты С медиа фильтр не трогает (там подпись может быть
+# любой длины). Каналы на референсах — медийные, чистого короткого текста там почти нет.
+MIN_REF_TEXT_CHARS = 25
+
 # Лёгкий фильтр: пропускаем явную рекламу (ссылки/цены НЕ трогаем — иначе режем WB)
 AD_MARKERS = ("реклама", "рекламa", "erid", "ерид", "по вопросам рекламы", "#ad", "промокод")
 
@@ -300,6 +306,15 @@ async def import_for_channel(channel: dict, count: int = DEFAULT_TAKE) -> dict:
                 raw = p.get("text", "")
                 if q["ref"].get("skip_ads", True) and raw and _is_ad(raw):
                     logger.debug(f"Референс {q['handle']}: пропуск рекламы (id={p['id']})")
+                    continue
+                # Текст-только пост (без медиа) короче порога → навигационная шелуха
+                # донора («Серия тут», пустышки). Стандалоном выглядит пусто — пропускаем.
+                if not p.get("media_kind") and len((raw or "").strip()) < MIN_REF_TEXT_CHARS:
+                    logger.debug(
+                        f"Референс {q['handle']}: пропуск короткого текст-поста "
+                        f"'{(raw or '').strip()[:20]}' (id={p['id']})"
+                    )
+                    skipped_limits += 1
                     continue
                 media_ids = await _store_reference_post(
                     channel, channel_id, q["handle"], p, q["ref"].get("rephrase", True)
