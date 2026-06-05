@@ -13,6 +13,7 @@ ui.py — Inline-меню бота (UI слой)
   ui:ch_pause:@handle         → переключить паузу
   ui:ch_delete:@handle        → запрос подтверждения удаления
   ui:ch_delete_ok:@handle     → подтверждённое удаление
+  ui:ch_create:@handle        → экран создания поста
   ui:ch_generate:@handle      → запустить генерацию
   ui:ch_postnow:@handle       → опубликовать следующий пост
   ui:ch_review:@handle        → очередь постов канала
@@ -621,7 +622,7 @@ async def screen_channel_card(qm, context: ContextTypes.DEFAULT_TYPE, handle: st
             InlineKeyboardButton("⚙️ Настройки", callback_data=f"ui:ch_settings:{channel_id}"),
         ],
         [
-            InlineKeyboardButton("⚡ Генерить",  callback_data=f"ui:ch_generate:{channel_id}"),
+            InlineKeyboardButton("➕ Создать пост", callback_data=f"ui:ch_create:{channel_id}"),
             InlineKeyboardButton("📤 Постнуть",  callback_data=f"ui:ch_postnow:{channel_id}"),
         ],
         [
@@ -637,6 +638,41 @@ async def screen_channel_card(qm, context: ContextTypes.DEFAULT_TYPE, handle: st
         [InlineKeyboardButton("◀️ К списку каналов", callback_data="ui:channels")],
     ])
 
+    await _answer_or_send(qm, text, kb)
+
+
+async def screen_create_post(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
+    """Единый вход в создание поста: вручную, референсы или ИИ."""
+    ch = _load_channel(handle)
+    if not ch:
+        await _answer_or_send(qm, f"❌ Канал {handle} не найден.", None)
+        return
+
+    channel_id = ch["channel_id"]
+    name = ch.get("name") or channel_id
+    refs = ch.get("reference_channels") or []
+    drafts = buffer.count_drafts(channel_id)
+    ready = buffer.get_level(channel_id)
+
+    text = (
+        f"➕ <b>Создать пост</b>\n"
+        f"<b>{name}</b>  <code>{channel_id}</code>\n\n"
+        f"📬 В очереди: <b>{ready}</b>\n"
+        f"✍️ Черновиков: <b>{drafts}</b>\n"
+        f"🔗 Доноров: <b>{len(refs)}</b>\n\n"
+        f"Выбери источник поста."
+    )
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✍️ Вручную", callback_data=f"ui:draft_new:{channel_id}"),
+            InlineKeyboardButton("✍️ Черновики", callback_data=f"ui:ch_draft:{channel_id}"),
+        ],
+        [
+            InlineKeyboardButton("🔗 Референсы", callback_data=f"ui:ch_refs:{channel_id}"),
+            InlineKeyboardButton("🤖 Генерация ИИ", callback_data=f"ui:ch_generate:{channel_id}"),
+        ],
+        [InlineKeyboardButton("◀️ К каналу", callback_data=f"ui:ch:{channel_id}")],
+    ])
     await _answer_or_send(qm, text, kb)
 
 
@@ -1425,14 +1461,23 @@ def _draft_type_label(d: dict) -> str:
     return f"{base} + текст" if has_text else base
 
 
-async def _reply_draft_card(msg_obj, d: dict, num: str):
+def _draft_created_kb(d: dict) -> InlineKeyboardMarkup:
+    handle = d["channel_id"]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 В очередь", callback_data=f"ui:draft_q:{d['id']}")],
+        [InlineKeyboardButton("✍️ В черновик", callback_data=f"ui:ch_draft:{handle}")],
+        [InlineKeyboardButton("◀️ Назад", callback_data=f"ui:ch_create:{handle}")],
+    ])
+
+
+async def _reply_draft_card(msg_obj, d: dict, num: str, created: bool = False):
     """Отправляет одну карточку черновика: реальное медиа (по file_id) + кнопки."""
     preview = (d.get("content") or "").strip()
     preview = preview if preview else "<i>(без подписи)</i>"
     cap = f"{num} <b>{_draft_type_label(d)}</b>\n{preview}"
     if len(cap) > 1024:
         cap = cap[:1020] + "…"
-    kb = InlineKeyboardMarkup([
+    kb = _draft_created_kb(d) if created else InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✏️ Текст", callback_data=f"ui:draft_edit:{d['id']}"),
             InlineKeyboardButton("🖼 Медиа",  callback_data=f"ui:draft_media:{d['id']}"),
@@ -1549,15 +1594,15 @@ async def action_draft_new(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
     if not _load_channel(handle):
         return
     context.user_data["draft_compose"] = handle
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data=f"ui:ch_draft:{handle}")]])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data=f"ui:ch_create:{handle}")]])
     await _answer_or_send(
         qm,
-        "✍️ <b>Новый пост в черновик</b>\n\n"
+        "✍️ <b>Создать пост вручную</b>\n\n"
         "Пришли одним сообщением:\n"
         "• <b>текст</b> — будет текстовый пост\n"
         "• <b>фото</b> (можно с подписью) — фото-пост\n"
         "• <b>видео</b> (можно с подписью) — видео-пост\n\n"
-        "Что пришлёшь — то и ляжет в черновик.",
+        "Я покажу превью. Если ничего не выбрать, пост останется в черновике.",
         kb,
     )
 
@@ -1612,7 +1657,7 @@ async def _flush_album_draft(context, gid: str, reply_msg):
     handle = slot["handle"]
     members = list(range(len(slot["items"])))
     items = {str(i): {"file_id": fid, "type": mt} for i, (fid, mt) in enumerate(slot["items"])}
-    buffer.add({
+    post = {
         "channel_id": handle,
         "content": slot["caption"],
         "format": "manual",
@@ -1621,12 +1666,11 @@ async def _flush_album_draft(context, gid: str, reply_msg):
         "media_type": "album",
         "parse_mode": slot.get("parse_mode"),
         "tg_file_id": json.dumps({"members": members, "items": items}),
-    })
+    }
+    post_id = buffer.add(post)
+    post["id"] = post_id
     try:
-        await reply_msg.reply_text(
-            f"✅ Черновик-альбом создан ({len(members)} медиа). В очередь пока не попал.",
-            reply_markup=_draft_done_kb(handle),
-        )
+        await _reply_draft_card(reply_msg, post, f"✅ Черновик-альбом создан ({len(members)} медиа)", created=True)
     except Exception:
         pass
 
@@ -1684,13 +1728,12 @@ async def create_draft_from_message(update: Update, context: ContextTypes.DEFAUL
     if file_id:
         post["tg_file_id"] = file_id
         post["media_type"] = media_type
-    buffer.add(post)
+    post_id = buffer.add(post)
+    post["id"] = post_id
 
     kind = {"photo": "фото", "video": "видео", "document": "документ", "animation": "гиф"}.get(media_type, "текст")
-    await msg.reply_text(
-        f"✅ Черновик создан ({kind}). Можно прислать ещё или вернуться в меню.",
-        reply_markup=_draft_done_kb(handle),
-    )
+    await msg.reply_text(f"✅ Черновик создан ({kind}).")
+    await _reply_draft_card(msg, post, "👀 Превью", created=True)
     return True
 
 
@@ -3099,7 +3142,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _POST_ACTIONS = {"draft_edit", "draft_media", "draft_q", "draft_del", "draft_view"}
     _CHANNEL_ACTIONS = {
         "ch", "ch_settings", "ch_topic_redo", "ch_pause", "ch_delete", "ch_delete_ok",
-        "ch_clear", "ch_clear_ok", "ch_generate", "ch_gen_run", "ch_postnow",
+        "ch_clear", "ch_clear_ok", "ch_create", "ch_generate", "ch_gen_run", "ch_postnow",
         "ch_review", "ch_schedule", "ch_sched_toggle", "ch_sched_clear",
         "ch_sched_custom", "ch_sched_copy", "ch_sched_copy_ok", "ch_images_toggle",
         "ch_history", "ch_set", "ch_set_img", "ch_folder", "ch_setfold",
@@ -3331,6 +3374,10 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "ch" and len(parts) >= 3:
         handle = parts[2]
         await screen_channel_card(query, context, handle)
+
+    elif action == "ch_create" and len(parts) >= 3:
+        handle = parts[2]
+        await screen_create_post(query, context, handle)
 
     elif action == "ch_settings" and len(parts) >= 3:
         handle = parts[2]
