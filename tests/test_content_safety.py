@@ -165,6 +165,64 @@ class ContentSafetyTest(unittest.TestCase):
         self.assertIn("age_range", dna["unknown_facts"])
         self.assertIn("guaranteed_results", dna["unknown_facts"])
 
+    def test_marketplace_kids_products_do_not_build_kids_channel_dna(self):
+        analysis = {
+            "topic": "детские товары / игрушки / товары для детей",
+            "channel_type": "marketplace",
+            "archetype": "default",
+            "safe_profile": build_safe_channel_profile({
+                "topic": "детские товары / игрушки / товары для детей",
+                "channel_type": "marketplace",
+                "archetype": "default",
+            }),
+        }
+        dna = build_channel_dna(
+            analysis,
+            posts_sample=[
+                "Подборка игрушек и товаров для детей с Wildberries.",
+                "Артикул, цена и ссылка на товар.",
+            ],
+        )
+        self.assertNotEqual(dna["audience"], "родители детей")
+        self.assertEqual(dna["confidence"], "low")
+        self.assertNotIn("игровые новости", dna["forbidden_angles"])
+
+    def test_marketplace_wb_product_format_does_not_get_parent_forbidden_angles(self):
+        analysis = {
+            "topic": "игрушки и детские товары",
+            "channel_type": "content",
+            "archetype": "default",
+            "post_formats": ["wb_product"],
+            "safe_profile": build_safe_channel_profile({
+                "topic": "игрушки и детские товары",
+                "archetype": "default",
+            }),
+        }
+        dna = build_channel_dna(analysis)
+        self.assertNotEqual(dna["audience"], "родители детей")
+        self.assertNotIn("игровые новости", dna["forbidden_angles"])
+        self.assertEqual(dna["pain_points"], [])
+
+    def test_non_kids_channels_do_not_build_kids_channel_dna(self):
+        for topic, archetype in (
+            ("новости технологий и стартапов", "news"),
+            ("новые музыкальные релизы", "default"),
+            ("автомобильные обзоры и советы", "auto"),
+            ("мемы и юмор каждый день", "default"),
+        ):
+            analysis = {
+                "topic": topic,
+                "archetype": archetype,
+                "channel_type": "content",
+                "safe_profile": build_safe_channel_profile({
+                    "topic": topic,
+                    "archetype": archetype,
+                }),
+            }
+            dna = build_channel_dna(analysis)
+            self.assertNotEqual(dna["audience"], "родители детей")
+            self.assertNotIn("игровые новости", dna["forbidden_angles"])
+
     def test_attach_channel_dna_preserves_existing_manual_dna(self):
         analysis = {
             "topic": "робототехника для детей",

@@ -50,6 +50,12 @@ KIDS_EDU_MARKERS = (
     "занят", "круж", "секци", "лагер", "логик", "edtech",
 )
 
+MARKETPLACE_MARKERS = (
+    "marketplace", "wb", "wildberries", "вайлдберриз", "ozon", "озон",
+    "aliexpress", "алиэкспресс", "товар", "товары", "артикул", "скидка",
+    "цена", "₽", "руб",
+)
+
 
 def _clean_text(value: Any, limit: int = 500) -> str:
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", str(value or ""))
@@ -86,7 +92,32 @@ def _joined_text(analysis: dict, posts_sample: list[str] | None, about: str) -> 
     return "\n".join(p for p in parts if p)
 
 
+def _is_marketplace_analysis(analysis: dict, text: str) -> bool:
+    channel_type = _clean_text(analysis.get("channel_type", ""), 80)
+    archetype = _clean_text(analysis.get("archetype", ""), 80)
+    if channel_type == "marketplace" or archetype == "marketplace":
+        return True
+
+    post_formats = _as_list(analysis.get("post_formats"), 20)
+    safe_profile = analysis.get("safe_profile") if isinstance(analysis.get("safe_profile"), dict) else {}
+    post_formats += _as_list(safe_profile.get("post_formats"), 20)
+    if any(fmt == "wb_product" for fmt in post_formats):
+        return True
+
+    source_text = " ".join(
+        [
+            _clean_text(analysis.get("topic_source", ""), 120),
+            _clean_text(analysis.get("source", ""), 120),
+            text,
+        ]
+    )
+    low = _low(source_text)
+    return any(marker in low for marker in MARKETPLACE_MARKERS)
+
+
 def _is_kids_education_analysis(analysis: dict, text: str) -> bool:
+    if _is_marketplace_analysis(analysis, text):
+        return False
     archetype = _clean_text(analysis.get("archetype", ""), 80)
     if archetype in KIDS_EDU_ARCHETYPES:
         return True
