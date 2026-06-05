@@ -23,6 +23,7 @@ ui.py — Inline-меню бота (UI слой)
 """
 
 import asyncio
+import html
 import json
 import re
 from datetime import datetime, timezone
@@ -1446,6 +1447,8 @@ async def action_ref_import(qm, context, handle: str, count: int = 10):
 # ── Черновик: ручные посты админа (текст/фото/видео), не в очереди ──────────
 
 _NUM_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+DRAFT_BATCH_LIMIT = 20
+_MANUAL_DEDUP_STATUSES = ("draft", "ready", "pending_review", "awaiting_media", "published")
 
 
 def _draft_type_label(d: dict) -> str:
@@ -1461,23 +1464,128 @@ def _draft_type_label(d: dict) -> str:
     return f"{base} + текст" if has_text else base
 
 
-def _draft_created_kb(d: dict) -> InlineKeyboardMarkup:
+def _manual_dedup_text(content: str | None) -> str:
+    text = html.unescape(content or "")
+    text = re.sub(r"<a\b[^>]*>(.*?)</a>", r"\1", text, flags=re.I | re.S)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"https?://\S+", " ", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    return text
+
+
+def _manual_post_duplicate(channel_id: str, content: str | None, media_type: str | None, tg_file_id: str | None) -> dict | None:
+    """Ищет уже активный/опубликованный ручной дубль без новых колонок БД."""
+    text_key = _manual_dedup_text(content)
+    media_key = (tg_file_id or "").strip()
+    if not text_key and not media_key:
+        return None
+    from database import db
+    placeholders = ",".join("?" for _ in _MANUAL_DEDUP_STATUSES)
+    with db.connect() as conn:
+        rows = conn.execute(
+            f"SELECT id, status, content, media_type, tg_file_id FROM posts "
+            f"WHERE channel_id = ? AND status IN ({placeholders})",
+            (channel_id, *_MANUAL_DEDUP_STATUSES),
+        ).fetchall()
+    for row in rows:
+        old_media = (row["tg_file_id"] or "").strip()
+        if media_key and old_media and media_key == old_media:
+            return dict(row)
+        if text_key and text_key == _manual_dedup_text(row["content"]):
+            if not media_type or not row["media_type"] or media_type == row["media_type"]:
+                return dict(row)
+    return None
+
+
+async def _warn_manual_duplicate(msg, duplicate: dict):
+    status = duplicate.get("status") or "active"
+    labels = {
+        "draft": "уже есть в черновиках",
+        "ready": "уже стоит в очереди",
+        "pending_review": "уже ждёт проверки",
+        "awaiting_media": "уже ждёт медиа",
+        "published": "уже был опубликован",
+    }
+    await msg.reply_text(f"⚠️ Такой пост {labels.get(status, 'уже есть')}. Повтор не добавляю.")
+
+
+def _draft_batch_state(context: ContextTypes.DEFAULT_TYPE, handle: str, reset: bool = False) -> dict:
+    state = context.user_data.get("draft_batch") or {}
+    if reset or state.get("handle") != handle:
+        state = {"handle": handle, "ids": [], "pending_albums": [], "overflow_warned": False}
+        context.user_data["draft_batch"] = state
+    return state
+
+
+def _draft_batch_count(context: ContextTypes.DEFAULT_TYPE, handle: str) -> int:
+    state = _draft_batch_state(context, handle)
+    return len(state.get("ids") or [])
+
+
+def _draft_batch_used(context: ContextTypes.DEFAULT_TYPE, handle: str) -> int:
+    state = _draft_batch_state(context, handle)
+    return len(state.get("ids") or []) + len(state.get("pending_albums") or [])
+
+
+def _draft_batch_add(context: ContextTypes.DEFAULT_TYPE, handle: str, post_id: str):
+    state = _draft_batch_state(context, handle)
+    ids = state.setdefault("ids", [])
+    if post_id not in ids:
+        ids.append(post_id)
+
+
+def _draft_batch_track_album(context: ContextTypes.DEFAULT_TYPE, handle: str, gid: str):
+    state = _draft_batch_state(context, handle)
+    pending = state.setdefault("pending_albums", [])
+    if gid not in pending:
+        pending.append(gid)
+
+
+def _draft_batch_untrack_album(context: ContextTypes.DEFAULT_TYPE, handle: str, gid: str):
+    state = _draft_batch_state(context, handle)
+    state["pending_albums"] = [x for x in state.get("pending_albums", []) if x != gid]
+
+
+async def _draft_batch_limit_reached(msg, context: ContextTypes.DEFAULT_TYPE, handle: str) -> bool:
+    state = _draft_batch_state(context, handle)
+    if _draft_batch_used(context, handle) < DRAFT_BATCH_LIMIT:
+        return False
+    if not state.get("overflow_warned"):
+        state["overflow_warned"] = True
+        await msg.reply_text(
+            f"⚠️ За один раз можно переслать не более {DRAFT_BATCH_LIMIT} постов. "
+            f"Первые {DRAFT_BATCH_LIMIT} сохранены, лишние не добавляю."
+        )
+    return True
+
+
+def _draft_created_kb(d: dict, batch_count: int = 0) -> InlineKeyboardMarkup:
     handle = d["channel_id"]
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("📤 В очередь", callback_data=f"ui:draft_q:{d['id']}")],
+    ]
+    if batch_count > 1:
+        rows.append([
+            InlineKeyboardButton(
+                f"📤 Все созданные в очередь ({batch_count})",
+                callback_data=f"ui:draft_qbatch:{handle}",
+            )
+        ])
+    rows.extend([
         [InlineKeyboardButton("✍️ В черновик", callback_data=f"ui:ch_draft:{handle}")],
         [InlineKeyboardButton("◀️ Назад", callback_data=f"ui:ch_create:{handle}")],
     ])
+    return InlineKeyboardMarkup(rows)
 
 
-async def _reply_draft_card(msg_obj, d: dict, num: str, created: bool = False):
+async def _reply_draft_card(msg_obj, d: dict, num: str, created: bool = False, batch_count: int = 0):
     """Отправляет одну карточку черновика: реальное медиа (по file_id) + кнопки."""
     preview = (d.get("content") or "").strip()
     preview = preview if preview else "<i>(без подписи)</i>"
     cap = f"{num} <b>{_draft_type_label(d)}</b>\n{preview}"
     if len(cap) > 1024:
         cap = cap[:1020] + "…"
-    kb = _draft_created_kb(d) if created else InlineKeyboardMarkup([
+    kb = _draft_created_kb(d, batch_count) if created else InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✏️ Текст", callback_data=f"ui:draft_edit:{d['id']}"),
             InlineKeyboardButton("🖼 Медиа",  callback_data=f"ui:draft_media:{d['id']}"),
@@ -1594,6 +1702,7 @@ async def action_draft_new(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
     if not _load_channel(handle):
         return
     context.user_data["draft_compose"] = handle
+    _draft_batch_state(context, handle, reset=True)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data=f"ui:ch_create:{handle}")]])
     await _answer_or_send(
         qm,
@@ -1601,7 +1710,8 @@ async def action_draft_new(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
         "Пришли одним сообщением:\n"
         "• <b>текст</b> — будет текстовый пост\n"
         "• <b>фото</b> (можно с подписью) — фото-пост\n"
-        "• <b>видео</b> (можно с подписью) — видео-пост\n\n"
+        "• <b>видео</b> (можно с подписью) — видео-пост\n"
+        f"• можно переслать пачкой до <b>{DRAFT_BATCH_LIMIT}</b> постов\n\n"
         "Я покажу превью. Если ничего не выбрать, пост останется в черновике.",
         kb,
     )
@@ -1653,6 +1763,8 @@ async def _flush_album_draft(context, gid: str, reply_msg):
     slots = context.user_data.get("_album_slots", {})
     slot = slots.pop(gid, None)
     if not slot or not slot["items"]:
+        if slot:
+            _draft_batch_untrack_album(context, slot.get("handle"), gid)
         return
     handle = slot["handle"]
     members = list(range(len(slot["items"])))
@@ -1667,10 +1779,26 @@ async def _flush_album_draft(context, gid: str, reply_msg):
         "parse_mode": slot.get("parse_mode"),
         "tg_file_id": json.dumps({"members": members, "items": items}),
     }
+    _draft_batch_untrack_album(context, handle, gid)
+    duplicate = _manual_post_duplicate(handle, post["content"], post["media_type"], post["tg_file_id"])
+    if duplicate:
+        try:
+            await _warn_manual_duplicate(reply_msg, duplicate)
+        except Exception:
+            pass
+        return
     post_id = buffer.add(post)
     post["id"] = post_id
+    _draft_batch_add(context, handle, post_id)
+    batch_count = _draft_batch_count(context, handle)
     try:
-        await _reply_draft_card(reply_msg, post, f"✅ Черновик-альбом создан ({len(members)} медиа)", created=True)
+        await _reply_draft_card(
+            reply_msg,
+            post,
+            f"✅ Черновик-альбом создан ({len(members)} медиа)",
+            created=True,
+            batch_count=batch_count,
+        )
     except Exception:
         pass
 
@@ -1700,6 +1828,10 @@ async def create_draft_from_message(update: Update, context: ContextTypes.DEFAUL
     gid = getattr(msg, "media_group_id", None)
     if gid and file_id:
         slots = context.user_data.setdefault("_album_slots", {})
+        if str(gid) not in slots:
+            if await _draft_batch_limit_reached(msg, context, handle):
+                return True
+            _draft_batch_track_album(context, handle, str(gid))
         slot = slots.setdefault(str(gid), {
             "items": [], "caption": "", "parse_mode": None, "handle": handle, "task": None
         })
@@ -1716,6 +1848,9 @@ async def create_draft_from_message(update: Update, context: ContextTypes.DEFAUL
         await msg.reply_text("⚠️ Пусто. Пришли текст, фото, видео или перешли пост.")
         return True  # остаёмся в режиме compose
 
+    if await _draft_batch_limit_reached(msg, context, handle):
+        return True
+
     # Режим НЕ сбрасываем (липкий) — можно слать/пересылать ещё посты подряд.
     post = {
         "channel_id": handle,
@@ -1728,12 +1863,18 @@ async def create_draft_from_message(update: Update, context: ContextTypes.DEFAUL
     if file_id:
         post["tg_file_id"] = file_id
         post["media_type"] = media_type
+    duplicate = _manual_post_duplicate(handle, post["content"], post.get("media_type"), post.get("tg_file_id"))
+    if duplicate:
+        await _warn_manual_duplicate(msg, duplicate)
+        return True
     post_id = buffer.add(post)
     post["id"] = post_id
+    _draft_batch_add(context, handle, post_id)
+    batch_count = _draft_batch_count(context, handle)
 
     kind = {"photo": "фото", "video": "видео", "document": "документ", "animation": "гиф"}.get(media_type, "текст")
-    await msg.reply_text(f"✅ Черновик создан ({kind}).")
-    await _reply_draft_card(msg, post, "👀 Превью", created=True)
+    await msg.reply_text(f"✅ Черновик создан ({kind}). В этой пачке: {batch_count}/{DRAFT_BATCH_LIMIT}.")
+    await _reply_draft_card(msg, post, "👀 Превью", created=True, batch_count=batch_count)
     return True
 
 
@@ -1854,6 +1995,33 @@ async def action_draft_queue_all(qm, context: ContextTypes.DEFAULT_TYPE, handle:
             n += 1
         else:
             skipped += 1
+    from telegram import CallbackQuery
+    if isinstance(qm, CallbackQuery):
+        suffix = f", пропущено: {skipped}" if skipped else ""
+        await qm.answer(f"⬆️ В очередь: {n}{suffix}")
+    await screen_drafts(qm, context, handle)
+
+
+async def action_draft_queue_batch(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
+    """Отправляет в очередь только черновики, созданные в текущей ручной пачке."""
+    state = context.user_data.get("draft_batch") or {}
+    ids = list(state.get("ids") or []) if state.get("handle") == handle else []
+    drafts = {d["id"]: d for d in buffer.get_drafts(handle)}
+    n = skipped = 0
+    remaining = []
+    for post_id in ids:
+        draft = drafts.get(post_id)
+        if not draft:
+            continue
+        valid, _ = _validate_draft_for_queue(draft)
+        if valid and buffer.draft_to_ready(post_id):
+            n += 1
+        else:
+            skipped += 1
+            remaining.append(post_id)
+    if state.get("handle") == handle:
+        state["ids"] = remaining
+        context.user_data["draft_batch"] = state
     from telegram import CallbackQuery
     if isinstance(qm, CallbackQuery):
         suffix = f", пропущено: {skipped}" if skipped else ""
@@ -3147,7 +3315,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ch_sched_custom", "ch_sched_copy", "ch_sched_copy_ok", "ch_images_toggle",
         "ch_history", "ch_set", "ch_set_img", "ch_folder", "ch_setfold",
         "ch_newfold", "ch_restore", "ch_draft", "draft_new", "draft_qlast",
-        "draft_qall", "draft_clear", "draft_clearok", "rsy_toggle",
+        "draft_qall", "draft_qbatch", "draft_clear", "draft_clearok", "rsy_toggle",
         "ch_archetype", "ch_set_arche", "ch_source_toggle", "ch_src_mode",
         "ch_refs", "ref_tgl", "ref_del", "ref_add", "ref_take", "ref_go",
         "ref_import", "rss_del", "rss_clear", "rss_add", "rss_ai", "rss_ai_ok",
@@ -3325,6 +3493,9 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "draft_qall" and len(parts) >= 3:
         await action_draft_queue_all(query, context, parts[2])
+
+    elif action == "draft_qbatch" and len(parts) >= 3:
+        await action_draft_queue_batch(query, context, parts[2])
 
     elif action == "draft_clear" and len(parts) >= 3:
         await action_draft_clear_confirm(query, context, parts[2])
