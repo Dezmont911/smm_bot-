@@ -1214,6 +1214,7 @@ async def handle_export_confirm(update: Update, context: ContextTypes.DEFAULT_TY
         "rss_sources": rss_urls,
         "evergreen_topics": analysis.get("evergreen_topics", []),
         "safe_profile": analysis.get("safe_profile", {}),
+        "channel_dna": analysis.get("channel_dna", {}),
         "forbidden_topics": [],
         "audience": "широкая аудитория",
         "post_length": "100–200 слов",
@@ -1312,6 +1313,7 @@ async def _create_channel_from_analysis(analysis: dict, channel_id: str, display
         "rss_sources": rss_urls,
         "evergreen_topics": analysis.get("evergreen_topics", []),
         "safe_profile": analysis.get("safe_profile", {}),
+        "channel_dna": analysis.get("channel_dna", {}),
         "forbidden_topics": [],
         "audience": "широкая аудитория",
         "post_length": "100–200 слов",
@@ -1652,6 +1654,8 @@ async def handle_add_channel_type(update: Update, context: ContextTypes.DEFAULT_
                 else:
                     ch["topic"] = (analysis.get("topic") or "").strip()
                     ch["safe_profile"] = analysis.get("safe_profile", {})
+                    if analysis.get("channel_dna") and "channel_dna" not in ch:
+                        ch["channel_dna"] = analysis["channel_dna"]
                     arch, src = normalize_meta(analysis.get("archetype"), analysis.get("topic_source"))
                     ch["archetype"] = arch
                     ch.setdefault("topic_source", src)

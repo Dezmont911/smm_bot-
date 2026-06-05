@@ -56,6 +56,34 @@ KIDS_EDU_FIT_MARKERS = (
     "пробн", "школ", "лагер", "проект", "созда", "конструкт",
 )
 
+FREE_TRIAL_MARKERS = (
+    "бесплатный урок", "бесплатное пробное", "первый урок бесплатно",
+    "первое занятие бесплатно", "пробное бесплатно", "бесплатное занятие",
+    "бесплатная консультация",
+)
+
+DISCOUNT_MARKERS = (
+    "со скидкой", "скидка", "скидки", "акция", "акции", "%",
+)
+
+TIME_TO_RESULT_MARKERS = (
+    "за месяц", "через месяц", "за несколько месяцев", "через несколько месяцев",
+    "за пару занятий", "за несколько занятий", "в первый же день",
+)
+
+GUARANTEED_RESULT_MARKERS = (
+    "гарантированно", "точно научится", "забудет о телефоне", "забывают про экран",
+    "перестанет сидеть в телефоне", "обязательно научится",
+)
+
+ADDRESS_MARKERS = (
+    "ул.", "улица", "проспект", "пр-т", "переулок", "шоссе", "бульвар", "офис", "кабинет",
+)
+
+PRICE_MARKERS = (
+    "₽", "руб", "стоимость", "цена", "от 990", "от 1500",
+)
+
 
 def _clean_text(value: Any, limit: int = 500) -> str:
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", str(value or ""))
@@ -80,6 +108,20 @@ def _as_list(value: Any, limit: int = 12) -> list[str]:
 def _channel_dna(channel: dict) -> dict:
     dna = channel.get("channel_dna") or {}
     return dna if isinstance(dna, dict) else {}
+
+
+def _unknown_facts(channel: dict) -> set[str]:
+    dna = _channel_dna(channel)
+    facts = dna.get("unknown_facts")
+    if not isinstance(facts, (list, tuple)):
+        return set()
+    return {_clean_text(f, 80) for f in facts if _clean_text(f, 80)}
+
+
+def _known_facts(channel: dict) -> dict:
+    dna = _channel_dna(channel)
+    facts = dna.get("known_facts")
+    return facts if isinstance(facts, dict) else {}
 
 
 def _profile_text(channel: dict) -> str:
@@ -245,6 +287,7 @@ def build_content_brief(channel: dict, safety: dict, format_name: str | None = N
     tone = _clean_text(dna.get("tone") or channel.get("tone") or "", 180)
     pain_points = _as_list(dna.get("pain_points"), 8)
     forbidden_angles = _as_list(dna.get("forbidden_angles"), 10)
+    unknown_facts = _unknown_facts(channel)
 
     must_include = []
     if offer:
@@ -255,6 +298,37 @@ def build_content_brief(channel: dict, safety: dict, format_name: str | None = N
         must_include.append("показать пользу для ребенка или ответить на вопрос родителя")
 
     must_avoid = list(forbidden_angles)
+    if dna:
+        must_avoid.append(
+            "не указывать цены, бесплатность, скидки, адреса, даты, расписание, сроки и "
+            "гарантированные результаты, если этого нет в known_facts"
+        )
+    if "free_trial" in unknown_facts:
+        must_avoid.append("не писать, что пробное занятие или первый урок бесплатные")
+    if "discount" in unknown_facts:
+        must_avoid.append("не упоминать скидки, акции и проценты")
+    if "concrete_time_to_result" in unknown_facts:
+        must_avoid.append("не обещать результат за месяц, за несколько месяцев или за пару занятий")
+    if "guaranteed_results" in unknown_facts:
+        must_avoid.append("не обещать гарантированный результат или что ребенок точно забудет о телефоне")
+    if "price" in unknown_facts:
+        must_avoid.append("не указывать цены или скидки")
+    if {"price", "free_trial", "discount"} & unknown_facts:
+        must_avoid.append(
+            "не упоминать бесплатность, скидки, акции и цены; вместо этого писать: "
+            "актуальные условия подскажем в WhatsApp или подберем направление по возрасту"
+        )
+    if "age_range" in unknown_facts:
+        must_avoid.append("не указывать конкретные возрастные диапазоны, если age_range нет в known_facts")
+    if "address" in unknown_facts:
+        must_avoid.append("не указывать адрес")
+    if "schedule" in unknown_facts or "exact_dates" in unknown_facts:
+        must_avoid.append("не указывать расписание, даты старта или точные даты")
+    if "родител" in _low(audience):
+        must_avoid.append(
+            "обращайся к родителям на 'вы'; не используй повелительные формы в стиле "
+            "'ищи', 'определи', 'выбирай' как обращение к ребенку/подростку"
+        )
     if is_kids_education_channel(channel):
         must_avoid.extend([
             "писать игровую новость как новость",
@@ -274,6 +348,50 @@ def build_content_brief(channel: dict, safety: dict, format_name: str | None = N
         "format_constraints": [f"format={format_name}"] if format_name else [],
         "safety_reason_code": safety.get("reason_code"),
     }
+
+
+def _unsupported_fact_claim(channel: dict, content: str) -> str | None:
+    if not _channel_dna(channel):
+        return None
+
+    unknown = _unknown_facts(channel)
+    if not unknown:
+        return None
+
+    known = _known_facts(channel)
+    low = _low(content)
+
+    if "free_trial" in unknown and not known.get("free_trial") and any(marker in low for marker in FREE_TRIAL_MARKERS):
+        return "free_trial"
+    if "discount" in unknown and not known.get("discount") and any(marker in low for marker in DISCOUNT_MARKERS):
+        return "discount"
+    if "concrete_time_to_result" in unknown and any(marker in low for marker in TIME_TO_RESULT_MARKERS):
+        return "concrete_time_to_result"
+    if "guaranteed_results" in unknown and any(marker in low for marker in GUARANTEED_RESULT_MARKERS):
+        return "guaranteed_results"
+    if "price" in unknown and not known.get("price") and (
+        any(marker in low for marker in PRICE_MARKERS)
+        or re.search(r"\b(?:от\s*)?\d[\d\s]*(?:₽|руб\.?|р\.)\b", low)
+    ):
+        return "price"
+    if "exact_dates" in unknown and re.search(
+        r"\b\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b",
+        low,
+    ):
+        return "exact_dates"
+    if "schedule" in unknown and re.search(
+        r"(?:пн|вт|ср|чт|пт|сб|вс|понедельник|суббот|воскрес).*?\d{1,2}[:.]\d{2}",
+        low,
+    ):
+        return "schedule"
+    if "age_range" in unknown and not known.get("age_range") and re.search(
+        r"(?:\b\d{1,2}\s*[-–]\s*\d{1,2}\s*(?:лет|года|год)\b|\b(?:после|с|от)\s*\d{1,2}\s*(?:лет|года|год)?\b)",
+        low,
+    ):
+        return "age_range"
+    if "address" in unknown and not known.get("address") and any(marker in low for marker in ADDRESS_MARKERS):
+        return "address"
+    return None
 
 
 def validate_generated_post(channel: dict, post: dict, safety: dict, brief: dict) -> dict:
@@ -296,6 +414,16 @@ def validate_generated_post(channel: dict, post: dict, safety: dict, brief: dict
 
     if _blocked_content(content):
         result.update({"allowed": False, "decision": "blocked", "reason_code": "blocked_output_content"})
+        return result
+
+    unsupported_fact = _unsupported_fact_claim(channel, content)
+    if unsupported_fact:
+        result.update({
+            "allowed": False,
+            "decision": "review",
+            "reason_code": "unsupported_claim_or_unknown_fact",
+            "notes": f"generated post mentions unknown fact: {unsupported_fact}",
+        })
         return result
 
     if is_kids_education_channel(channel):
