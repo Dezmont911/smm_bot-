@@ -103,7 +103,7 @@ if 'due_at' not in pcols:
     print("  ✅ processed_ads.due_at добавлена")
 else:
     print("  ℹ️  processed_ads.due_at уже есть")
-conn.executescript("""
+conn.executescript('''
 CREATE TABLE IF NOT EXISTS boost_settings (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     boost_enabled INTEGER NOT NULL DEFAULT 0,
@@ -150,7 +150,7 @@ CREATE TABLE IF NOT EXISTS boost_orders (
 );
 CREATE INDEX IF NOT EXISTS idx_boost_channels_enabled ON boost_channels(enabled);
 CREATE INDEX IF NOT EXISTS idx_boost_orders_channel ON boost_orders(boost_channel_id, message_id);
-""")
+''')
 print("  ✅ boost tables ready")
 updated = conn.execute(
     "UPDATE posts SET parse_mode = 'HTML' WHERE (parse_mode IS NULL OR parse_mode = 'Markdown') AND content LIKE '%<b>%' AND status IN ('ready', 'pending_review')"
