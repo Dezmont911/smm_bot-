@@ -157,6 +157,26 @@ class Config:
         default_factory=lambda: _optional("FAL_API_KEY", "")
     )
 
+    # --- TwiBoost / post boost ---
+    TWIBOOST_API_KEY: str = field(
+        default_factory=lambda: _optional("TWIBOOST_API_KEY", "")
+    )
+    TWIBOOST_API_URL: str = field(
+        default_factory=lambda: _optional("TWIBOOST_API_URL", "https://twiboost.com/api/v2")
+    )
+    TWIBOOST_VIEWS_SERVICE_ID: int = field(
+        default_factory=lambda: int(v) if (v := _optional("TWIBOOST_VIEWS_SERVICE_ID", "0")).isdigit() else 0
+    )
+    BOOST_DEFAULT_QUANTITY: int = field(
+        default_factory=lambda: int(v) if (v := _optional("BOOST_DEFAULT_QUANTITY", "500")).isdigit() else 500
+    )
+    BOOST_DRY_RUN: bool = field(
+        default_factory=lambda: _optional("BOOST_DRY_RUN", "true").lower() == "true"
+    )
+    BOOST_REAL_ORDERS_ENABLED: bool = field(
+        default_factory=lambda: _optional("BOOST_REAL_ORDERS_ENABLED", "false").lower() == "true"
+    )
+
     # --- Учёт расходов на сервисы (цены в USD, можно переопределить в .env) ---
     # Claude — цена за 1 млн токенов (вход/выход). По умолчанию — Haiku 4.5 ($1/$5).
     # Для sonnet/opus цена выбирается автоматически по имени модели (см. cost_tracker).

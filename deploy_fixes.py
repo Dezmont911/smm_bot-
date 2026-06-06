@@ -43,6 +43,7 @@ FILES = [
     "cost_tracker.py",    # НОВЫЙ модуль — учёт расходов на Claude/fal.ai
     "content_safety.py",  # НОВЫЙ модуль — safe-v1 пайплайн генерации (импортится в content_generator)
     "channel_dna.py",     # НОВЫЙ модуль — ДНК канала (импортится в channel_analyzer/content_safety)
+    "boost_manager.py",   # НОВЫЙ модуль — безопасные настройки и dry-run клиент TwiBoost
 ]
 
 # (локальный путь относительно LOCAL_BASE, удалённый путь относительно REMOTE_BASE, метка)

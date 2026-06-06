@@ -46,6 +46,20 @@ from config import cfg
 from content_generator import generator
 from poster import poster
 import accounts
+from boost_manager import (
+    BOOST_OVERRIDE_INHERIT,
+    BOOST_OVERRIDE_OFF,
+    BOOST_OVERRIDE_ON,
+    boost_configured,
+    boost_real_orders_allowed,
+    channel_boost_override,
+    channel_can_use_boost,
+    effective_boost_enabled,
+    load_global_boost_settings,
+    required_env_vars,
+    set_channel_boost_override,
+    write_global_boost_settings,
+)
 
 
 def _acting_uid(qm) -> int | None:
@@ -94,6 +108,28 @@ def _save_admin_settings(data: dict):
 def admin_default_rsy_enabled() -> bool:
     """Включать ли РСЯ-перекрытие по умолчанию для новых каналов superadmin."""
     return bool(_load_admin_settings().get("default_rsy_override", False))
+
+
+def admin_boost_settings() -> dict:
+    return load_global_boost_settings(_load_admin_settings(), cfg)
+
+
+def _save_boost_global_enabled(enabled: bool):
+    data = write_global_boost_settings(_load_admin_settings(), enabled, cfg)
+    _save_admin_settings(data)
+
+
+def _boost_mode_label() -> str:
+    if boost_real_orders_allowed(cfg):
+        return "real orders"
+    return "dry-run"
+
+
+def _boost_effective_label(ch: dict) -> str:
+    settings = admin_boost_settings()
+    effective = effective_boost_enabled(ch, settings, config=cfg)
+    override = channel_boost_override(ch)
+    return f"{'on' if effective else 'off'} / {override}"
 
 
 # ── Вспомогательные функции ────────────────────────────────────────────────
@@ -843,6 +879,7 @@ async def screen_channel_settings(qm, context: ContextTypes.DEFAULT_TYPE, handle
         [InlineKeyboardButton(f"📰 Источники тем: {src_mode_short}", callback_data=f"ui:ch_set:{channel_id}:rss")],
         [InlineKeyboardButton(f"🚫 Запрещённые темы: {forb_str}", callback_data=f"ui:ch_set:{channel_id}:forbidden")],
         [InlineKeyboardButton(f"{rsy_icon} Перекрытие рекламы РСЯ", callback_data=f"ui:rsy_toggle:{channel_id}")],
+        [InlineKeyboardButton(f"🚀 Boost: {_boost_effective_label(ch)}", callback_data=f"ui:ch_boost:{channel_id}")],
     ]
 
     if is_wb:
@@ -859,6 +896,42 @@ async def screen_channel_settings(qm, context: ContextTypes.DEFAULT_TYPE, handle
         f"⚙️ <b>Настройки</b>  <code>{channel_id}</code>\n\nНажми параметр чтобы изменить:",
         InlineKeyboardMarkup(rows),
     )
+
+
+async def screen_channel_boost(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
+    ch = _load_channel(handle)
+    if not ch:
+        await _answer_or_send(qm, f"❌ Канал {handle} не найден.", None)
+        return
+
+    channel_id = ch["channel_id"]
+    settings = admin_boost_settings()
+    override = channel_boost_override(ch)
+    allowed = channel_can_use_boost(ch, cfg)
+    effective = effective_boost_enabled(ch, settings, config=cfg)
+    global_state = "on" if settings.get("boost_global_enabled") else "off"
+    api_state = "configured" if boost_configured(cfg) else "not configured"
+    real_state = _boost_mode_label()
+
+    text = (
+        f"🚀 <b>Boost</b>  <code>{channel_id}</code>\n\n"
+        f"Global: <b>{global_state}</b>\n"
+        f"Channel override: <b>{override}</b>\n"
+        f"Effective: <b>{'on' if effective else 'off'}</b>\n"
+        f"Allowed scope: <b>{'yes' if allowed else 'no'}</b>\n"
+        f"Mode: <b>{real_state}</b>\n"
+        f"TwiBoost API: <b>{api_state}</b>\n\n"
+        "Автозаказ после публикации здесь не подключён."
+    )
+    rows = [
+        [
+            InlineKeyboardButton("inherit", callback_data=f"ui:ch_boost_set:{channel_id}:{BOOST_OVERRIDE_INHERIT}"),
+            InlineKeyboardButton("on", callback_data=f"ui:ch_boost_set:{channel_id}:{BOOST_OVERRIDE_ON}"),
+            InlineKeyboardButton("off", callback_data=f"ui:ch_boost_set:{channel_id}:{BOOST_OVERRIDE_OFF}"),
+        ],
+        [InlineKeyboardButton("◀️ К настройкам", callback_data=f"ui:ch_settings:{channel_id}")],
+    ]
+    await _answer_or_send(qm, text, InlineKeyboardMarkup(rows))
 
 
 async def screen_archetype_picker(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
@@ -3751,6 +3824,67 @@ async def screen_help_section(qm, context: ContextTypes.DEFAULT_TYPE, key: str):
 # АДМИН-ПАНЕЛЬ (только superadmin) — инвайты и пользователи по кнопкам
 # ══════════════════════════════════════════════════════════════════════════════
 
+async def screen_boost_admin(qm, context: ContextTypes.DEFAULT_TYPE):
+    uid = _acting_uid(qm)
+    if not accounts.is_superadmin(uid):
+        await qm.answer("Только для владельца.", show_alert=True)
+        return
+
+    settings = admin_boost_settings()
+    channels = [
+        ch for ch in _load_channels(include_inactive=True, owner_id=uid, scope="mine")
+        if ch.get("active", True) and channel_can_use_boost(ch, cfg)
+    ]
+    global_state = "on" if settings.get("boost_global_enabled") else "off"
+    api_state = "configured" if boost_configured(cfg) else "not configured"
+    real_allowed = "yes" if boost_real_orders_allowed(cfg) else "no"
+    env_lines = "\n".join(f"• <code>{name}</code>" for name in required_env_vars())
+
+    text = (
+        "🚀 <b>Boost settings</b>\n\n"
+        f"Global: <b>{global_state}</b>\n"
+        f"Status: <b>{settings.get('boost_status')}</b>\n"
+        f"Scope: <b>{settings.get('boost_scope')}</b>\n"
+        f"Mode: <b>{_boost_mode_label()}</b>\n"
+        f"Real orders allowed: <b>{real_allowed}</b>\n"
+        f"TwiBoost API: <b>{api_state}</b>\n"
+        f"Affected channels: <b>{len(channels)}</b>\n\n"
+        "Required env vars:\n"
+        f"{env_lines}\n\n"
+        "По умолчанию реальные заказы выключены. Этот экран только управляет настройками."
+    )
+    rows = [
+        [InlineKeyboardButton(f"Global Boost: {global_state}", callback_data="ui:boost_toggle")],
+        [InlineKeyboardButton("Показать каналы", callback_data="ui:boost_channels")],
+        [InlineKeyboardButton("◀️ В админ-панель", callback_data="ui:admin")],
+    ]
+    await _answer_or_send(qm, text, InlineKeyboardMarkup(rows))
+
+
+async def screen_boost_channels(qm, context: ContextTypes.DEFAULT_TYPE):
+    uid = _acting_uid(qm)
+    if not accounts.is_superadmin(uid):
+        await qm.answer("Только для владельца.", show_alert=True)
+        return
+
+    channels = [
+        ch for ch in _load_channels(include_inactive=True, owner_id=uid, scope="mine")
+        if ch.get("active", True) and channel_can_use_boost(ch, cfg)
+    ]
+    rows = [
+        [InlineKeyboardButton(f"{ch.get('name') or ch['channel_id']}: {_boost_effective_label(ch)}",
+                              callback_data=f"ui:ch_boost:{ch['channel_id']}")]
+        for ch in channels[:25]
+    ]
+    rows.append([InlineKeyboardButton("◀️ Boost settings", callback_data="ui:boost")])
+    text = (
+        "🚀 <b>Boost channels</b>\n\n"
+        f"Каналов в разрешённом scope: <b>{len(channels)}</b>\n"
+        "Формат кнопки: effective / override."
+    )
+    await _answer_or_send(qm, text, InlineKeyboardMarkup(rows))
+
+
 async def screen_admin(qm, context: ContextTypes.DEFAULT_TYPE):
     """Меню админа: создать инвайт, список тестеров, каналы пользователей."""
     uid = _acting_uid(qm)
@@ -3775,6 +3909,7 @@ async def screen_admin(qm, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(f"📡 Каналы пользователей ({len(tester_chans)})", callback_data="ui:adm_chans:0")],
         [InlineKeyboardButton(f"📢 РСЯ по умолчанию: {rsy_state}", callback_data="ui:adm_rsy_default")],
         [InlineKeyboardButton(f"🗑 Удалить мои каналы ({len(my_chans)})", callback_data="ui:adm_del_my_chans")],
+        [InlineKeyboardButton("🚀 Boost", callback_data="ui:boost")],
         [InlineKeyboardButton("💰 Расходы", callback_data="ui:adm_cost:today")],
         [InlineKeyboardButton("⚡ Генерить для всех", callback_data="ui:generate_all")],
         [InlineKeyboardButton("◀️ В меню", callback_data="ui:main")],
@@ -4051,6 +4186,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 👑 Админ-действия — только для главного владельца (superadmin)
     if action in ("admin", "adm_inv", "adm_users", "adm_revoke", "adm_pro", "adm_chans", "adm_cost",
+                  "boost", "boost_toggle", "boost_channels",
                   "adm_rsy_default", "adm_del_my_chans", "adm_del_my_chans_ok"):
         if not accounts.is_superadmin(uid):
             await query.answer("Только для владельца.", show_alert=True)
@@ -4067,6 +4203,15 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action == "adm_cost":
             period = parts[2] if len(parts) >= 3 and parts[2] else "today"
             await screen_admin_costs(query, context, period)
+        elif action == "boost":
+            await screen_boost_admin(query, context)
+        elif action == "boost_toggle":
+            current = admin_boost_settings().get("boost_global_enabled", False)
+            _save_boost_global_enabled(not current)
+            await query.answer(f"Boost global: {'on' if not current else 'off'}")
+            await screen_boost_admin(query, context)
+        elif action == "boost_channels":
+            await screen_boost_channels(query, context)
         elif action == "adm_rsy_default":
             await action_admin_rsy_default_toggle(query, context)
         elif action == "adm_del_my_chans":
@@ -4098,6 +4243,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ch_sched_days", "ch_sched_day", "ch_sched_daypreset",
         "ch_sched_custom", "ch_sched_copy", "ch_sched_copy_ok", "ch_images_toggle",
         "ch_history", "ch_set", "ch_set_img", "ch_folder", "ch_setfold",
+        "ch_boost", "ch_boost_set",
         "ch_newfold", "ch_restore", "ch_draft", "draft_new", "draft_qlast",
         "draft_qall", "draft_qbatch", "draft_preview_batch", "draft_clear", "draft_clearok", "rsy_toggle",
         "ch_archetype", "ch_set_arche", "ch_source_toggle", "ch_src_mode",
@@ -4343,6 +4489,28 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "ch_settings" and len(parts) >= 3:
         handle = parts[2]
         await screen_channel_settings(query, context, handle)
+
+    elif action == "ch_boost" and len(parts) >= 3:
+        handle = parts[2]
+        await screen_channel_boost(query, context, handle)
+
+    elif action == "ch_boost_set" and len(parts) >= 4:
+        handle = parts[2]
+        override = parts[3]
+        if override not in (BOOST_OVERRIDE_INHERIT, BOOST_OVERRIDE_ON, BOOST_OVERRIDE_OFF):
+            await query.answer("Unknown Boost override.", show_alert=True)
+            return
+        ch = _load_channel(handle)
+        if not ch:
+            await query.answer("Канал не найден.", show_alert=True)
+            return
+        if override == BOOST_OVERRIDE_ON and not channel_can_use_boost(ch, cfg):
+            await query.answer("Boost доступен только для каналов владельца/admin.", show_alert=True)
+            return
+        set_channel_boost_override(ch, override)
+        _save_channel(ch)
+        await query.answer(f"Boost override: {override}")
+        await screen_channel_boost(query, context, handle)
 
     elif action == "ch_topic_redo" and len(parts) >= 3:
         handle = parts[2]
