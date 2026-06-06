@@ -1684,6 +1684,39 @@ def _manual_import_rejection_message(validation: dict) -> str:
     return f"⚠️ Пост не прошёл проверку: {reason}"
 
 
+_DRAFT_LINK_RE = re.compile(r'<a\s+href="([^"]+)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+
+
+def _draft_html_links(text_html: str | None) -> list[tuple[str, str]]:
+    out, seen = [], set()
+    for url, label in _DRAFT_LINK_RE.findall(text_html or ""):
+        url = (url or "").strip()
+        if not url.lower().startswith(("http://", "https://")) or url in seen:
+            continue
+        seen.add(url)
+        label = re.sub(r"<[^>]+>", "", label or "").strip() or url
+        out.append((url, label))
+    return out
+
+
+def _draft_plain_text(text_html: str | None) -> str:
+    text = re.sub(r"<br\s*/?>", "\n", text_html or "", flags=re.IGNORECASE)
+    text = re.sub(r"</p\s*>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(text).strip()
+
+
+def _merge_draft_polished_text(polished: str, original_html: str | None) -> tuple[str, str | None]:
+    """Возвращает publish-ready текст и parse_mode, сохраняя реальные HTML-ссылки черновика."""
+    links = _draft_html_links(original_html)
+    body = (polished or "").strip()
+    if not links:
+        return body, None
+    body_html = html.escape(body)
+    cta = "\n".join(f'<a href="{url}">{html.escape(label)}</a>' for url, label in links)
+    return (body_html + ("\n\n" if body_html else "") + cta).strip(), "HTML"
+
+
 async def _warn_manual_import_rejected(msg, validation: dict):
     await _reply_and_cleanup_user_msg(msg, _manual_import_rejection_message(validation))
 
@@ -1885,6 +1918,7 @@ def _draft_created_kb(d: dict, batch_count: int = 0) -> InlineKeyboardMarkup:
     handle = d["channel_id"]
     rows = [
         [InlineKeyboardButton("📤 В очередь", callback_data=f"ui:draft_q:{d['id']}")],
+        [InlineKeyboardButton("🤖 Улучшить текст", callback_data=f"ui:draft_ai:{d['id']}")],
     ]
     if batch_count > 1:
         rows.append([
@@ -1912,6 +1946,7 @@ async def _reply_draft_card(msg_obj, d: dict, num: str, created: bool = False, b
             InlineKeyboardButton("✏️ Текст", callback_data=f"ui:draft_edit:{d['id']}"),
             InlineKeyboardButton("🖼 Медиа",  callback_data=f"ui:draft_media:{d['id']}"),
         ],
+        [InlineKeyboardButton("🤖 Улучшить текст", callback_data=f"ui:draft_ai:{d['id']}")],
         [
             InlineKeyboardButton("📤 В очередь", callback_data=f"ui:draft_q:{d['id']}"),
             InlineKeyboardButton("🗑 Удалить",   callback_data=f"ui:draft_del:{d['id']}"),
@@ -1998,6 +2033,118 @@ async def action_draft_edit_media(qm, context: ContextTypes.DEFAULT_TYPE, post_i
     context.user_data["draft_media"] = post_id
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К черновикам", callback_data=f"ui:ch_draft:{handle}")]])
     await _answer_or_send(qm, "🖼 Пришли <b>новое фото или видео</b> — заменю медиа черновика.", kb)
+
+
+async def action_draft_ai_polish(qm, context: ContextTypes.DEFAULT_TYPE, post_id: str):
+    """Бережно улучшает текст черновика через LLM, но не ставит его в очередь."""
+    from telegram import CallbackQuery
+
+    handle = buffer.get_post_channel(post_id)
+    ch = _load_channel(handle) if handle else None
+    draft = next((x for x in buffer.get_drafts(handle) if x["id"] == post_id), None) if handle else None
+    if not ch or not draft:
+        if isinstance(qm, CallbackQuery):
+            await qm.answer("Черновик не найден.", show_alert=True)
+        return
+
+    original = (draft.get("content") or "").strip()
+    plain = _draft_plain_text(original)
+    if not plain:
+        if isinstance(qm, CallbackQuery):
+            await qm.answer("В черновике нет текста для улучшения.", show_alert=True)
+        return
+
+    from content_safety import (
+        build_content_brief,
+        evaluate_topic_candidate,
+        validate_generated_post,
+        validate_imported_post,
+    )
+
+    import_validation = validate_imported_post(ch, {
+        "channel_id": handle,
+        "content": original,
+        "format": draft.get("format") or "manual",
+        "topic": draft.get("topic") or "manual draft",
+        "media_type": draft.get("media_type"),
+        "tg_file_id": draft.get("tg_file_id"),
+    })
+    if not import_validation.get("allowed"):
+        if isinstance(qm, CallbackQuery):
+            await qm.answer(_manual_import_rejection_message(import_validation), show_alert=True)
+        return
+
+    safety = evaluate_topic_candidate(ch, {"topic": plain[:700], "source": "manual_draft_ai_polish"})
+    if safety.get("decision") in ("blocked", "review") or not safety.get("safe_topic"):
+        if isinstance(qm, CallbackQuery):
+            await qm.answer("⚠️ Такой текст ИИ не будет переписывать по политике бота.", show_alert=True)
+        return
+    brief = build_content_brief(ch, safety, draft.get("format") or "manual")
+
+    if isinstance(qm, CallbackQuery):
+        await qm.answer("🤖 Улучшаю текст...")
+        try:
+            await qm.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⏳ ИИ улучшает текст...", callback_data="ui:noop")
+            ]]))
+        except Exception:
+            pass
+
+    async def _send_result(text: str, kb: InlineKeyboardMarkup):
+        if isinstance(qm, CallbackQuery):
+            await qm.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        else:
+            await _answer_or_send(qm, text, kb)
+
+    try:
+        from ai_client import rephrase_text
+        polished_raw = await rephrase_text(plain, ch)
+        polished_raw = (polished_raw or "").strip()
+    except Exception as e:
+        logger.warning(f"draft_ai_polish failed {post_id[:8]}: {e}")
+        polished_raw = ""
+
+    if not polished_raw or polished_raw == plain:
+        await _send_result(
+            "😔 ИИ не смог улучшить текст. Черновик не изменён.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К черновикам", callback_data=f"ui:ch_draft:{handle}")]]),
+        )
+        return
+
+    content, parse_mode = _merge_draft_polished_text(polished_raw, original)
+    validation = validate_generated_post(
+        ch,
+        {
+            "channel_id": handle,
+            "content": content,
+            "format": draft.get("format") or "manual",
+            "topic": safety.get("safe_topic") or draft.get("topic") or "manual draft",
+            "media_type": draft.get("media_type"),
+            "tg_file_id": draft.get("tg_file_id"),
+        },
+        safety,
+        brief,
+    )
+    if not validation.get("allowed"):
+        logger.warning(f"draft_ai_polish validation skipped [{handle}] {post_id[:8]}: {validation.get('reason_code')}")
+        await _send_result(
+            f"⚠️ ИИ-текст не прошёл проверку: <code>{validation.get('reason_code')}</code>\nЧерновик не изменён.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К черновикам", callback_data=f"ui:ch_draft:{handle}")]]),
+        )
+        return
+
+    buffer.set_draft_content(post_id, content, parse_mode)
+    updated = next((x for x in buffer.get_drafts(handle) if x["id"] == post_id), None)
+    await _send_result(
+        "✅ Текст улучшен ИИ. Черновик остался в черновиках.",
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 В очередь", callback_data=f"ui:draft_q:{post_id}")],
+            [InlineKeyboardButton("✍️ Черновики", callback_data=f"ui:ch_draft:{handle}")],
+            [InlineKeyboardButton("◀️ Создать пост", callback_data=f"ui:ch_create:{handle}")],
+        ]),
+    )
+    if updated and isinstance(qm, CallbackQuery):
+        await _reply_draft_card(qm.message, updated, "🤖 Обновлённый черновик")
 
 
 async def action_draft_clear_confirm(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
@@ -3691,7 +3838,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # на единственную защиту: забыть дописать сюда новый ch_* не страшно, пока handle с «@».
     # Действия с ДВУМЯ каналами (напр. ch_sched_copy_ok: dst в parts[2], src в parts[3])
     # этот общий гард прикрывает только по parts[2] — второй канал проверяй вручную (_owns).
-    _POST_ACTIONS = {"draft_edit", "draft_media", "draft_q", "draft_del", "draft_view"}
+    _POST_ACTIONS = {"draft_edit", "draft_media", "draft_ai", "draft_q", "draft_del", "draft_view"}
     _CHANNEL_ACTIONS = {
         "ch", "ch_settings", "ch_topic_redo", "ch_pause", "ch_delete", "ch_delete_ok",
         "ch_clear", "ch_clear_ok", "ch_create", "ch_generate", "ch_gen_run", "ch_postnow",
@@ -3899,6 +4046,9 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "draft_media" and len(parts) >= 3:
         await action_draft_edit_media(query, context, parts[2])
+
+    elif action == "draft_ai" and len(parts) >= 3:
+        await action_draft_ai_polish(query, context, parts[2])
 
     elif action == "draft_view" and len(parts) >= 3:
         await action_draft_view(query, context, parts[2])
