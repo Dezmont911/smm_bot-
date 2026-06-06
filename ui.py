@@ -509,19 +509,56 @@ async def prompt_channel_search(qm, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К каналам", callback_data="ui:channels")]])
     await _answer_or_send(
         qm,
-        "🔍 <b>Поиск канала</b>\n\nПришли часть названия или @username — покажу совпадения.",
+        "🔍 <b>Поиск канала</b>\n\nПришли часть названия, @username или ссылку t.me — покажу совпадения.",
         kb,
     )
 
 
+def _channel_search_terms(query: str) -> set[str]:
+    q = (query or "").strip().lower()
+    q = q.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    terms = {q} if q else set()
+
+    m = re.search(r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/(@?[a-z0-9_]{4,})", q)
+    if m:
+        username = m.group(1).lstrip("@")
+        terms.update({username, f"@{username}", f"t.me/{username}", f"https://t.me/{username}"})
+    elif q.startswith("@"):
+        username = q.lstrip("@")
+        terms.update({username, f"@{username}", f"t.me/{username}", f"https://t.me/{username}"})
+    elif re.fullmatch(r"[a-z0-9_]{4,}", q):
+        terms.update({q, f"@{q}", f"t.me/{q}", f"https://t.me/{q}"})
+
+    return {t for t in terms if t}
+
+
+def _channel_search_haystack(ch: dict) -> set[str]:
+    values = {
+        ch.get("channel_id"),
+        ch.get("name"),
+        ch.get("username"),
+        ch.get("chat_username"),
+        ch.get("handle"),
+    }
+    cid = (ch.get("channel_id") or "").strip().lower().lstrip("@")
+    if cid:
+        values.update({cid, f"@{cid}", f"t.me/{cid}", f"https://t.me/{cid}"})
+    out = set()
+    for value in values:
+        text = (str(value or "")).strip().lower()
+        if text:
+            out.add(text)
+    return out
+
+
 async def screen_channels_search(qm, context: ContextTypes.DEFAULT_TYPE, query: str):
-    """Показывает каналы, совпавшие с запросом (по названию или @username)."""
-    q = (query or "").strip().lower().lstrip("@")
+    """Показывает каналы, совпавшие с запросом (по названию, @username или t.me-ссылке)."""
+    terms = _channel_search_terms(query)
     channels = [c for c in _load_channels(include_inactive=True, owner_id=_acting_uid(qm), scope="mine")
                 if c.get("active", True)]
     matched = [
         c for c in channels
-        if q in (c.get("name", "") or "").lower() or q in c["channel_id"].lower().lstrip("@")
+        if any(term in value for term in terms for value in _channel_search_haystack(c))
     ][:20]
 
     buttons = [[_channel_button(c)] for c in matched]
