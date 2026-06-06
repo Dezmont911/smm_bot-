@@ -982,7 +982,7 @@ async def handle_add_method_choice(update: Update, context: ContextTypes.DEFAULT
             "🔍 <b>Добавление по ссылке / @username</b>\n\n"
             "Пришли ссылку или @username <b>публичного</b> канала.\n"
             "Например: <code>@durov</code> или <code>https://t.me/durov</code>\n\n"
-            "Бот прочитает канал через юзербота и сам всё определит.\n\n"
+            "Бот проанализирует канал и сам всё определит.\n\n"
             "/cancel — отменить",
             parse_mode=ParseMode.HTML,
         )
@@ -995,7 +995,7 @@ async def handle_add_method_choice(update: Update, context: ContextTypes.DEFAULT
             "(или через запятую). До <b>20</b> за раз.\n\n"
             "Например:\n"
             "<code>@channel1\n@channel2\nhttps://t.me/channel3</code>\n\n"
-            "Бот прочитает каждый юзерботом, сам определит тему/стиль/источники "
+            "Бот проанализирует каждый канал, сам определит тему/стиль/источники "
             "и создаст карточки. Автопубликация у всех будет выключена.\n\n"
             "/cancel — отменить",
             parse_mode=ParseMode.HTML,
@@ -1373,7 +1373,7 @@ async def handle_add_username(update: Update, context: ContextTypes.DEFAULT_TYPE
         data = await read_channel(handle, limit=50)
     except UserbotNotAuthorized:
         await msg.edit_text(
-            "❌ Юзербот не авторизован — авто-чтение недоступно.\n"
+            "❌ Авто-анализ канала временно недоступен.\n"
             "Добавь канал вручную (✏️) или через экспорт (📂).\n/cancel — отменить"
         )
         return ADD_USERNAME
@@ -1559,7 +1559,7 @@ async def handle_add_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     existing.add(data["handle"].lower())
                     added.append(data["handle"])
         except UserbotNotAuthorized:
-            skipped.append((handle, "юзербот не авторизован — стоп"))
+            skipped.append((handle, "авто-анализ временно недоступен — стоп"))
             break  # без юзербота дальше смысла нет
         except ValueError as e:
             skipped.append((handle, str(e)[:60]))
