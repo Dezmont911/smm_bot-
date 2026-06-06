@@ -29,6 +29,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from telegram import (
     InlineKeyboardButton,
@@ -61,11 +62,11 @@ from boost_manager import (
     list_boost_events,
     list_tracked_channels,
     normalize_channel_input,
+    parse_boost_quantity,
     required_env_vars,
     set_boost_enabled,
     set_tracked_channel_enabled,
     set_tracked_channel_quantity,
-    validate_boost_quantity,
 )
 
 
@@ -169,9 +170,10 @@ def _boost_link_label(value) -> str:
 def _boost_status_label(status: str | None) -> str:
     return {
         "disabled": "выключен",
-        "dry_run": "тестовый режим",
+        "dry_run": "тестовый заказ",
         "enabled": "включен",
-        "ignored": "пропущен",
+        "ordered": "заказ создан",
+        "ignored": "пропущено",
         "duplicate": "дубликат",
         "failed": "ошибка",
     }.get(status or "", status or "нет")
@@ -192,10 +194,14 @@ def _boost_reason_label(reason: str | None) -> str:
         "public_username": "публичный username найден",
         "missing_channel_or_message_id": "нет канала или ID сообщения",
         "twiboost_not_configured": "TwiBoost не настроен",
+        "missing_service_id": "не указан ID сервиса",
+        "provider_error": "ошибка провайдера",
         "quantity_must_be_integer": "количество должно быть числом",
         "quantity_must_be_positive": "количество должно быть больше нуля",
         "quantity_too_large": "количество слишком большое",
-    }.get(reason or "", reason or "нет")
+        "quantity_invalid": "некорректное количество",
+        "quantity_range_reversed": "диапазон указан наоборот",
+    }.get(reason or "", f"неизвестная причина: {reason}" if reason else "нет")
 
 
 def _boost_event_type_label(event_type: str | None) -> str:
@@ -212,6 +218,29 @@ def _boost_smm_state_label(existing: dict | None) -> str:
     if not existing:
         return "не добавлен"
     return "включен" if existing.get("enabled") else "выключен"
+
+
+def _boost_quantity_display(ch: dict | None) -> str:
+    ch = ch or {}
+    if ch.get("quantity_display"):
+        return str(ch["quantity_display"])
+    qmin = ch.get("quantity_min")
+    qmax = ch.get("quantity_max")
+    if qmin is not None and qmax is not None:
+        return str(qmin) if int(qmin) == int(qmax) else f"{qmin}–{qmax}"
+    return str(ch.get("quantity") or cfg.BOOST_DEFAULT_QUANTITY)
+
+
+def _boost_event_time_label(value) -> str:
+    if not value:
+        return "нет"
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y %H:%M МСК")
+    except Exception:
+        return str(value)
 
 
 # ── Вспомогательные функции ────────────────────────────────────────────────
@@ -3883,6 +3912,7 @@ async def screen_boost_admin(qm, context: ContextTypes.DEFAULT_TYPE):
     service_state = _boost_config_label(_boost_service_configured(settings))
     real_allowed = _boost_yesno_label(boost_real_orders_allowed(settings, cfg))
     env_lines = "\n".join(f"• <code>{name}</code>" for name in required_env_vars())
+    global_hint = "\n\nБуст выключен глобально. Новые посты не обрабатываются." if not settings.get("boost_enabled") else ""
 
     text = (
         "🚀 <b>Настройки Boost</b>\n\n"
@@ -3899,6 +3929,7 @@ async def screen_boost_admin(qm, context: ContextTypes.DEFAULT_TYPE):
         "Переменные окружения:\n"
         f"{env_lines}\n\n"
         "В текущем режиме реальные заказы не отправляются: создаются только тестовые события."
+        f"{global_hint}"
     )
     rows = [
         [InlineKeyboardButton(f"Глобальный Boost: {global_state}", callback_data="ui:boost_toggle")],
@@ -3942,14 +3973,23 @@ def _boost_event_channel_name(event: dict) -> str:
 
 
 def _boost_event_line(event: dict) -> str:
-    target = event.get("post_url") or _boost_reason_label(event.get("reason_code") or event.get("error"))
+    reason = event.get("reason_code") or event.get("error")
+    reason_label = _boost_reason_label(reason)
+    range_display = event.get("channel_quantity_display")
+    quantity_line = f"{event.get('quantity')} просмотров"
+    if range_display and str(range_display) != str(event.get("quantity")):
+        quantity_line = f"{range_display} просмотров, выбрано: {event.get('quantity')}"
+    status_line = f"Статус: {_boost_status_label(event.get('status'))}"
+    if event.get("status") in ("ignored", "failed") and reason:
+        status_line = f"Статус: {_boost_status_label(event.get('status'))}\nПричина: {html.escape(reason_label)}"
+    link_line = f"Ссылка: {html.escape(str(event.get('post_url')))}" if event.get("post_url") else ""
     return (
         f"#{event.get('id')} · <b>{html.escape(_boost_event_channel_name(event))}</b>\n"
-        f"{_boost_event_type_label(event.get('event_type'))}, сообщение <code>{event.get('message_id')}</code>, "
-        f"количество <b>{event.get('quantity')}</b>\n"
-        f"{_boost_status_label(event.get('status'))}: {html.escape(_boost_reason_label(event.get('reason_code') or event.get('error')))}\n"
-        f"{html.escape(str(target))}\n"
-        f"<code>{html.escape(_boost_none_label(event.get('created_at')))}</code>"
+        f"{_boost_event_type_label(event.get('event_type')).capitalize()} · сообщение <code>{event.get('message_id')}</code> · "
+        f"{html.escape(quantity_line)}\n"
+        f"{status_line}\n"
+        f"{link_line + chr(10) if link_line else ''}"
+        f"<code>{html.escape(_boost_event_time_label(event.get('created_at')))}</code>"
     )
 
 
@@ -4110,7 +4150,7 @@ async def action_boost_pick_smm_channel(qm, context: ContextTypes.DEFAULT_TYPE, 
             f"📋 <b>{html.escape(_boost_smm_name(ch))}</b>\n\n"
             f"Канал: <code>{html.escape(_boost_smm_identity(ch))}</code>\n"
             f"Количество по умолчанию: <b>{settings.get('default_quantity')}</b>\n\n"
-            "Пришли количество числом. Канал будет сохранен выключенным по умолчанию."
+            "Введите количество просмотров: например 600 или диапазон 600-610. Канал будет сохранен выключенным по умолчанию."
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"ui:boost_add_mine:{page}")]]),
@@ -4127,7 +4167,7 @@ def _boost_channel_name(ch: dict) -> str:
 
 def _boost_channel_button_label(ch: dict) -> str:
     state = _boost_onoff_label(bool(ch.get("enabled")))
-    qty = ch.get("quantity") or cfg.BOOST_DEFAULT_QUANTITY
+    qty = _boost_quantity_display(ch)
     linked = _boost_link_label(ch.get("smm_channel_id"))
     return f"{_boost_channel_name(ch)} | {linked} | {state} | {qty}"[:60]
 
@@ -4146,13 +4186,13 @@ async def screen_boost_channel_detail(qm, context: ContextTypes.DEFAULT_TYPE, ch
     linked = _boost_link_label(ch.get("smm_channel_id"))
     service_state = _boost_config_label(bool(ch.get("service_id") or _boost_service_configured()))
     public_state = "есть" if ch.get("username") else "нет"
-    disabled_hint = "\n\n⚠️ Канал выключен. Включи его, чтобы новые посты попадали в обработку Boost." if not ch.get("enabled") else ""
+    disabled_hint = "\n\n⚠️ Канал выключен. Новые посты не обрабатываются." if not ch.get("enabled") else ""
     text = (
         f"🚀 <b>Канал Boost</b> <code>{ch['id']}</code>\n\n"
         f"Канал: <b>{html.escape(_boost_channel_name(ch))}</b>\n"
         f"Связь с smm_bot: <b>{html.escape(str(linked))}</b>\n"
         f"Состояние: <b>{_boost_onoff_label(bool(ch.get('enabled')))}</b>\n"
-        f"Количество: <b>{ch.get('quantity') or cfg.BOOST_DEFAULT_QUANTITY}</b>\n"
+        f"Количество: <b>{_boost_quantity_display(ch)}</b>\n"
         f"ID сервиса: <b>{service_state}</b>\n"
         f"Публичная ссылка: <b>{public_state}</b>\n"
         f"Название: <b>{html.escape(_boost_none_label(ch.get('title')))}</b>\n"
@@ -4164,7 +4204,7 @@ async def screen_boost_channel_detail(qm, context: ContextTypes.DEFAULT_TYPE, ch
     next_state = _boost_onoff_label(not bool(ch.get("enabled")))
     rows = [
         [InlineKeyboardButton(f"Состояние: {next_state}", callback_data=f"ui:boost_ch_tgl:{ch['id']}")],
-        [InlineKeyboardButton("Количество", callback_data=f"ui:boost_ch_qty:{ch['id']}")],
+        [InlineKeyboardButton("✏️ Изменить количество", callback_data=f"ui:boost_ch_qty:{ch['id']}")],
         [InlineKeyboardButton("🧾 Журнал канала", callback_data=f"ui:boost_ch_events:{ch['id']}")],
         [InlineKeyboardButton("Удалить", callback_data=f"ui:boost_ch_del:{ch['id']}")],
         [InlineKeyboardButton("◀️ К списку", callback_data="ui:boost_channels")],
@@ -4202,9 +4242,9 @@ async def handle_boost_text_input(update: Update, context: ContextTypes.DEFAULT_
     if smm_channel_id:
         raw = (update.message.text or "").strip()
         try:
-            quantity = validate_boost_quantity(raw)
+            quantity = parse_boost_quantity(raw)["quantity_display"]
         except ValueError:
-            await update.message.reply_text("❌ Количество должно быть целым числом от 1 до 100000. Пришли число ещё раз.")
+            await update.message.reply_text("❌ Некорректное количество. Используйте число 600 или диапазон 600-610. Ноль, отрицательные числа и символы запрещены.")
             return True
 
         channels = _boost_smm_candidates(user.id)
@@ -4237,10 +4277,10 @@ async def handle_boost_text_input(update: Update, context: ContextTypes.DEFAULT_
     if external_raw:
         raw = (update.message.text or "").strip()
         try:
-            quantity = validate_boost_quantity(raw)
+            quantity = parse_boost_quantity(raw)["quantity_display"]
             ch = add_tracked_channel(external_raw, owner_id=user.id, quantity=quantity, enabled=False)
         except ValueError:
-            await update.message.reply_text("❌ Количество должно быть целым числом от 1 до 100000. Пришли число ещё раз.")
+            await update.message.reply_text("❌ Некорректное количество. Используйте число 600 или диапазон 600-610. Ноль, отрицательные числа и символы запрещены.")
             return True
         _clear_boost_pending(context)
         await update.message.reply_text(
@@ -4272,7 +4312,7 @@ async def handle_boost_text_input(update: Update, context: ContextTypes.DEFAULT_
         settings = get_boost_settings()
         await update.message.reply_text(
             (
-                "Теперь пришли количество числом.\n"
+                "Введите количество просмотров: например 600 или диапазон 600-610.\n"
                 f"Количество по умолчанию: {settings.get('default_quantity')}"
             )
         )
@@ -4282,14 +4322,14 @@ async def handle_boost_text_input(update: Update, context: ContextTypes.DEFAULT_
     if qty_channel_id is not None:
         raw = (update.message.text or "").strip()
         try:
-            quantity = validate_boost_quantity(raw)
+            quantity = parse_boost_quantity(raw)["quantity_display"]
             ch = set_tracked_channel_quantity(int(qty_channel_id), quantity)
         except (TypeError, ValueError):
-            await update.message.reply_text("❌ Количество должно быть целым числом от 1 до 100000. Пришли число ещё раз.")
+            await update.message.reply_text("❌ Некорректное количество. Используйте число 600 или диапазон 600-610. Ноль, отрицательные числа и символы запрещены.")
             return True
         context.user_data.pop("boost_set_quantity_for", None)
         await update.message.reply_text(
-            f"✅ Количество обновлено: <b>{ch.get('quantity')}</b>",
+            f"✅ Количество обновлено: <b>{_boost_quantity_display(ch)}</b>",
             parse_mode=ParseMode.HTML,
         )
         await screen_boost_channel_detail(update.message, context, int(qty_channel_id))
@@ -4657,7 +4697,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["boost_set_quantity_for"] = int(parts[2])
             await query.answer()
             await query.edit_message_text(
-                "Пришли новое количество просмотров числом.",
+                "Введите количество просмотров: например 600 или диапазон 600-610.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"ui:boost_ch:{parts[2]}")]]),
             )
         elif action == "boost_ch_del" and len(parts) >= 3 and parts[2].isdigit():

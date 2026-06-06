@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
+import random
 import re
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -23,7 +25,9 @@ BOOST_PROVIDER = "twiboost"
 BOOST_STATUS_DISABLED = "disabled"
 BOOST_STATUS_DRY_RUN = "dry_run"
 BOOST_STATUS_ENABLED = "enabled"
+BOOST_STATUS_ORDERED = "ordered"
 BOOST_STATUS_IGNORED = "ignored"
+BOOST_STATUS_FAILED = "failed"
 BOOST_EVENT_TYPE_MEDIA_GROUP = "media_group"
 BOOST_EVENT_TYPE_POST = "post"
 BOOST_EVENT_TYPE_TEXT = "text"
@@ -33,6 +37,9 @@ BOOST_REASON_NO_PUBLIC_POST_URL = "no_public_post_url"
 BOOST_REASON_PUBLIC_USERNAME = "public_username"
 BOOST_REASON_GLOBAL_DISABLED = "boost_global_disabled"
 BOOST_REASON_CHANNEL_DISABLED = "boost_channel_disabled"
+BOOST_REASON_MISSING_SERVICE_ID = "missing_service_id"
+BOOST_REASON_TWIBOOST_NOT_CONFIGURED = "twiboost_not_configured"
+BOOST_REASON_PROVIDER_ERROR = "provider_error"
 
 REQUIRED_ENV_VARS = (
     "TWIBOOST_API_KEY",
@@ -87,6 +94,9 @@ def ensure_boost_schema(database=db):
                 title TEXT,
                 enabled INTEGER NOT NULL DEFAULT 0,
                 quantity INTEGER,
+                quantity_min INTEGER,
+                quantity_max INTEGER,
+                quantity_display TEXT,
                 service_id TEXT,
                 note TEXT,
                 last_seen_message_id INTEGER,
@@ -163,6 +173,24 @@ def _ensure_boost_order_columns(conn):
     channel_columns = {row["name"] for row in conn.execute("PRAGMA table_info(boost_channels)").fetchall()}
     if "smm_channel_id" not in channel_columns:
         conn.execute("ALTER TABLE boost_channels ADD COLUMN smm_channel_id TEXT")
+    for name, definition in {
+        "quantity_min": "INTEGER",
+        "quantity_max": "INTEGER",
+        "quantity_display": "TEXT",
+    }.items():
+        if name not in channel_columns:
+            conn.execute(f"ALTER TABLE boost_channels ADD COLUMN {name} {definition}")
+    conn.execute(
+        """
+        UPDATE boost_channels
+        SET
+            quantity_min = COALESCE(quantity_min, quantity),
+            quantity_max = COALESCE(quantity_max, quantity),
+            quantity_display = COALESCE(quantity_display, CAST(quantity AS TEXT))
+        WHERE quantity IS NOT NULL
+          AND (quantity_min IS NULL OR quantity_max IS NULL OR quantity_display IS NULL OR quantity_display = '')
+        """
+    )
     conn.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_boost_channels_smm_channel
@@ -256,7 +284,6 @@ def boost_configured(config=cfg) -> bool:
     return bool(
         getattr(config, "TWIBOOST_API_KEY", "")
         and getattr(config, "TWIBOOST_API_URL", "")
-        and int(getattr(config, "TWIBOOST_VIEWS_SERVICE_ID", 0) or 0) > 0
     )
 
 
@@ -264,8 +291,8 @@ def boost_real_orders_allowed(settings: dict | None = None, config=cfg) -> bool:
     settings = settings or get_boost_settings(config=config)
     return (
         bool(settings.get("boost_enabled"))
-        and not bool(settings.get("boost_dry_run", True))
-        and bool(settings.get("real_orders_enabled", False))
+        and not bool(getattr(config, "BOOST_DRY_RUN", settings.get("boost_dry_run", True)))
+        and bool(getattr(config, "BOOST_REAL_ORDERS_ENABLED", settings.get("real_orders_enabled", False)))
         and boost_configured(config)
     )
 
@@ -320,16 +347,64 @@ def _normalize_chat_id_value(value: int | str | None) -> str | None:
 
 
 def validate_boost_quantity(value: int | str, config=cfg) -> int:
-    try:
-        quantity = int(str(value).strip())
-    except (TypeError, ValueError):
-        raise ValueError("quantity_must_be_integer")
+    spec = parse_boost_quantity(value, config)
+    if spec["quantity_min"] != spec["quantity_max"]:
+        raise ValueError("quantity_must_be_fixed")
+    return int(spec["quantity_min"])
+
+
+def parse_boost_quantity(value: int | str, config=cfg) -> dict:
+    raw = str(value if value is not None else "").strip()
+    if not raw:
+        raise ValueError("quantity_empty")
+    match = re.fullmatch(r"(\d+)(?:\s*[-–—]\s*(\d+))?", raw)
+    if not match:
+        raise ValueError("quantity_invalid")
+    quantity_min = int(match.group(1))
+    quantity_max = int(match.group(2) or match.group(1))
     max_quantity = int(getattr(config, "BOOST_MAX_QUANTITY", 100000) or 100000)
-    if quantity <= 0:
+    if quantity_min <= 0 or quantity_max <= 0:
         raise ValueError("quantity_must_be_positive")
-    if quantity > max_quantity:
+    if quantity_min > max_quantity or quantity_max > max_quantity:
         raise ValueError("quantity_too_large")
-    return quantity
+    if quantity_max < quantity_min:
+        raise ValueError("quantity_range_reversed")
+    return {
+        "quantity_min": quantity_min,
+        "quantity_max": quantity_max,
+        "quantity_display": str(quantity_min) if quantity_min == quantity_max else f"{quantity_min}–{quantity_max}",
+    }
+
+
+def select_boost_quantity(quantity_min: int, quantity_max: int, rng=None) -> int:
+    rng = rng or random.randint
+    quantity_min = int(quantity_min)
+    quantity_max = int(quantity_max)
+    if quantity_min <= 0 or quantity_max < quantity_min:
+        raise ValueError("quantity_invalid")
+    if quantity_min == quantity_max:
+        return quantity_min
+    return int(rng(quantity_min, quantity_max))
+
+
+def boost_quantity_spec_from_channel(channel: dict, settings: dict | None = None, config=cfg) -> dict:
+    settings = settings or {}
+    quantity_min = channel.get("quantity_min")
+    quantity_max = channel.get("quantity_max")
+    if quantity_min is not None and quantity_max is not None:
+        return parse_boost_quantity(
+            f"{int(quantity_min)}-{int(quantity_max)}" if int(quantity_min) != int(quantity_max) else str(int(quantity_min)),
+            config,
+        )
+    fallback = channel.get("quantity") or settings.get("default_quantity") or getattr(config, "BOOST_DEFAULT_QUANTITY", 500) or 500
+    return parse_boost_quantity(fallback, config)
+
+
+def _service_id_ok(value: int | str | None) -> bool:
+    try:
+        return int(value or 0) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _smm_channel_identifier(channel: dict) -> str:
@@ -475,7 +550,7 @@ def link_tracked_channel_to_smm_channel(
 def add_tracked_channel(
     raw_channel: str,
     owner_id: int | None,
-    quantity: int | None = None,
+    quantity: int | str | None = None,
     service_id: int | str | None = None,
     title: str | None = None,
     note: str | None = None,
@@ -489,7 +564,11 @@ def add_tracked_channel(
     ensure_boost_schema(database)
     normalized = normalize_channel_input(raw_channel)
     now = utc_now()
-    qty = validate_boost_quantity(quantity if quantity is not None else getattr(config, "BOOST_DEFAULT_QUANTITY", 500) or 500, config)
+    quantity_spec = parse_boost_quantity(
+        quantity if quantity is not None else getattr(config, "BOOST_DEFAULT_QUANTITY", 500) or 500,
+        config,
+    )
+    qty = int(quantity_spec["quantity_min"])
     svc = str(service_id or getattr(config, "TWIBOOST_VIEWS_SERVICE_ID", "") or "") or None
     tg_chat_id = _normalize_chat_id_value(snapshot_tg_chat_id if snapshot_tg_chat_id is not None else normalized["tg_chat_id"])
     username = _normalize_username_value(snapshot_username or normalized["username"])
@@ -511,6 +590,9 @@ def add_tracked_channel(
                     username = COALESCE(?, username),
                     title = COALESCE(?, title),
                     quantity = CASE WHEN ? THEN ? ELSE quantity END,
+                    quantity_min = CASE WHEN ? THEN ? ELSE quantity_min END,
+                    quantity_max = CASE WHEN ? THEN ? ELSE quantity_max END,
+                    quantity_display = CASE WHEN ? THEN ? ELSE quantity_display END,
                     service_id = COALESCE(?, service_id),
                     note = COALESCE(?, note),
                     updated_at = ?
@@ -524,6 +606,12 @@ def add_tracked_channel(
                     title,
                     1 if quantity is not None else 0,
                     qty,
+                    1 if quantity is not None else 0,
+                    int(quantity_spec["quantity_min"]),
+                    1 if quantity is not None else 0,
+                    int(quantity_spec["quantity_max"]),
+                    1 if quantity is not None else 0,
+                    quantity_spec["quantity_display"],
                     svc,
                     note,
                     now,
@@ -535,8 +623,8 @@ def add_tracked_channel(
                 """
                 INSERT INTO boost_channels (
                     channel_key, smm_channel_id, owner_id, tg_chat_id, username, title, enabled,
-                    quantity, service_id, note, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    quantity, quantity_min, quantity_max, quantity_display, service_id, note, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     normalized["channel_key"],
@@ -547,6 +635,9 @@ def add_tracked_channel(
                     title,
                     _bool_int(enabled),
                     qty,
+                    int(quantity_spec["quantity_min"]),
+                    int(quantity_spec["quantity_max"]),
+                    quantity_spec["quantity_display"],
                     svc,
                     note,
                     now,
@@ -571,7 +662,7 @@ def add_tracked_channel_from_smm_channel(
     config=cfg,
 ) -> tuple[dict, bool]:
     ensure_boost_schema(database)
-    quantity = validate_boost_quantity(quantity, config)
+    quantity_spec = parse_boost_quantity(quantity, config)
     with _connect(database) as conn:
         existing = _find_existing_for_smm_channel(conn, smm_channel)
     if existing:
@@ -582,7 +673,7 @@ def add_tracked_channel_from_smm_channel(
     channel = add_tracked_channel(
         raw_channel,
         owner_id=owner_id,
-        quantity=quantity,
+        quantity=quantity_spec["quantity_display"],
         service_id=service_id,
         title=smm_channel.get("name") or smm_channel.get("title"),
         note="linked_smm_channel",
@@ -642,13 +733,28 @@ def set_tracked_channel_enabled(channel_id: int, enabled: bool, database=db) -> 
     return get_tracked_channel(channel_id, database)
 
 
-def set_tracked_channel_quantity(channel_id: int, quantity: int, database=db) -> dict | None:
-    quantity = validate_boost_quantity(quantity)
+def set_tracked_channel_quantity(channel_id: int, quantity: int | str, database=db, config=cfg) -> dict | None:
+    quantity_spec = parse_boost_quantity(quantity, config)
     ensure_boost_schema(database)
     with _connect(database) as conn:
         conn.execute(
-            "UPDATE boost_channels SET quantity = ?, updated_at = ? WHERE id = ?",
-            (quantity, utc_now(), int(channel_id)),
+            """
+            UPDATE boost_channels SET
+                quantity = ?,
+                quantity_min = ?,
+                quantity_max = ?,
+                quantity_display = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                int(quantity_spec["quantity_min"]),
+                int(quantity_spec["quantity_min"]),
+                int(quantity_spec["quantity_max"]),
+                quantity_spec["quantity_display"],
+                utc_now(),
+                int(channel_id),
+            ),
         )
         conn.commit()
     return get_tracked_channel(channel_id, database)
@@ -769,7 +875,10 @@ def list_boost_events(
                 c.username AS channel_username,
                 c.tg_chat_id AS channel_tg_chat_id,
                 c.title AS channel_title,
-                c.enabled AS channel_enabled
+                c.enabled AS channel_enabled,
+                c.quantity_min AS channel_quantity_min,
+                c.quantity_max AS channel_quantity_max,
+                c.quantity_display AS channel_quantity_display
             FROM boost_orders o
             LEFT JOIN boost_channels c ON c.id = o.boost_channel_id
             {where}
@@ -833,34 +942,52 @@ def create_boost_event(
     ensure_boost_schema(database)
     now = utc_now()
     with _connect(database) as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO boost_orders (
-                boost_channel_id, tg_chat_id, message_id, event_key, media_group_id,
-                canonical_message_id, event_type, post_url, quantity, service_id,
-                provider_order_id, status, dry_run, reason_code, error, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                int(boost_channel["id"]),
-                boost_channel.get("tg_chat_id"),
-                int(message_id),
-                event_key or f"msg:{int(message_id)}",
-                str(media_group_id) if media_group_id is not None else None,
-                int(canonical_message_id or message_id),
-                event_type or BOOST_EVENT_TYPE_POST,
-                post_url,
-                int(quantity),
-                str(service_id) if service_id is not None else None,
-                str(provider_order_id) if provider_order_id is not None else None,
-                status,
-                _bool_int(dry_run),
-                reason_code,
-                error,
-                now,
-                now,
-            ),
-        )
+        event_key = event_key or f"msg:{int(message_id)}"
+        service_value = str(service_id) if service_id is not None else None
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO boost_orders (
+                    boost_channel_id, tg_chat_id, message_id, event_key, media_group_id,
+                    canonical_message_id, event_type, post_url, quantity, service_id,
+                    provider_order_id, status, dry_run, reason_code, error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(boost_channel["id"]),
+                    boost_channel.get("tg_chat_id"),
+                    int(message_id),
+                    event_key,
+                    str(media_group_id) if media_group_id is not None else None,
+                    int(canonical_message_id or message_id),
+                    event_type or BOOST_EVENT_TYPE_POST,
+                    post_url,
+                    int(quantity),
+                    service_value,
+                    str(provider_order_id) if provider_order_id is not None else None,
+                    status,
+                    _bool_int(dry_run),
+                    reason_code,
+                    error,
+                    now,
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            row = conn.execute(
+                """
+                SELECT * FROM boost_orders
+                WHERE boost_channel_id = ?
+                  AND event_key = ?
+                  AND COALESCE(service_id, '') = COALESCE(?, '')
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (int(boost_channel["id"]), event_key, service_value),
+            ).fetchone()
+            if row:
+                return dict(row)
+            raise
         conn.execute(
             """
             UPDATE boost_channels SET
@@ -884,7 +1011,7 @@ def create_boost_event(
 
 
 async def handle_boost_channel_post_dry_run(message, database=db, config=cfg, client=None) -> dict:
-    """Prepare a dry-run event for a tracked channel post; never sends real orders."""
+    """Prepare a Boost event for a tracked channel post; real orders require the full safety gate."""
     chat = getattr(message, "chat", None)
     if chat is None:
         _log_boost_result("ignored", "no_chat", message=message)
@@ -905,11 +1032,19 @@ async def handle_boost_channel_post_dry_run(message, database=db, config=cfg, cl
         return {"status": "ignored", "reason": "no_message_id", "channel": channel}
 
     settings = get_boost_settings(database, config)
-    quantity = int(channel.get("quantity") or settings.get("default_quantity") or getattr(config, "BOOST_DEFAULT_QUANTITY", 500) or 500)
     service_id = channel.get("service_id") or settings.get("default_service_id") or getattr(config, "TWIBOOST_VIEWS_SERVICE_ID", None)
     event_key = build_boost_event_key(message)
     event_type = infer_boost_event_type(message)
     media_group_id = getattr(message, "media_group_id", None)
+
+    if not settings.get("boost_enabled"):
+        _log_boost_result(BOOST_STATUS_IGNORED, BOOST_REASON_GLOBAL_DISABLED, message=message, channel=channel, event_key=event_key, event_type=event_type, settings=settings)
+        return {"status": BOOST_STATUS_IGNORED, "reason": BOOST_REASON_GLOBAL_DISABLED, "channel": channel}
+
+    if not bool(channel.get("enabled")):
+        _log_boost_result(BOOST_STATUS_IGNORED, BOOST_REASON_CHANNEL_DISABLED, message=message, channel=channel, event_key=event_key, event_type=event_type, settings=settings)
+        return {"status": BOOST_STATUS_IGNORED, "reason": BOOST_REASON_CHANNEL_DISABLED, "channel": channel}
+
     if not event_key:
         _log_boost_result("ignored", "no_event_key", message=message, channel=channel, event_type=event_type, settings=settings)
         return {"status": "ignored", "reason": "no_event_key", "channel": channel}
@@ -919,45 +1054,8 @@ async def handle_boost_channel_post_dry_run(message, database=db, config=cfg, cl
         _log_boost_result("duplicate", "already_has_event", message=message, channel=channel, event=existing, event_key=event_key, event_type=event_type, settings=settings)
         return {"status": "duplicate", "reason": "already_has_event", "channel": channel, "event": existing}
 
-    if not settings.get("boost_enabled"):
-        event = create_boost_event(
-            channel,
-            message_id,
-            None,
-            quantity,
-            service_id,
-            status=BOOST_STATUS_IGNORED,
-            dry_run=True,
-            event_key=event_key,
-            media_group_id=str(media_group_id) if media_group_id is not None else None,
-            canonical_message_id=message_id,
-            event_type=event_type,
-            reason_code=BOOST_REASON_GLOBAL_DISABLED,
-            error=BOOST_REASON_GLOBAL_DISABLED,
-            database=database,
-        )
-        _log_boost_result(BOOST_STATUS_IGNORED, BOOST_REASON_GLOBAL_DISABLED, message=message, channel=channel, event=event, event_key=event_key, event_type=event_type, settings=settings)
-        return {"status": BOOST_STATUS_IGNORED, "reason": BOOST_REASON_GLOBAL_DISABLED, "channel": channel, "event": event}
-
-    if not bool(channel.get("enabled")):
-        event = create_boost_event(
-            channel,
-            message_id,
-            None,
-            quantity,
-            service_id,
-            status=BOOST_STATUS_IGNORED,
-            dry_run=True,
-            event_key=event_key,
-            media_group_id=str(media_group_id) if media_group_id is not None else None,
-            canonical_message_id=message_id,
-            event_type=event_type,
-            reason_code=BOOST_REASON_CHANNEL_DISABLED,
-            error=BOOST_REASON_CHANNEL_DISABLED,
-            database=database,
-        )
-        _log_boost_result(BOOST_STATUS_IGNORED, BOOST_REASON_CHANNEL_DISABLED, message=message, channel=channel, event=event, event_key=event_key, event_type=event_type, settings=settings)
-        return {"status": BOOST_STATUS_IGNORED, "reason": BOOST_REASON_CHANNEL_DISABLED, "channel": channel, "event": event}
+    quantity_spec = boost_quantity_spec_from_channel(channel, settings, config)
+    quantity = select_boost_quantity(quantity_spec["quantity_min"], quantity_spec["quantity_max"])
 
     post_url_result = build_telegram_post_url(channel, message)
 
@@ -968,7 +1066,7 @@ async def handle_boost_channel_post_dry_run(message, database=db, config=cfg, cl
             post_url_result["post_url"],
             quantity,
             service_id,
-            status=BOOST_STATUS_DRY_RUN,
+            status=BOOST_STATUS_IGNORED,
             dry_run=True,
             event_key=event_key,
             media_group_id=str(media_group_id) if media_group_id is not None else None,
@@ -978,34 +1076,85 @@ async def handle_boost_channel_post_dry_run(message, database=db, config=cfg, cl
             error=post_url_result["reason_code"],
             database=database,
         )
-        _log_boost_result(BOOST_STATUS_DRY_RUN, post_url_result["reason_code"], message=message, channel=channel, event=event, event_key=event_key, event_type=event_type, settings=settings)
+        _log_boost_result(BOOST_STATUS_IGNORED, post_url_result["reason_code"], message=message, channel=channel, event=event, event_key=event_key, event_type=event_type, settings=settings)
         return {
-            "status": BOOST_STATUS_DRY_RUN,
+            "status": BOOST_STATUS_IGNORED,
             "reason": post_url_result["reason_code"],
             "event": event,
             "url": post_url_result,
         }
 
     wrapper = client or TwiBoostClientWrapper(config=config)
-    result = await wrapper.create_views_order(post_url_result["post_url"] or "", quantity, service_id, dry_run=True)
+    if not _service_id_ok(service_id):
+        event = create_boost_event(
+            channel,
+            message_id,
+            post_url_result["post_url"],
+            quantity,
+            service_id,
+            status=BOOST_STATUS_IGNORED,
+            dry_run=True,
+            event_key=event_key,
+            media_group_id=str(media_group_id) if media_group_id is not None else None,
+            canonical_message_id=post_url_result["canonical_message_id"] or message_id,
+            event_type=event_type,
+            reason_code=BOOST_REASON_MISSING_SERVICE_ID,
+            error=BOOST_REASON_MISSING_SERVICE_ID,
+            database=database,
+        )
+        _log_boost_result(BOOST_STATUS_IGNORED, BOOST_REASON_MISSING_SERVICE_ID, message=message, channel=channel, event=event, event_key=event_key, event_type=event_type, settings=settings)
+        return {"status": BOOST_STATUS_IGNORED, "reason": BOOST_REASON_MISSING_SERVICE_ID, "event": event, "url": post_url_result}
+
+    if not getattr(wrapper, "api_key", None) or not getattr(wrapper, "api_url", None):
+        event = create_boost_event(
+            channel,
+            message_id,
+            post_url_result["post_url"],
+            quantity,
+            service_id,
+            status=BOOST_STATUS_IGNORED,
+            dry_run=True,
+            event_key=event_key,
+            media_group_id=str(media_group_id) if media_group_id is not None else None,
+            canonical_message_id=post_url_result["canonical_message_id"] or message_id,
+            event_type=event_type,
+            reason_code=BOOST_REASON_TWIBOOST_NOT_CONFIGURED,
+            error=BOOST_REASON_TWIBOOST_NOT_CONFIGURED,
+            database=database,
+        )
+        _log_boost_result(BOOST_STATUS_IGNORED, BOOST_REASON_TWIBOOST_NOT_CONFIGURED, message=message, channel=channel, event=event, event_key=event_key, event_type=event_type, settings=settings)
+        return {"status": BOOST_STATUS_IGNORED, "reason": BOOST_REASON_TWIBOOST_NOT_CONFIGURED, "event": event, "url": post_url_result}
+
+    dry_run = not boost_real_orders_allowed(settings, config)
+    result = await wrapper.create_views_order(post_url_result["post_url"] or "", quantity, service_id, dry_run=dry_run)
+    provider_error = result.get("error")
+    provider_order_id = result.get("order") or result.get("order_id")
+    status = BOOST_STATUS_DRY_RUN if dry_run else BOOST_STATUS_ORDERED
+    reason_code = post_url_result["reason_code"]
+    error = None
+    if provider_error:
+        status = BOOST_STATUS_IGNORED if dry_run else BOOST_STATUS_FAILED
+        reason_code = BOOST_REASON_PROVIDER_ERROR
+        error = str(provider_error)
     event = create_boost_event(
         channel,
         message_id,
         post_url_result["post_url"],
         quantity,
         service_id,
-        status=BOOST_STATUS_DRY_RUN,
-        dry_run=True,
+        status=status,
+        dry_run=dry_run,
         event_key=event_key,
         media_group_id=str(media_group_id) if media_group_id is not None else None,
         canonical_message_id=post_url_result["canonical_message_id"] or message_id,
         event_type=event_type,
-        reason_code=post_url_result["reason_code"],
-        error=None if result.get("would_create_order") else result.get("error"),
+        reason_code=reason_code,
+        provider_order_id=provider_order_id,
+        error=error,
         database=database,
     )
-    _log_boost_result(BOOST_STATUS_DRY_RUN, post_url_result["reason_code"], message=message, channel=channel, event=event, event_key=event_key, event_type=event_type, settings=settings)
-    return {"status": BOOST_STATUS_DRY_RUN, "event": event, "request": result, "url": post_url_result}
+    _log_boost_result(status, reason_code, message=message, channel=channel, event=event, event_key=event_key, event_type=event_type, settings=settings)
+    return {"status": status, "event": event, "request": result, "url": post_url_result}
 
 
 @dataclass
@@ -1068,15 +1217,17 @@ class TwiBoostClientWrapper:
         qty = int(quantity or getattr(self.config, "BOOST_DEFAULT_QUANTITY", 500) or 500)
         svc = int(service_id or self.service_id or 0)
         payload = {"action": "add", "service": svc, "link": post_url, "quantity": qty}
+        configured_for_order = bool(self.api_key and self.api_url and svc > 0)
 
         if dry_run:
             return {
                 "dry_run": True,
-                "would_create_order": True,
-                "configured": self.configured,
+                "would_create_order": configured_for_order,
+                "configured": configured_for_order,
                 "request": payload,
+                **({} if configured_for_order else {"error": "twiboost_not_configured"}),
             }
-        if not self.configured or svc <= 0:
+        if not configured_for_order:
             return {"error": "twiboost_not_configured", "configured": False}
         return await self._request(payload)
 

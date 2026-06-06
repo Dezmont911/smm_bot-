@@ -101,8 +101,8 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context.user_data, {})
 
     def test_boost_label_helpers_hide_machine_codes(self):
-        self.assertEqual(ui._boost_status_label("dry_run"), "тестовый режим")
-        self.assertEqual(ui._boost_status_label("ignored"), "пропущен")
+        self.assertEqual(ui._boost_status_label("dry_run"), "тестовый заказ")
+        self.assertEqual(ui._boost_status_label("ignored"), "пропущено")
         self.assertEqual(ui._boost_reason_label("no_public_post_url"), "нет публичной ссылки на пост")
         self.assertEqual(ui._boost_reason_label("boost_channel_disabled"), "Boost для канала выключен")
         self.assertEqual(ui._boost_event_type_label("media_group"), "альбом")
@@ -138,9 +138,30 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Журнал Boost", captured["text"])
         self.assertIn("@boosted", captured["text"])
-        self.assertIn("фото", captured["text"])
-        self.assertIn("тестовый режим", captured["text"])
+        self.assertIn("Фото", captured["text"])
+        self.assertIn(ui._boost_status_label("dry_run"), captured["text"])
         self.assertIn("https://t.me/boosted/42", captured["text"])
+
+    def test_boost_event_line_does_not_duplicate_reason_without_post_url(self):
+        event = {
+            "id": 8,
+            "boost_channel_id": 7,
+            "channel_username": "channel",
+            "message_id": 2040,
+            "event_type": "media_group",
+            "quantity": 650,
+            "status": "ignored",
+            "reason_code": "no_public_post_url",
+            "error": "no_public_post_url",
+            "post_url": None,
+            "created_at": "2026-06-06T17:56:00+00:00",
+        }
+
+        line = ui._boost_event_line(event)
+        reason = ui._boost_reason_label("no_public_post_url")
+
+        self.assertEqual(line.count(reason), 1)
+        self.assertNotIn("no_public_post_url", line)
 
     async def test_channel_settings_has_no_boost_buttons(self):
         captured = {}
