@@ -629,7 +629,7 @@ async def screen_channel_card(qm, context: ContextTypes.DEFAULT_TYPE, handle: st
         ],
         [
             InlineKeyboardButton("🔗 Референсы",  callback_data=f"ui:ch_refs:{channel_id}"),
-            InlineKeyboardButton("✍️ Черновик",   callback_data=f"ui:ch_draft:{channel_id}"),
+            InlineKeyboardButton("✍️ Черновики",  callback_data=f"ui:ch_draft:{channel_id}"),
         ],
         [InlineKeyboardButton("📜 История публикаций", callback_data=f"ui:ch_history:{channel_id}")],
         [InlineKeyboardButton("🧹 Очистить буфер",    callback_data=f"ui:ch_clear:{channel_id}")],
@@ -662,17 +662,13 @@ async def screen_create_post(qm, context: ContextTypes.DEFAULT_TYPE, handle: str
         f"📬 В очереди: <b>{ready}</b>\n"
         f"✍️ Черновиков: <b>{drafts}</b>\n"
         f"🔗 Доноров: <b>{len(refs)}</b>\n\n"
-        f"Выбери источник поста."
+        f"Выбери, как подготовить новый пост."
     )
     kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✍️ Вручную", callback_data=f"ui:draft_new:{channel_id}"),
-            InlineKeyboardButton("✍️ Черновики", callback_data=f"ui:ch_draft:{channel_id}"),
-        ],
-        [
-            InlineKeyboardButton("🔗 Референсы", callback_data=f"ui:ch_refs:{channel_id}"),
-            InlineKeyboardButton("🤖 Генерация ИИ", callback_data=f"ui:ch_generate:{channel_id}"),
-        ],
+        [InlineKeyboardButton("✍️ Вручную", callback_data=f"ui:draft_new:{channel_id}")],
+        [InlineKeyboardButton("🔗 Из референсов", callback_data=f"ui:ch_refs:{channel_id}")],
+        [InlineKeyboardButton("🤖 Генерация ИИ", callback_data=f"ui:ch_generate:{channel_id}")],
+        [InlineKeyboardButton("📝 Черновики", callback_data=f"ui:ch_draft:{channel_id}")],
         [InlineKeyboardButton("◀️ К каналу", callback_data=f"ui:ch:{channel_id}")],
     ])
     await _answer_or_send(qm, text, kb)
@@ -1806,7 +1802,7 @@ async def screen_drafts(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
 
     if not drafts:
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Создать пост", callback_data=f"ui:draft_new:{handle}")],
+            [InlineKeyboardButton("➕ Создать пост", callback_data=f"ui:ch_create:{handle}")],
             [InlineKeyboardButton("↩️ Назад к каналу", callback_data=f"ui:ch:{handle}")],
         ])
         await _answer_or_send(qm, f"🔥 <b>Черновики</b> — {name}\n\nПусто. «➕ Создать пост» → пришли текст, фото или видео.", kb)
@@ -1831,7 +1827,7 @@ async def screen_drafts(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
     # Массовые действия снизу
     foot = []
     foot.append([InlineKeyboardButton(f"📤 Все в очередь ({len(drafts)})", callback_data=f"ui:draft_qall:{handle}")])
-    foot.append([InlineKeyboardButton("➕ Создать пост", callback_data=f"ui:draft_new:{handle}")])
+    foot.append([InlineKeyboardButton("➕ Создать пост", callback_data=f"ui:ch_create:{handle}")])
     foot.append([InlineKeyboardButton("🗑 Очистить все черновики", callback_data=f"ui:draft_clear:{handle}")])
     foot.append([InlineKeyboardButton("↩️ Назад к каналу", callback_data=f"ui:ch:{handle}")])
     await msg_obj.reply_text("⬇️ Действия с черновиками:", reply_markup=InlineKeyboardMarkup(foot))
