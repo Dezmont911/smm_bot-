@@ -66,12 +66,12 @@ class Poster:
         self.bot = bot
 
     # --------------------------------------------------------
-    # Главный метод — вызывается планировщиком каждый час
+    # Главный метод — вызывается планировщиком каждую минуту
     # --------------------------------------------------------
 
     async def tick(self):
         """
-        Основной цикл постера — вызывается каждый час.
+        Основной цикл постера — вызывается каждую минуту.
         Проверяет каждый канал: нужно ли сейчас постить?
         """
         if self.bot is None:
@@ -79,22 +79,46 @@ class Poster:
             return
 
         now_utc = datetime.now(timezone.utc)
-        current_hour = now_utc.hour
+        current_minute = now_utc.hour * 60 + now_utc.minute
         current_weekday_msk = (now_utc + timedelta(hours=3)).weekday()
 
         channels = self._load_active_channels()
         if not channels:
             return
 
-        logger.debug(f"Постер: проверяю {len(channels)} каналов | час UTC: {current_hour}")
+        logger.debug(
+            f"Постер: проверяю {len(channels)} каналов | "
+            f"время UTC: {now_utc.strftime('%H:%M')}"
+        )
 
         for channel in channels:
             try:
-                await self._process_channel(channel, current_hour, current_weekday_msk)
+                await self._process_channel(channel, current_minute, current_weekday_msk)
             except Exception as e:
                 logger.error(f"Ошибка постера для {channel['channel_id']}: {e}")
 
-    async def _process_channel(self, channel: dict, current_hour: int, current_weekday_msk: int):
+    @staticmethod
+    def _schedule_entry_to_utc_min(value) -> int | None:
+        if isinstance(value, int) and 0 <= value <= 23:
+            return value * 60
+        if isinstance(value, str):
+            import re
+            m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?", value.strip())
+            if m:
+                hour = int(m.group(1))
+                minute = int(m.group(2) or 0)
+                if 0 <= hour <= 23 and 0 <= minute <= 59:
+                    return hour * 60 + minute
+        return None
+
+    @classmethod
+    def _schedule_utc_minutes(cls, entries) -> set[int]:
+        return {
+            m for m in (cls._schedule_entry_to_utc_min(v) for v in (entries or []))
+            if m is not None
+        }
+
+    async def _process_channel(self, channel: dict, current_minute: int, current_weekday_msk: int):
         """
         Обрабатывает один канал: постит если пришло время,
         проверяет буфер и при необходимости запускает генерацию.
@@ -108,9 +132,9 @@ class Poster:
         # Проверяем: пришло ли время для этого канала?
         # ВАЖНО: пустое/отсутствующее расписание = автопубликации НЕТ (без дефолт-часов!).
         # Иначе канал без post_times_utc постил по дефолту, хотя «расписание не задано».
-        post_hours = channel.get("post_times_utc") or []
-        if not post_hours or current_hour not in post_hours:
-            return  # расписание не задано или не наш час — пропускаем
+        post_minutes = self._schedule_utc_minutes(channel.get("post_times_utc") or [])
+        if not post_minutes or current_minute not in post_minutes:
+            return  # расписание не задано или не наш слот — пропускаем
 
         schedule_days = channel.get("schedule_days")
         if isinstance(schedule_days, list):

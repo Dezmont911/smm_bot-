@@ -189,8 +189,67 @@ def _save_channel(ch: dict):
     path.write_text(json.dumps(ch, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _schedule_entry_to_utc_min(value) -> int | None:
+    if isinstance(value, int) and 0 <= value <= 23:
+        return value * 60
+    if isinstance(value, str):
+        m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?", value.strip())
+        if m:
+            hour = int(m.group(1))
+            minute = int(m.group(2) or 0)
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                return hour * 60 + minute
+    return None
+
+
+def _schedule_utc_minutes(entries) -> list[int]:
+    minutes = {
+        m for m in (_schedule_entry_to_utc_min(v) for v in (entries or []))
+        if m is not None
+    }
+    return sorted(minutes)
+
+
+def _schedule_entries_from_utc_minutes(minutes) -> list:
+    result = []
+    for minute_of_day in sorted({int(m) % 1440 for m in minutes}):
+        hour, minute = divmod(minute_of_day, 60)
+        result.append(hour if minute == 0 else f"{hour:02d}:{minute:02d}")
+    return result
+
+
+def _schedule_msk_minutes(entries) -> list[int]:
+    return sorted((m + 180) % 1440 for m in _schedule_utc_minutes(entries))
+
+
+def _format_schedule_minutes(minutes, sep: str = " · ") -> str:
+    return sep.join(f"{m // 60:02d}:{m % 60:02d}" for m in sorted(minutes))
+
+
+def _parse_schedule_msk_text(text: str) -> list[int]:
+    raw = re.split(r"[\s,]+", (text or "").strip())
+    tokens = [t for t in raw if t]
+    if not tokens:
+        raise ValueError
+    minutes = []
+    for token in tokens:
+        m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?", token)
+        if not m:
+            raise ValueError
+        hour = int(m.group(1))
+        minute = int(m.group(2) or 0)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+        minutes.append(hour * 60 + minute)
+    return sorted(set(minutes))
+
+
+def _msk_minutes_to_utc_entries(minutes) -> list:
+    return _schedule_entries_from_utc_minutes((int(m) - 180) % 1440 for m in minutes)
+
+
 def _utc_to_msk(hours: list[int]) -> list[int]:
-    return sorted((h + 3) % 24 for h in hours)
+    return sorted((h + 3) % 24 for h in hours if isinstance(h, int))
 
 
 _SCHEDULE_DAY_LABELS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
@@ -597,11 +656,11 @@ async def screen_channel_card(qm, context: ContextTypes.DEFAULT_TYPE, handle: st
     buf_icon = {"ok": "✅", "emergency": "⚠️", "critical": "🚨"}.get(status, "🔴")
 
     # Расписание (без дефолта: пустое = «не задано»)
-    msk_hours = _utc_to_msk(sorted(ch.get("post_times_utc", [])))
+    msk_minutes = _schedule_msk_minutes(ch.get("post_times_utc", []))
     if paused:
         schedule_str = "⏸ остановлено"
-    elif msk_hours:
-        schedule_str = " · ".join(f"{h:02d}:00" for h in msk_hours) + " МСК"
+    elif msk_minutes:
+        schedule_str = _format_schedule_minutes(msk_minutes) + " МСК"
     else:
         schedule_str = "не задано"
 
@@ -710,11 +769,11 @@ async def screen_channel_settings(qm, context: ContextTypes.DEFAULT_TYPE, handle
     posts_day  = ch.get("daily_posts_count", "?")
     post_len   = ch.get("post_length", "100–200 слов")
 
-    msk_hours  = _utc_to_msk(sorted(ch.get("post_times_utc", [])))
+    msk_minutes = _schedule_msk_minutes(ch.get("post_times_utc", []))
     if ch.get("schedule_disabled"):
         sched_str = "⏸ остановлено"
-    elif msk_hours:
-        sched_str = " ".join(f"{h:02d}" for h in msk_hours) + " МСК"
+    elif msk_minutes:
+        sched_str = _format_schedule_minutes(msk_minutes, sep=" ") + " МСК"
     else:
         sched_str = "не задано"
 
@@ -806,8 +865,8 @@ async def screen_schedule(qm, context, handle: str):
         return
 
     channel_id = ch["channel_id"]
-    utc_hours  = sorted(ch.get("post_times_utc", []))
-    msk_active = sorted((h + 3) % 24 for h in utc_hours)
+    utc_minutes = _schedule_utc_minutes(ch.get("post_times_utc", []))
+    msk_active = sorted((m + 180) % 1440 for m in utc_minutes)
     days = _schedule_days(ch)
     days_str = _schedule_days_label(days)
 
@@ -818,7 +877,7 @@ async def screen_schedule(qm, context, handle: str):
     time_buttons = []
     row = []
     for h in POPULAR:
-        label = f"✅ {h:02d}:00" if h in msk_active else f"🕐 {h:02d}:00"
+        label = f"✅ {h:02d}:00" if h * 60 in msk_active else f"🕐 {h:02d}:00"
         row.append(InlineKeyboardButton(label, callback_data=f"ui:ch_sched_toggle:{channel_id}:{h}"))
         if len(row) == 4:
             time_buttons.append(row)
@@ -826,7 +885,7 @@ async def screen_schedule(qm, context, handle: str):
     if row:
         time_buttons.append(row)
 
-    active_str = " · ".join(f"{h:02d}:00" for h in msk_active) or "не задано"
+    active_str = _format_schedule_minutes(msk_active) or "не задано"
 
     sched_rows = [
         [InlineKeyboardButton(f"📆 Дни: {days_str}", callback_data=f"ui:ch_sched_days:{channel_id}")],
@@ -929,15 +988,15 @@ async def action_schedule_toggle(qm, context, handle: str, hour_msk: int):
     if not ch:
         return
 
-    utc_hours = set(ch.get("post_times_utc", []))
-    hour_utc  = (hour_msk - 3) % 24
+    utc_minutes = set(_schedule_utc_minutes(ch.get("post_times_utc", [])))
+    utc_minute = ((hour_msk - 3) % 24) * 60
 
-    if hour_utc in utc_hours:
-        utc_hours.discard(hour_utc)
+    if utc_minute in utc_minutes:
+        utc_minutes.discard(utc_minute)
     else:
-        utc_hours.add(hour_utc)
+        utc_minutes.add(utc_minute)
 
-    ch["post_times_utc"] = sorted(utc_hours)
+    ch["post_times_utc"] = _schedule_entries_from_utc_minutes(utc_minutes)
     # Пустое расписание = автопубликация выключена (пауза); есть время = снимаем паузу
     if ch["post_times_utc"]:
         ch.pop("schedule_disabled", None)
@@ -2518,7 +2577,7 @@ async def action_rss_ai_confirm(qm, context: ContextTypes.DEFAULT_TYPE, handle: 
 # (кнопка «🔄 Подобрать тему заново» → action_rederive_topic).
 EDITABLE_FIELDS = {
     "tone":        ("🎨 Тон общения",         "Введи желаемый тон\nНапример: <i>дружелюбный, с юмором, без снобизма</i>", "text"),
-    "schedule":    ("📅 Расписание",          "Введи часы публикации МСК через пробел\nНапример: <code>9 12 16 20</code>",  "schedule"),
+    "schedule":    ("📅 Расписание",          "Введи время публикации МСК через пробел\nНапример: <code>08:14 09:20</code> или <code>9 12 16</code>",  "schedule"),
     "posts_count": ("🔢 Постов в день",       "Введи число постов в день (от 1 до 30)\nНапример: <code>10</code>",         "int"),
     "post_length": ("📏 Длина поста",         "Введи диапазон слов\nНапример: <code>100–200 слов</code>",                  "text"),
     "images":      ("🖼 Источник картинок",   None,  "images_menu"),
@@ -2782,36 +2841,34 @@ async def handle_settings_text_input(update: Update, context: ContextTypes.DEFAU
 
     elif field == "schedule":
         try:
-            hours_msk = sorted(set(int(h) for h in text.split() if h.isdigit() and 0 <= int(h) <= 23))
-            if not hours_msk:
-                raise ValueError
-            ch["post_times_utc"] = sorted((h - 3) % 24 for h in hours_msk)
+            minutes_msk = _parse_schedule_msk_text(text)
+            ch["post_times_utc"] = _msk_minutes_to_utc_entries(minutes_msk)
             ch.pop("schedule_disabled", None)
-            times_str = " ".join(f"{h:02d}:00" for h in hours_msk)
+            times_str = _format_schedule_minutes(minutes_msk, sep=" ")
             success_msg = f"✅ Расписание: <b>{times_str} МСК</b>"
         except Exception:
             await update.message.reply_text(
-                "⚠️ Неверный формат. Напиши часы через пробел, например: <code>9 12 16 20</code>",
+                "⚠️ Неверный формат. Вводи время в формате <code>HH:MM</code> через пробел.\n"
+                "Например: <code>08:14 09:20</code> или <code>9 12 16</code>",
                 parse_mode=ParseMode.HTML,
             )
             return True
 
     elif field == "schedule_add":
         try:
-            new_hours_msk = [int(h) for h in text.split() if h.isdigit() and 0 <= int(h) <= 23]
-            if not new_hours_msk:
-                raise ValueError
-            existing_utc = set(ch.get("post_times_utc", [6, 9, 13, 17]))
-            for h in new_hours_msk:
-                existing_utc.add((h - 3) % 24)
-            ch["post_times_utc"] = sorted(existing_utc)
+            new_minutes_msk = _parse_schedule_msk_text(text)
+            existing_utc = set(_schedule_utc_minutes(ch.get("post_times_utc", [])))
+            for minute_msk in new_minutes_msk:
+                existing_utc.add((minute_msk - 180) % 1440)
+            ch["post_times_utc"] = _schedule_entries_from_utc_minutes(existing_utc)
             ch.pop("schedule_disabled", None)
-            all_msk = sorted((h + 3) % 24 for h in ch["post_times_utc"])
-            times_str = " · ".join(f"{h:02d}:00" for h in all_msk)
+            all_msk = _schedule_msk_minutes(ch["post_times_utc"])
+            times_str = _format_schedule_minutes(all_msk)
             success_msg = f"✅ Расписание обновлено: <b>{times_str} МСК</b>"
         except Exception:
             await update.message.reply_text(
-                "⚠️ Неверный формат. Напиши часы через пробел, например: <code>8</code> или <code>8 14 22</code>",
+                "⚠️ Неверный формат. Вводи время в формате <code>HH:MM</code> через пробел.\n"
+                "Например: <code>08:14</code>, <code>09:20</code> или <code>8 14 22</code>",
                 parse_mode=ParseMode.HTML,
             )
             return True
@@ -2968,8 +3025,8 @@ def _get_field_display(ch: dict, field: str) -> str:
     if field == "posts_count": return str(ch.get("daily_posts_count", "?"))
     if field == "post_length": return ch.get("post_length", "—")
     if field == "schedule":
-        msk = _utc_to_msk(ch.get("post_times_utc", [6, 9, 13, 17]))
-        return " ".join(str(h) for h in msk) + " МСК"
+        msk = _schedule_msk_minutes(ch.get("post_times_utc", [6, 9, 13, 17]))
+        return _format_schedule_minutes(msk, sep=" ") + " МСК"
     if field == "rss":
         n = len(ch.get("rss_sources", []))
         return f"{n} источников"
@@ -3973,8 +4030,8 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         await query.edit_message_text(
             f"➕ <b>Добавить своё время</b>\n\n"
-            f"Напиши час или несколько через пробел (МСК):\n"
-            f"Например: <code>8</code> или <code>8 14 22</code>",
+            f"Напиши время или несколько слотов через пробел (МСК):\n"
+            f"Например: <code>08:14</code>, <code>09:20</code> или <code>8 14 22</code>",
             reply_markup=kb, parse_mode=ParseMode.HTML,
         )
 

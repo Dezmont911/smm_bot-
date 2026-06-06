@@ -1265,7 +1265,7 @@ async def handle_export_confirm(update: Update, context: ContextTypes.DEFAULT_TY
         f"RSS-источников: {len(rss_urls)}\n"
         f"Вечнозелёных тем: {len(channel_card['evergreen_topics'])}\n\n"
         f"⏸ Автопубликация <b>выключена</b> — включи расписание:\n"
-        f"<code>/schedule {channel_id} 09 12 16 20</code>\n\n"
+        f"<code>/schedule {channel_id} 08:14 09:20</code>\n\n"
         f"⚠️ Добавь бота администратором в <code>{channel_id}</code>",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("⚡ Сгенерировать первые посты", callback_data=f"ui:ch_generate:{channel_id}")],
@@ -1492,7 +1492,7 @@ async def handle_username_confirm(update: Update, context: ContextTypes.DEFAULT_
         + meta_line
         + (f"Лент подобрано: {len(rss_urls)}\n" if card.get("channel_type") == "content" else "") +
         f"\n⏸ Автопубликация <b>выключена</b> — включи расписание:\n"
-        f"<code>/schedule {handle} 09 12 16 20</code>\n"
+        f"<code>/schedule {handle} 08:14 09:20</code>\n"
         f"\n⚠️ Чтобы бот мог публиковать, добавь его администратором в <code>{handle}</code>",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("⚡ Сгенерировать первые посты", callback_data=f"ui:ch_generate:{handle}")],
@@ -3700,7 +3700,7 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Использование:
       /schedule                        — расписание всех каналов
       /schedule @channel               — расписание конкретного канала
-      /schedule @channel 09 12 16 20   — установить часы (МСК)
+      /schedule @channel 08:14 09:20   — установить время (МСК)
       /schedule @channel off           — только РСЯ (без таймера)
       /schedule @channel on            — вернуть расписание
     """
@@ -3710,11 +3710,54 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
     channels = _channels_for(update)
 
-    def utc_to_msk(hours: list) -> list:
-        return sorted([(h + 3) % 24 for h in hours])
+    def entry_to_utc_min(value):
+        if isinstance(value, int) and 0 <= value <= 23:
+            return value * 60
+        if isinstance(value, str):
+            m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?", value.strip())
+            if m:
+                hour = int(m.group(1))
+                minute = int(m.group(2) or 0)
+                if 0 <= hour <= 23 and 0 <= minute <= 59:
+                    return hour * 60 + minute
+        return None
 
-    def msk_to_utc(hours: list) -> list:
-        return sorted([(h - 3) % 24 for h in hours])
+    def utc_minutes(entries: list) -> list:
+        return sorted({
+            m for m in (entry_to_utc_min(v) for v in (entries or []))
+            if m is not None
+        })
+
+    def utc_to_msk_minutes(entries: list) -> list:
+        return sorted((m + 180) % 1440 for m in utc_minutes(entries))
+
+    def format_minutes(minutes: list, sep: str = ", ") -> str:
+        return sep.join(f"{m // 60:02d}:{m % 60:02d}" for m in sorted(minutes))
+
+    def parse_msk_minutes(values: list[str]) -> list[int]:
+        minutes = []
+        for value in values:
+            for token in re.split(r"[\s,]+", value.strip()):
+                if not token:
+                    continue
+                m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?", token)
+                if not m:
+                    raise ValueError("вводи время в формате HH:MM, например 08:14 09:20")
+                hour = int(m.group(1))
+                minute = int(m.group(2) or 0)
+                if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                    raise ValueError(f"время вне диапазона: {token}")
+                minutes.append(hour * 60 + minute)
+        if not minutes:
+            raise ValueError("не указано время")
+        return sorted(set(minutes))
+
+    def utc_entries_from_msk_minutes(minutes: list[int]) -> list:
+        result = []
+        for minute_of_day in sorted({(int(m) - 180) % 1440 for m in minutes}):
+            hour, minute = divmod(minute_of_day, 60)
+            result.append(hour if minute == 0 else f"{hour:02d}:{minute:02d}")
+        return result
 
     DEFAULT_UTC = [6, 9, 13, 17]  # 09, 12, 16, 20 МСК
 
@@ -3729,9 +3772,9 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ch.get("schedule_disabled", False):
                 lines.append(f"• {cid} — <b>⏸ только РСЯ</b>")
             else:
-                msk = utc_to_msk(ch.get("post_times_utc", DEFAULT_UTC))
-                lines.append(f"• {cid} — {', '.join(f'{h:02d}:00' for h in msk)} МСК")
-        lines.append("\n<i>/schedule @channel 09 12 16 20 — изменить</i>")
+                msk = utc_to_msk_minutes(ch.get("post_times_utc", DEFAULT_UTC))
+                lines.append(f"• {cid} — {format_minutes(msk)} МСК")
+        lines.append("\n<i>/schedule @channel 08:14 09:20 — изменить</i>")
         lines.append("<i>/schedule @channel off — только РСЯ</i>")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
         return
@@ -3755,12 +3798,12 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"<i>Включить расписание: /schedule {handle} on</i>"
             )
         else:
-            msk = utc_to_msk(channel.get("post_times_utc", DEFAULT_UTC))
-            times = ", ".join(f"{h:02d}:00" for h in msk)
+            msk = utc_to_msk_minutes(channel.get("post_times_utc", DEFAULT_UTC))
+            times = format_minutes(msk)
             text = (
                 f"📅 <b>{handle}</b>\n"
                 f"Расписание: {times} МСК\n\n"
-                f"<i>Изменить: /schedule {handle} 09 12 16 20</i>\n"
+                f"<i>Изменить: /schedule {handle} 08:14 09:20</i>\n"
                 f"<i>Отключить: /schedule {handle} off</i>"
             )
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
@@ -3772,8 +3815,8 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "on":
         channel.pop("schedule_disabled", None)
         save_channel_card(channel)
-        msk = utc_to_msk(channel.get("post_times_utc", DEFAULT_UTC))
-        times = ", ".join(f"{h:02d}:00" for h in msk)
+        msk = utc_to_msk_minutes(channel.get("post_times_utc", DEFAULT_UTC))
+        times = format_minutes(msk)
         await update.message.reply_text(
             f"✅ Расписание включено для <b>{handle}</b>\n"
             f"Публикации в: {times} МСК",
@@ -3792,19 +3835,13 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- Установить часы публикаций (МСК) ---
+    # --- Установить время публикаций (МСК) ---
     try:
-        hours_msk = []
-        for arg in args[1:]:
-            h = int(arg)
-            if not 0 <= h <= 23:
-                raise ValueError(f"Час вне диапазона: {h}")
-            hours_msk.append(h)
-        hours_msk = sorted(set(hours_msk))
-        channel["post_times_utc"] = msk_to_utc(hours_msk)
+        minutes_msk = parse_msk_minutes(args[1:])
+        channel["post_times_utc"] = utc_entries_from_msk_minutes(minutes_msk)
         channel.pop("schedule_disabled", None)
         save_channel_card(channel)
-        times = ", ".join(f"{h:02d}:00" for h in hours_msk)
+        times = format_minutes(minutes_msk)
         await update.message.reply_text(
             f"✅ Расписание обновлено для <b>{handle}</b>\n"
             f"Публикации в: <b>{times} МСК</b>",
@@ -3814,7 +3851,8 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"❌ Ошибка: {e}\n\n"
             f"Примеры:\n"
-            f"  /schedule {handle} 09 12 16 20\n"
+            f"  /schedule {handle} 08:14 09:20\n"
+            f"  /schedule {handle} 9 12 16\n"
             f"  /schedule {handle} off\n"
             f"  /schedule {handle} on",
         )
@@ -4293,10 +4331,10 @@ def main():
             job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 300},
         )
 
-        # Постер — каждый час проверяет все каналы
+        # Постер — раз в минуту проверяет все каналы (поддерживает HH:MM-слоты)
         scheduler.add_job(
             poster.tick,
-            CronTrigger(minute=0),
+            CronTrigger(second=0),
             id="poster_tick",
             name="Публикация постов",
             misfire_grace_time=300,
@@ -4402,7 +4440,7 @@ def main():
 
         logger.success(
             "Планировщик запущен:\n"
-            "  • Постер: каждый час (:00)\n"
+            "  • Постер: каждую минуту (поддерживает HH:MM)\n"
             "  • Ступенчатая генерация: каждый час (:30), только просевшие каналы\n"
             "  • Авто-добор референсов: каждый час (:45), только если буфер < 5\n"
             "  • Чистка awaiting_media: каждый час (:15)\n"
