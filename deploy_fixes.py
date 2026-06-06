@@ -118,6 +118,7 @@ CREATE TABLE IF NOT EXISTS boost_settings (
 CREATE TABLE IF NOT EXISTS boost_channels (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     channel_key TEXT UNIQUE NOT NULL,
+    smm_channel_id TEXT,
     owner_id INTEGER,
     tg_chat_id TEXT,
     username TEXT,
@@ -156,6 +157,18 @@ CREATE TABLE IF NOT EXISTS boost_orders (
 CREATE INDEX IF NOT EXISTS idx_boost_channels_enabled ON boost_channels(enabled);
 CREATE INDEX IF NOT EXISTS idx_boost_orders_channel ON boost_orders(boost_channel_id, message_id);
 ''')
+channel_cols = [r[1] for r in conn.execute("PRAGMA table_info(boost_channels)").fetchall()]
+if 'smm_channel_id' not in channel_cols:
+    conn.execute("ALTER TABLE boost_channels ADD COLUMN smm_channel_id TEXT")
+    print("  ✅ boost_channels.smm_channel_id добавлена")
+else:
+    print("  ℹ️  boost_channels.smm_channel_id уже есть")
+conn.execute(
+    '''
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_boost_channels_smm_channel
+    ON boost_channels(smm_channel_id)
+    '''
+)
 order_cols = [r[1] for r in conn.execute("PRAGMA table_info(boost_orders)").fetchall()]
 for _col, _definition in (
     ('event_key', 'TEXT'),

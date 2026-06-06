@@ -7,6 +7,7 @@ from database import Database
 from boost_manager import (
     TwiBoostClientWrapper,
     add_tracked_channel,
+    add_tracked_channel_from_smm_channel,
     build_telegram_post_url,
     boost_configured,
     boost_real_orders_allowed,
@@ -18,6 +19,7 @@ from boost_manager import (
     save_boost_settings,
     set_tracked_channel_enabled,
     set_tracked_channel_quantity,
+    validate_boost_quantity,
 )
 
 
@@ -78,6 +80,93 @@ class BoostManagerTests(unittest.TestCase):
         self.assertEqual(updated["quantity"], 900)
         self.assertTrue(deleted)
         self.assertEqual(list_tracked_channels(self.db), [])
+
+    def test_duplicate_manual_add_does_not_reset_existing_settings(self):
+        added = add_tracked_channel("@Boosted", owner_id=100, quantity=900, database=self.db, config=self.config)
+        set_tracked_channel_enabled(added["id"], True, self.db)
+
+        duplicate = add_tracked_channel("https://t.me/boosted", owner_id=100, database=self.db, config=self.config)
+        channels = list_tracked_channels(self.db)
+
+        self.assertEqual(len(channels), 1)
+        self.assertEqual(duplicate["id"], added["id"])
+        self.assertEqual(duplicate["quantity"], 900)
+        self.assertTrue(bool(duplicate["enabled"]))
+
+    def test_add_from_existing_smm_channel_links_snapshot(self):
+        smm_channel = {
+            "channel_id": "@boosted",
+            "name": "Boosted Channel",
+            "username": "boosted",
+            "chat_id_num": -1001234567890,
+            "owner_id": 100,
+            "active": True,
+        }
+
+        added, created = add_tracked_channel_from_smm_channel(
+            smm_channel,
+            owner_id=smm_channel["owner_id"],
+            quantity=750,
+            database=self.db,
+            config=self.config,
+        )
+
+        self.assertTrue(created)
+        self.assertEqual(added["smm_channel_id"], "@boosted")
+        self.assertEqual(added["owner_id"], 100)
+        self.assertEqual(added["tg_chat_id"], "-1001234567890")
+        self.assertEqual(added["username"], "boosted")
+        self.assertEqual(added["title"], "Boosted Channel")
+        self.assertEqual(added["quantity"], 750)
+        self.assertFalse(bool(added["enabled"]))
+
+    def test_add_from_existing_smm_channel_links_existing_manual_record(self):
+        manual = add_tracked_channel("@boosted", owner_id=100, quantity=900, database=self.db, config=self.config)
+        smm_channel = {
+            "channel_id": "@boosted",
+            "name": "Boosted Channel",
+            "username": "boosted",
+            "chat_id_num": -1001234567890,
+            "owner_id": 100,
+            "active": True,
+        }
+
+        linked, created = add_tracked_channel_from_smm_channel(
+            smm_channel,
+            owner_id=smm_channel["owner_id"],
+            quantity=750,
+            database=self.db,
+            config=self.config,
+        )
+        channels = list_tracked_channels(self.db)
+
+        self.assertFalse(created)
+        self.assertEqual(len(channels), 1)
+        self.assertEqual(linked["id"], manual["id"])
+        self.assertEqual(linked["smm_channel_id"], "@boosted")
+        self.assertEqual(linked["quantity"], 900)
+
+    def test_quantity_validation_rejects_bad_values_without_mutating(self):
+        added = add_tracked_channel("@boosted", owner_id=100, quantity=900, database=self.db, config=self.config)
+
+        for bad in ("abc", "0", "-5", "100001"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    set_tracked_channel_quantity(added["id"], bad, self.db)
+
+        current = list_tracked_channels(self.db)[0]
+        self.assertEqual(current["quantity"], 900)
+        self.assertEqual(validate_boost_quantity("100000"), 100000)
+
+    def test_manual_external_inputs_still_work(self):
+        username = add_tracked_channel("@external", owner_id=100, quantity=100, database=self.db, config=self.config)
+        link = add_tracked_channel("https://t.me/external2", owner_id=100, quantity=200, database=self.db, config=self.config)
+        private = add_tracked_channel("-1001234567890", owner_id=100, quantity=300, database=self.db, config=self.config)
+
+        self.assertEqual(username["username"], "external")
+        self.assertEqual(link["username"], "external2")
+        self.assertEqual(private["tg_chat_id"], "-1001234567890")
+        self.assertIsNone(private["smm_channel_id"])
 
     def test_required_env_vars_are_namespaced(self):
         names = required_env_vars()

@@ -73,6 +73,7 @@ def ensure_boost_schema(database=db):
             CREATE TABLE IF NOT EXISTS boost_channels (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 channel_key TEXT UNIQUE NOT NULL,
+                smm_channel_id TEXT,
                 owner_id INTEGER,
                 tg_chat_id TEXT,
                 username TEXT,
@@ -150,6 +151,15 @@ def _ensure_boost_order_columns(conn):
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_boost_orders_unique_event
             ON boost_orders(boost_channel_id, event_key, COALESCE(service_id, ''))
+        """
+    )
+    channel_columns = {row["name"] for row in conn.execute("PRAGMA table_info(boost_channels)").fetchall()}
+    if "smm_channel_id" not in channel_columns:
+        conn.execute("ALTER TABLE boost_channels ADD COLUMN smm_channel_id TEXT")
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_boost_channels_smm_channel
+            ON boost_channels(smm_channel_id)
         """
     )
 
@@ -284,6 +294,108 @@ def normalize_channel_input(raw: str) -> dict:
     return {"channel_key": f"user:{username}", "tg_chat_id": None, "username": username}
 
 
+def validate_boost_quantity(value: int | str, config=cfg) -> int:
+    try:
+        quantity = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise ValueError("quantity_must_be_integer")
+    max_quantity = int(getattr(config, "BOOST_MAX_QUANTITY", 100000) or 100000)
+    if quantity <= 0:
+        raise ValueError("quantity_must_be_positive")
+    if quantity > max_quantity:
+        raise ValueError("quantity_too_large")
+    return quantity
+
+
+def _smm_channel_identifier(channel: dict) -> str:
+    chat_id = channel.get("chat_id_num")
+    if chat_id:
+        return str(chat_id)
+    username = channel.get("username") or channel.get("channel_id")
+    if username:
+        return str(username)
+    raise ValueError("smm_channel_missing_identifier")
+
+
+def _smm_channel_username(channel: dict) -> str | None:
+    value = channel.get("username") or channel.get("channel_id")
+    if not value:
+        return None
+    value = str(value).strip().lstrip("@")
+    if not value or not re.fullmatch(r"[A-Za-z0-9_]{4,64}", value):
+        return None
+    return value.lower()
+
+
+def _smm_channel_chat_id(channel: dict) -> str | None:
+    chat_id = channel.get("chat_id_num")
+    return str(chat_id) if chat_id else None
+
+
+def _find_existing_for_smm_channel(conn, channel: dict):
+    smm_channel_id = channel.get("channel_id")
+    if smm_channel_id:
+        row = conn.execute(
+            "SELECT * FROM boost_channels WHERE smm_channel_id = ?",
+            (str(smm_channel_id),),
+        ).fetchone()
+        if row:
+            return row
+    keys = []
+    chat_id = _smm_channel_chat_id(channel)
+    username = _smm_channel_username(channel)
+    if chat_id:
+        keys.append(f"chat:{chat_id}")
+    if username:
+        keys.append(f"user:{username}")
+    for key in keys:
+        row = conn.execute("SELECT * FROM boost_channels WHERE channel_key = ?", (key,)).fetchone()
+        if row:
+            return row
+    return None
+
+
+def find_tracked_channel_for_smm_channel(smm_channel: dict, database=db) -> dict | None:
+    ensure_boost_schema(database)
+    with _connect(database) as conn:
+        row = _find_existing_for_smm_channel(conn, smm_channel)
+    return _row_to_dict(row)
+
+
+def link_tracked_channel_to_smm_channel(
+    boost_channel_id: int,
+    smm_channel: dict,
+    owner_id: int | None,
+    database=db,
+) -> dict | None:
+    ensure_boost_schema(database)
+    now = utc_now()
+    with _connect(database) as conn:
+        conn.execute(
+            """
+            UPDATE boost_channels SET
+                smm_channel_id = COALESCE(smm_channel_id, ?),
+                owner_id = COALESCE(owner_id, ?),
+                tg_chat_id = COALESCE(tg_chat_id, ?),
+                username = COALESCE(username, ?),
+                title = COALESCE(title, ?),
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                smm_channel.get("channel_id"),
+                owner_id,
+                _smm_channel_chat_id(smm_channel),
+                _smm_channel_username(smm_channel),
+                smm_channel.get("name") or smm_channel.get("title"),
+                now,
+                int(boost_channel_id),
+            ),
+        )
+        conn.commit()
+    return get_tracked_channel(boost_channel_id, database)
+
+
 def add_tracked_channel(
     raw_channel: str,
     owner_id: int | None,
@@ -292,14 +404,20 @@ def add_tracked_channel(
     title: str | None = None,
     note: str | None = None,
     enabled: bool = False,
+    smm_channel_id: str | None = None,
+    snapshot_username: str | None = None,
+    snapshot_tg_chat_id: int | str | None = None,
     database=db,
     config=cfg,
 ) -> dict:
     ensure_boost_schema(database)
     normalized = normalize_channel_input(raw_channel)
     now = utc_now()
-    qty = int(quantity or getattr(config, "BOOST_DEFAULT_QUANTITY", 500) or 500)
+    qty = validate_boost_quantity(quantity if quantity is not None else getattr(config, "BOOST_DEFAULT_QUANTITY", 500) or 500, config)
     svc = str(service_id or getattr(config, "TWIBOOST_VIEWS_SERVICE_ID", "") or "") or None
+    tg_chat_id = str(snapshot_tg_chat_id) if snapshot_tg_chat_id is not None else normalized["tg_chat_id"]
+    username = snapshot_username or normalized["username"]
+    username = str(username).lstrip("@").lower() if username else None
     with _connect(database) as conn:
         existing = conn.execute(
             "SELECT * FROM boost_channels WHERE channel_key = ?",
@@ -309,16 +427,21 @@ def add_tracked_channel(
             conn.execute(
                 """
                 UPDATE boost_channels SET
+                    smm_channel_id = COALESCE(?, smm_channel_id),
                     owner_id = ?, tg_chat_id = ?, username = ?, title = COALESCE(?, title),
-                    quantity = ?, service_id = ?, note = COALESCE(?, note),
+                    quantity = CASE WHEN ? THEN ? ELSE quantity END,
+                    service_id = COALESCE(?, service_id),
+                    note = COALESCE(?, note),
                     updated_at = ?
                 WHERE channel_key = ?
                 """,
                 (
+                    smm_channel_id,
                     owner_id,
-                    normalized["tg_chat_id"],
-                    normalized["username"],
+                    tg_chat_id,
+                    username,
                     title,
+                    1 if quantity is not None else 0,
                     qty,
                     svc,
                     note,
@@ -330,15 +453,16 @@ def add_tracked_channel(
             conn.execute(
                 """
                 INSERT INTO boost_channels (
-                    channel_key, owner_id, tg_chat_id, username, title, enabled,
+                    channel_key, smm_channel_id, owner_id, tg_chat_id, username, title, enabled,
                     quantity, service_id, note, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     normalized["channel_key"],
+                    smm_channel_id,
                     owner_id,
-                    normalized["tg_chat_id"],
-                    normalized["username"],
+                    tg_chat_id,
+                    username,
                     title,
                     _bool_int(enabled),
                     qty,
@@ -354,6 +478,41 @@ def add_tracked_channel(
             (normalized["channel_key"],),
         ).fetchone()
     return _row_to_dict(row)
+
+
+def add_tracked_channel_from_smm_channel(
+    smm_channel: dict,
+    owner_id: int | None,
+    quantity: int | str,
+    service_id: int | str | None = None,
+    enabled: bool = False,
+    database=db,
+    config=cfg,
+) -> tuple[dict, bool]:
+    ensure_boost_schema(database)
+    quantity = validate_boost_quantity(quantity, config)
+    with _connect(database) as conn:
+        existing = _find_existing_for_smm_channel(conn, smm_channel)
+    if existing:
+        linked = link_tracked_channel_to_smm_channel(existing["id"], smm_channel, owner_id, database)
+        return linked or _row_to_dict(existing), False
+
+    raw_channel = _smm_channel_identifier(smm_channel)
+    channel = add_tracked_channel(
+        raw_channel,
+        owner_id=owner_id,
+        quantity=quantity,
+        service_id=service_id,
+        title=smm_channel.get("name") or smm_channel.get("title"),
+        note="linked_smm_channel",
+        enabled=enabled,
+        smm_channel_id=smm_channel.get("channel_id"),
+        snapshot_username=_smm_channel_username(smm_channel),
+        snapshot_tg_chat_id=_smm_channel_chat_id(smm_channel),
+        database=database,
+        config=config,
+    )
+    return channel, True
 
 
 def list_tracked_channels(database=db, include_disabled: bool = True) -> list[dict]:
@@ -402,13 +561,12 @@ def set_tracked_channel_enabled(channel_id: int, enabled: bool, database=db) -> 
 
 
 def set_tracked_channel_quantity(channel_id: int, quantity: int, database=db) -> dict | None:
-    if int(quantity) <= 0:
-        raise ValueError("quantity_must_be_positive")
+    quantity = validate_boost_quantity(quantity)
     ensure_boost_schema(database)
     with _connect(database) as conn:
         conn.execute(
             "UPDATE boost_channels SET quantity = ?, updated_at = ? WHERE id = ?",
-            (int(quantity), utc_now(), int(channel_id)),
+            (quantity, utc_now(), int(channel_id)),
         )
         conn.commit()
     return get_tracked_channel(channel_id, database)

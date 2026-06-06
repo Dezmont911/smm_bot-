@@ -194,6 +194,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS boost_channels (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     channel_key TEXT UNIQUE NOT NULL,
+                    smm_channel_id TEXT,
                     owner_id INTEGER,
                     tg_chat_id TEXT,
                     username TEXT,
@@ -233,6 +234,9 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_boost_channels_enabled
                     ON boost_channels(enabled);
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_boost_channels_smm_channel
+                    ON boost_channels(smm_channel_id);
 
                 CREATE INDEX IF NOT EXISTS idx_boost_orders_channel
                     ON boost_orders(boost_channel_id, message_id);

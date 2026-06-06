@@ -62,6 +62,7 @@ from ui import (
     screen_main,
     handle_settings_text_input,
     handle_boost_text_input,
+    _clear_boost_pending,
     handle_img_test_input,
     MENU_KEYBOARD,
     admin_default_rsy_enabled,
@@ -3301,6 +3302,13 @@ async def handle_image_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await screen_admin_costs_custom(update.message, context, update.message.text or "")
         return
 
+    # Проверка «Меню» — отдельный handler, но на всякий случай
+    text_msg = update.message.text or ""
+    if text_msg.strip() in ("☰ Меню", "☰Меню", "Меню"):
+        _clear_boost_pending(context)
+        await screen_main(update.message, context)
+        return
+
     if await handle_boost_text_input(update, context):
         return
 
@@ -3309,12 +3317,6 @@ async def handle_image_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         handled = await handle_settings_text_input(update, context)
         if handled:
             return
-
-    # Проверка «Меню» — отдельный handler, но на всякий случай
-    text_msg = update.message.text or ""
-    if text_msg.strip() in ("☰ Меню", "☰Меню", "Меню"):
-        await screen_main(update.message, context)
-        return
 
     # Проверяем тест генерации картинок
     if await handle_img_test_input(update, context):
