@@ -3439,11 +3439,21 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     try:
         boost_result = await handle_boost_channel_post_dry_run(message)
-        if boost_result.get("status") == "dry_run":
-            logger.info(
-                f"Boost dry-run event created | message_id={message.message_id} "
-                f"event_id={boost_result['event']['id']}"
-            )
+        boost_channel = boost_result.get("channel") or {}
+        boost_event = boost_result.get("event") or {}
+        logger.info(
+            "Boost channel_post result | status={} reason={} boost_channel_id={} "
+            "smm_channel_id={} username={} chat_id={} message_id={} media_group_id={} event_id={}",
+            boost_result.get("status"),
+            boost_result.get("reason"),
+            boost_channel.get("id"),
+            boost_channel.get("smm_channel_id"),
+            boost_channel.get("username") or getattr(message.chat, "username", None),
+            boost_channel.get("tg_chat_id") or getattr(message.chat, "id", None),
+            message.message_id,
+            getattr(message, "media_group_id", None),
+            boost_event.get("id"),
+        )
     except Exception as e:
         logger.exception(f"Boost dry-run handler failed: {e}")
 

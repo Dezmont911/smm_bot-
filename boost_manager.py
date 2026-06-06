@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from loguru import logger
+
 from config import cfg
 from database import db
 
@@ -24,8 +26,13 @@ BOOST_STATUS_ENABLED = "enabled"
 BOOST_STATUS_IGNORED = "ignored"
 BOOST_EVENT_TYPE_MEDIA_GROUP = "media_group"
 BOOST_EVENT_TYPE_POST = "post"
+BOOST_EVENT_TYPE_TEXT = "text"
+BOOST_EVENT_TYPE_PHOTO = "photo"
+BOOST_EVENT_TYPE_VIDEO = "video"
 BOOST_REASON_NO_PUBLIC_POST_URL = "no_public_post_url"
 BOOST_REASON_PUBLIC_USERNAME = "public_username"
+BOOST_REASON_GLOBAL_DISABLED = "boost_global_disabled"
+BOOST_REASON_CHANNEL_DISABLED = "boost_channel_disabled"
 
 REQUIRED_ENV_VARS = (
     "TWIBOOST_API_KEY",
@@ -294,6 +301,24 @@ def normalize_channel_input(raw: str) -> dict:
     return {"channel_key": f"user:{username}", "tg_chat_id": None, "username": username}
 
 
+def _normalize_username_value(value: str | None) -> str | None:
+    if not value:
+        return None
+    value = str(value).strip().lstrip("@").lower()
+    if not re.fullmatch(r"[a-z0-9_]{4,64}", value):
+        return None
+    return value
+
+
+def _normalize_chat_id_value(value: int | str | None) -> str | None:
+    if value is None:
+        return None
+    value = str(value).strip()
+    if not re.fullmatch(r"-?\d+", value):
+        return None
+    return value
+
+
 def validate_boost_quantity(value: int | str, config=cfg) -> int:
     try:
         quantity = int(str(value).strip())
@@ -319,21 +344,21 @@ def _smm_channel_identifier(channel: dict) -> str:
 
 def _smm_channel_username(channel: dict) -> str | None:
     value = channel.get("username") or channel.get("channel_id")
-    if not value:
-        return None
-    value = str(value).strip().lstrip("@")
-    if not value or not re.fullmatch(r"[A-Za-z0-9_]{4,64}", value):
-        return None
-    return value.lower()
+    return _normalize_username_value(value)
 
 
 def _smm_channel_chat_id(channel: dict) -> str | None:
     chat_id = channel.get("chat_id_num")
-    return str(chat_id) if chat_id else None
+    return _normalize_chat_id_value(chat_id)
 
 
-def _find_existing_for_smm_channel(conn, channel: dict):
-    smm_channel_id = channel.get("channel_id")
+def _find_existing_for_identity(
+    conn,
+    channel_key: str | None = None,
+    smm_channel_id: str | None = None,
+    tg_chat_id: int | str | None = None,
+    username: str | None = None,
+):
     if smm_channel_id:
         row = conn.execute(
             "SELECT * FROM boost_channels WHERE smm_channel_id = ?",
@@ -341,24 +366,75 @@ def _find_existing_for_smm_channel(conn, channel: dict):
         ).fetchone()
         if row:
             return row
-    keys = []
-    chat_id = _smm_channel_chat_id(channel)
-    username = _smm_channel_username(channel)
-    if chat_id:
-        keys.append(f"chat:{chat_id}")
-    if username:
-        keys.append(f"user:{username}")
-    for key in keys:
-        row = conn.execute("SELECT * FROM boost_channels WHERE channel_key = ?", (key,)).fetchone()
+
+    if channel_key:
+        row = conn.execute("SELECT * FROM boost_channels WHERE channel_key = ?", (channel_key,)).fetchone()
         if row:
             return row
+
+    normalized_chat_id = _normalize_chat_id_value(tg_chat_id)
+    if normalized_chat_id:
+        for query, value in (
+            ("SELECT * FROM boost_channels WHERE tg_chat_id = ?", normalized_chat_id),
+            ("SELECT * FROM boost_channels WHERE channel_key = ?", f"chat:{normalized_chat_id}"),
+        ):
+            row = conn.execute(query, (value,)).fetchone()
+            if row:
+                return row
+
+    normalized_username = _normalize_username_value(username)
+    if normalized_username:
+        for query, value in (
+            ("SELECT * FROM boost_channels WHERE username = ?", normalized_username),
+            ("SELECT * FROM boost_channels WHERE channel_key = ?", f"user:{normalized_username}"),
+        ):
+            row = conn.execute(query, (value,)).fetchone()
+            if row:
+                return row
+
     return None
+
+
+def _find_existing_for_smm_channel(conn, channel: dict):
+    smm_channel_id = channel.get("channel_id")
+    chat_id = _smm_channel_chat_id(channel)
+    username = _smm_channel_username(channel)
+    primary_key = f"chat:{chat_id}" if chat_id else f"user:{username}" if username else None
+    return _find_existing_for_identity(
+        conn,
+        channel_key=primary_key,
+        smm_channel_id=str(smm_channel_id) if smm_channel_id else None,
+        tg_chat_id=chat_id,
+        username=username,
+    )
 
 
 def find_tracked_channel_for_smm_channel(smm_channel: dict, database=db) -> dict | None:
     ensure_boost_schema(database)
     with _connect(database) as conn:
         row = _find_existing_for_smm_channel(conn, smm_channel)
+    return _row_to_dict(row)
+
+
+def find_tracked_channel_for_input(
+    raw_channel: str,
+    smm_channel_id: str | None = None,
+    snapshot_username: str | None = None,
+    snapshot_tg_chat_id: int | str | None = None,
+    database=db,
+) -> dict | None:
+    ensure_boost_schema(database)
+    normalized = normalize_channel_input(raw_channel)
+    username = _normalize_username_value(snapshot_username or normalized["username"])
+    tg_chat_id = _normalize_chat_id_value(snapshot_tg_chat_id if snapshot_tg_chat_id is not None else normalized["tg_chat_id"])
+    with _connect(database) as conn:
+        row = _find_existing_for_identity(
+            conn,
+            channel_key=normalized["channel_key"],
+            smm_channel_id=smm_channel_id,
+            tg_chat_id=tg_chat_id,
+            username=username,
+        )
     return _row_to_dict(row)
 
 
@@ -376,9 +452,9 @@ def link_tracked_channel_to_smm_channel(
             UPDATE boost_channels SET
                 smm_channel_id = COALESCE(smm_channel_id, ?),
                 owner_id = COALESCE(owner_id, ?),
-                tg_chat_id = COALESCE(tg_chat_id, ?),
-                username = COALESCE(username, ?),
-                title = COALESCE(title, ?),
+                tg_chat_id = COALESCE(?, tg_chat_id),
+                username = COALESCE(?, username),
+                title = COALESCE(?, title),
                 updated_at = ?
             WHERE id = ?
             """,
@@ -415,25 +491,30 @@ def add_tracked_channel(
     now = utc_now()
     qty = validate_boost_quantity(quantity if quantity is not None else getattr(config, "BOOST_DEFAULT_QUANTITY", 500) or 500, config)
     svc = str(service_id or getattr(config, "TWIBOOST_VIEWS_SERVICE_ID", "") or "") or None
-    tg_chat_id = str(snapshot_tg_chat_id) if snapshot_tg_chat_id is not None else normalized["tg_chat_id"]
-    username = snapshot_username or normalized["username"]
-    username = str(username).lstrip("@").lower() if username else None
+    tg_chat_id = _normalize_chat_id_value(snapshot_tg_chat_id if snapshot_tg_chat_id is not None else normalized["tg_chat_id"])
+    username = _normalize_username_value(snapshot_username or normalized["username"])
     with _connect(database) as conn:
-        existing = conn.execute(
-            "SELECT * FROM boost_channels WHERE channel_key = ?",
-            (normalized["channel_key"],),
-        ).fetchone()
+        existing = _find_existing_for_identity(
+            conn,
+            channel_key=normalized["channel_key"],
+            smm_channel_id=smm_channel_id,
+            tg_chat_id=tg_chat_id,
+            username=username,
+        )
         if existing:
             conn.execute(
                 """
                 UPDATE boost_channels SET
                     smm_channel_id = COALESCE(?, smm_channel_id),
-                    owner_id = ?, tg_chat_id = ?, username = ?, title = COALESCE(?, title),
+                    owner_id = COALESCE(owner_id, ?),
+                    tg_chat_id = COALESCE(?, tg_chat_id),
+                    username = COALESCE(?, username),
+                    title = COALESCE(?, title),
                     quantity = CASE WHEN ? THEN ? ELSE quantity END,
                     service_id = COALESCE(?, service_id),
                     note = COALESCE(?, note),
                     updated_at = ?
-                WHERE channel_key = ?
+                WHERE id = ?
                 """,
                 (
                     smm_channel_id,
@@ -446,7 +527,7 @@ def add_tracked_channel(
                     svc,
                     note,
                     now,
-                    normalized["channel_key"],
+                    int(existing["id"]),
                 ),
             )
         else:
@@ -474,8 +555,8 @@ def add_tracked_channel(
             )
         conn.commit()
         row = conn.execute(
-            "SELECT * FROM boost_channels WHERE channel_key = ?",
-            (normalized["channel_key"],),
+            "SELECT * FROM boost_channels WHERE id = ?",
+            (int(existing["id"]) if existing else int(conn.execute("SELECT last_insert_rowid()").fetchone()[0]),),
         ).fetchone()
     return _row_to_dict(row)
 
@@ -534,18 +615,19 @@ def get_tracked_channel(channel_id: int, database=db) -> dict | None:
 
 def find_tracked_channel(chat_id: int | str | None = None, username: str | None = None, database=db) -> dict | None:
     ensure_boost_schema(database)
-    keys = []
-    if username:
-        keys.append(f"user:{str(username).lstrip('@').lower()}")
-    if chat_id is not None:
-        keys.append(f"chat:{chat_id}")
-    if not keys:
+    username = _normalize_username_value(username)
+    chat_id = _normalize_chat_id_value(chat_id)
+    if not username and not chat_id:
         return None
     with _connect(database) as conn:
-        for key in keys:
-            row = conn.execute("SELECT * FROM boost_channels WHERE channel_key = ?", (key,)).fetchone()
-            if row:
-                return dict(row)
+        row = _find_existing_for_identity(
+            conn,
+            channel_key=f"user:{username}" if username else f"chat:{chat_id}" if chat_id else None,
+            tg_chat_id=chat_id,
+            username=username,
+        )
+        if row:
+            return dict(row)
     return None
 
 
@@ -592,6 +674,16 @@ def build_boost_event_key(message) -> str | None:
     if media_group_id:
         return f"mg:{media_group_id}"
     return f"msg:{message_id}"
+
+
+def infer_boost_event_type(message) -> str:
+    if _message_value(message, "media_group_id", None):
+        return BOOST_EVENT_TYPE_MEDIA_GROUP
+    if _message_value(message, "video", None):
+        return BOOST_EVENT_TYPE_VIDEO
+    if _message_value(message, "photo", None):
+        return BOOST_EVENT_TYPE_PHOTO
+    return BOOST_EVENT_TYPE_TEXT
 
 
 def build_telegram_post_url(channel: dict | None, message) -> dict:
@@ -651,6 +743,74 @@ def get_boost_event_by_key(
             (int(boost_channel_id), event_key, str(service_id) if service_id is not None else None),
         ).fetchone()
     return _row_to_dict(row)
+
+
+def list_boost_events(
+    limit: int = 10,
+    boost_channel_id: int | None = None,
+    database=db,
+) -> list[dict]:
+    ensure_boost_schema(database)
+    limit = max(1, min(int(limit or 10), 100))
+    params: list[Any] = []
+    where = ""
+    if boost_channel_id is not None:
+        where = "WHERE o.boost_channel_id = ?"
+        params.append(int(boost_channel_id))
+    params.append(limit)
+    with _connect(database) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT
+                o.*,
+                c.channel_key,
+                c.smm_channel_id,
+                c.owner_id,
+                c.username AS channel_username,
+                c.tg_chat_id AS channel_tg_chat_id,
+                c.title AS channel_title,
+                c.enabled AS channel_enabled
+            FROM boost_orders o
+            LEFT JOIN boost_channels c ON c.id = o.boost_channel_id
+            {where}
+            ORDER BY o.id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _log_boost_result(
+    status: str,
+    reason: str | None,
+    message=None,
+    channel: dict | None = None,
+    event: dict | None = None,
+    event_key: str | None = None,
+    event_type: str | None = None,
+    settings: dict | None = None,
+):
+    chat = getattr(message, "chat", None) if message is not None else None
+    logger.info(
+        "Boost event | status={} reason={} boost_channel_id={} smm_channel_id={} "
+        "username={} chat_id={} message_id={} media_group_id={} event_key={} event_type={} "
+        "enabled={} global_enabled={} dry_run={} event_id={}",
+        status,
+        reason,
+        channel.get("id") if channel else None,
+        channel.get("smm_channel_id") if channel else None,
+        (channel.get("username") if channel else None) or (getattr(chat, "username", None) if chat else None),
+        (channel.get("tg_chat_id") if channel else None) or (getattr(chat, "id", None) if chat else None),
+        getattr(message, "message_id", None) if message is not None else None,
+        getattr(message, "media_group_id", None) if message is not None else None,
+        event_key,
+        event_type,
+        bool(channel.get("enabled")) if channel else None,
+        bool(settings.get("boost_enabled")) if settings else None,
+        bool(settings.get("boost_dry_run", True)) if settings else True,
+        event.get("id") if event else None,
+    )
 
 
 def create_boost_event(
@@ -725,39 +885,80 @@ def create_boost_event(
 
 async def handle_boost_channel_post_dry_run(message, database=db, config=cfg, client=None) -> dict:
     """Prepare a dry-run event for a tracked channel post; never sends real orders."""
-    settings = get_boost_settings(database, config)
-    if not settings.get("boost_enabled"):
-        return {"status": "ignored", "reason": "boost_disabled"}
-
     chat = getattr(message, "chat", None)
     if chat is None:
+        _log_boost_result("ignored", "no_chat", message=message)
         return {"status": "ignored", "reason": "no_chat"}
+
     channel = find_tracked_channel(
         chat_id=getattr(chat, "id", None),
         username=getattr(chat, "username", None),
         database=database,
     )
     if not channel:
+        _log_boost_result("ignored", "not_tracked", message=message)
         return {"status": "ignored", "reason": "not_tracked"}
-    if not bool(channel.get("enabled")):
-        return {"status": "ignored", "reason": "channel_disabled", "channel": channel}
 
     message_id = int(getattr(message, "message_id", 0) or 0)
     if not message_id:
+        _log_boost_result("ignored", "no_message_id", message=message, channel=channel)
         return {"status": "ignored", "reason": "no_message_id", "channel": channel}
 
+    settings = get_boost_settings(database, config)
     quantity = int(channel.get("quantity") or settings.get("default_quantity") or getattr(config, "BOOST_DEFAULT_QUANTITY", 500) or 500)
     service_id = channel.get("service_id") or settings.get("default_service_id") or getattr(config, "TWIBOOST_VIEWS_SERVICE_ID", None)
     event_key = build_boost_event_key(message)
+    event_type = infer_boost_event_type(message)
+    media_group_id = getattr(message, "media_group_id", None)
     if not event_key:
+        _log_boost_result("ignored", "no_event_key", message=message, channel=channel, event_type=event_type, settings=settings)
         return {"status": "ignored", "reason": "no_event_key", "channel": channel}
 
     existing = get_boost_event_by_key(channel["id"], event_key, service_id, database)
     if existing:
+        _log_boost_result("duplicate", "already_has_event", message=message, channel=channel, event=existing, event_key=event_key, event_type=event_type, settings=settings)
         return {"status": "duplicate", "reason": "already_has_event", "channel": channel, "event": existing}
 
-    media_group_id = getattr(message, "media_group_id", None)
-    event_type = BOOST_EVENT_TYPE_MEDIA_GROUP if media_group_id else BOOST_EVENT_TYPE_POST
+    if not settings.get("boost_enabled"):
+        event = create_boost_event(
+            channel,
+            message_id,
+            None,
+            quantity,
+            service_id,
+            status=BOOST_STATUS_IGNORED,
+            dry_run=True,
+            event_key=event_key,
+            media_group_id=str(media_group_id) if media_group_id is not None else None,
+            canonical_message_id=message_id,
+            event_type=event_type,
+            reason_code=BOOST_REASON_GLOBAL_DISABLED,
+            error=BOOST_REASON_GLOBAL_DISABLED,
+            database=database,
+        )
+        _log_boost_result(BOOST_STATUS_IGNORED, BOOST_REASON_GLOBAL_DISABLED, message=message, channel=channel, event=event, event_key=event_key, event_type=event_type, settings=settings)
+        return {"status": BOOST_STATUS_IGNORED, "reason": BOOST_REASON_GLOBAL_DISABLED, "channel": channel, "event": event}
+
+    if not bool(channel.get("enabled")):
+        event = create_boost_event(
+            channel,
+            message_id,
+            None,
+            quantity,
+            service_id,
+            status=BOOST_STATUS_IGNORED,
+            dry_run=True,
+            event_key=event_key,
+            media_group_id=str(media_group_id) if media_group_id is not None else None,
+            canonical_message_id=message_id,
+            event_type=event_type,
+            reason_code=BOOST_REASON_CHANNEL_DISABLED,
+            error=BOOST_REASON_CHANNEL_DISABLED,
+            database=database,
+        )
+        _log_boost_result(BOOST_STATUS_IGNORED, BOOST_REASON_CHANNEL_DISABLED, message=message, channel=channel, event=event, event_key=event_key, event_type=event_type, settings=settings)
+        return {"status": BOOST_STATUS_IGNORED, "reason": BOOST_REASON_CHANNEL_DISABLED, "channel": channel, "event": event}
+
     post_url_result = build_telegram_post_url(channel, message)
 
     if not post_url_result["ok"]:
@@ -777,6 +978,7 @@ async def handle_boost_channel_post_dry_run(message, database=db, config=cfg, cl
             error=post_url_result["reason_code"],
             database=database,
         )
+        _log_boost_result(BOOST_STATUS_DRY_RUN, post_url_result["reason_code"], message=message, channel=channel, event=event, event_key=event_key, event_type=event_type, settings=settings)
         return {
             "status": BOOST_STATUS_DRY_RUN,
             "reason": post_url_result["reason_code"],
@@ -802,6 +1004,7 @@ async def handle_boost_channel_post_dry_run(message, database=db, config=cfg, cl
         error=None if result.get("would_create_order") else result.get("error"),
         database=database,
     )
+    _log_boost_result(BOOST_STATUS_DRY_RUN, post_url_result["reason_code"], message=message, channel=channel, event=event, event_key=event_key, event_type=event_type, settings=settings)
     return {"status": BOOST_STATUS_DRY_RUN, "event": event, "request": result, "url": post_url_result}
 
 

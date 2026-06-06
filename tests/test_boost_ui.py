@@ -100,6 +100,48 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(query.answers, [("Уже добавлен в Boost.", False)])
         self.assertEqual(context.user_data, {})
 
+    def test_boost_label_helpers_hide_machine_codes(self):
+        self.assertEqual(ui._boost_status_label("dry_run"), "тестовый режим")
+        self.assertEqual(ui._boost_status_label("ignored"), "пропущен")
+        self.assertEqual(ui._boost_reason_label("no_public_post_url"), "нет публичной ссылки на пост")
+        self.assertEqual(ui._boost_reason_label("boost_channel_disabled"), "Boost для канала выключен")
+        self.assertEqual(ui._boost_event_type_label("media_group"), "альбом")
+
+    async def test_boost_events_screen_shows_latest_events(self):
+        captured = {}
+        events = [
+            {
+                "id": 3,
+                "boost_channel_id": 7,
+                "channel_username": "boosted",
+                "channel_tg_chat_id": "-100123",
+                "channel_title": "Boosted",
+                "message_id": 42,
+                "event_type": "photo",
+                "quantity": 500,
+                "status": "dry_run",
+                "reason_code": "public_username",
+                "error": None,
+                "post_url": "https://t.me/boosted/42",
+                "created_at": "2026-06-07T01:02:03+00:00",
+            }
+        ]
+
+        async def fake_answer_or_send(qm, text, kb):
+            captured["text"] = text
+            captured["kb"] = kb
+
+        with patch.object(ui.accounts, "is_superadmin", return_value=True), \
+                patch.object(ui, "list_boost_events", return_value=events), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
+            await ui.screen_boost_events(FakeQuery(100), SimpleNamespace(user_data={}))
+
+        self.assertIn("Журнал Boost", captured["text"])
+        self.assertIn("@boosted", captured["text"])
+        self.assertIn("фото", captured["text"])
+        self.assertIn("тестовый режим", captured["text"])
+        self.assertIn("https://t.me/boosted/42", captured["text"])
+
     async def test_channel_settings_has_no_boost_buttons(self):
         captured = {}
         channel = {

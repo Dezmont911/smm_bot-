@@ -14,6 +14,7 @@ from boost_manager import (
     delete_tracked_channel,
     get_boost_settings,
     handle_boost_channel_post_dry_run,
+    list_boost_events,
     list_tracked_channels,
     required_env_vars,
     save_boost_settings,
@@ -144,7 +145,65 @@ class BoostManagerTests(unittest.TestCase):
         self.assertEqual(len(channels), 1)
         self.assertEqual(linked["id"], manual["id"])
         self.assertEqual(linked["smm_channel_id"], "@boosted")
+        self.assertEqual(linked["tg_chat_id"], "-1001234567890")
+        self.assertEqual(linked["title"], "Boosted Channel")
         self.assertEqual(linked["quantity"], 900)
+
+    def test_smm_first_then_external_username_does_not_duplicate(self):
+        smm_channel = {
+            "channel_id": "@boosted",
+            "name": "Boosted Channel",
+            "username": "boosted",
+            "chat_id_num": -1001234567890,
+            "owner_id": 100,
+            "active": True,
+        }
+        added, created = add_tracked_channel_from_smm_channel(
+            smm_channel,
+            owner_id=smm_channel["owner_id"],
+            quantity=750,
+            database=self.db,
+            config=self.config,
+        )
+
+        duplicate = add_tracked_channel("@boosted", owner_id=100, database=self.db, config=self.config)
+        duplicate_link = add_tracked_channel("https://t.me/Boosted", owner_id=100, database=self.db, config=self.config)
+        channels = list_tracked_channels(self.db)
+
+        self.assertTrue(created)
+        self.assertEqual(len(channels), 1)
+        self.assertEqual(duplicate["id"], added["id"])
+        self.assertEqual(duplicate_link["id"], added["id"])
+        self.assertEqual(channels[0]["channel_key"], "chat:-1001234567890")
+        self.assertEqual(channels[0]["username"], "boosted")
+        self.assertEqual(channels[0]["smm_channel_id"], "@boosted")
+
+    def test_external_first_then_smm_backfills_snapshot_without_duplicate(self):
+        manual = add_tracked_channel("@boosted", owner_id=100, quantity=900, database=self.db, config=self.config)
+        smm_channel = {
+            "channel_id": "@boosted",
+            "name": "Boosted Channel",
+            "username": "boosted",
+            "chat_id_num": -1001234567890,
+            "owner_id": 100,
+            "active": True,
+        }
+
+        linked, created = add_tracked_channel_from_smm_channel(
+            smm_channel,
+            owner_id=smm_channel["owner_id"],
+            quantity=750,
+            database=self.db,
+            config=self.config,
+        )
+        channels = list_tracked_channels(self.db)
+
+        self.assertFalse(created)
+        self.assertEqual(len(channels), 1)
+        self.assertEqual(linked["id"], manual["id"])
+        self.assertEqual(linked["tg_chat_id"], "-1001234567890")
+        self.assertEqual(linked["username"], "boosted")
+        self.assertEqual(linked["title"], "Boosted Channel")
 
     def test_quantity_validation_rejects_bad_values_without_mutating(self):
         added = add_tracked_channel("@boosted", owner_id=100, quantity=900, database=self.db, config=self.config)
@@ -226,15 +285,17 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["event"]["post_url"], "https://t.me/boosted/42")
         self.assertEqual(result["event"]["event_key"], "msg:42")
         self.assertEqual(result["event"]["canonical_message_id"], 42)
-        self.assertEqual(result["event"]["event_type"], "post")
+        self.assertEqual(result["event"]["event_type"], "text")
         self.assertEqual(result["event"]["reason_code"], "public_username")
         self.assertEqual(result["event"]["quantity"], 500)
 
     async def test_untracked_or_disabled_or_global_off_is_ignored(self):
+        add_tracked_channel("@boosted", owner_id=100, enabled=True, database=self.db, config=self.config)
         self.assertEqual(
             (await handle_boost_channel_post_dry_run(self._message(), self.db, self.config))["reason"],
-            "boost_disabled",
+            "boost_global_disabled",
         )
+        self.assertEqual(self._count_events(), 1)
 
         save_boost_settings({"boost_enabled": True}, self.db, self.config)
         self.assertEqual(
@@ -242,11 +303,12 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
             "not_tracked",
         )
 
-        add_tracked_channel("@boosted", owner_id=100, enabled=False, database=self.db, config=self.config)
+        set_tracked_channel_enabled(list_tracked_channels(self.db)[0]["id"], False, self.db)
         self.assertEqual(
-            (await handle_boost_channel_post_dry_run(self._message(), self.db, self.config))["reason"],
-            "channel_disabled",
+            (await handle_boost_channel_post_dry_run(self._message(message_id=43), self.db, self.config))["reason"],
+            "boost_channel_disabled",
         )
+        self.assertEqual(self._count_events(), 2)
 
     async def test_post_url_helper_requires_public_username(self):
         channel = {"username": "boosted", "tg_chat_id": "-1001234567890"}
@@ -270,13 +332,13 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
         add_tracked_channel("@boosted", owner_id=100, enabled=True, database=self.db, config=self.config)
 
         variants = (
-            {"text": "plain text"},
-            {"photo": [object()], "caption": None},
-            {"photo": [object()], "caption": "caption with https://wrong.example"},
-            {"video": object(), "caption": None},
-            {"video": object(), "caption": "video caption"},
+            ("text", {"text": "plain text"}),
+            ("photo", {"photo": [object()], "caption": None}),
+            ("photo", {"photo": [object()], "caption": "caption with https://wrong.example"}),
+            ("video", {"video": object(), "caption": None}),
+            ("video", {"video": object(), "caption": "video caption"}),
         )
-        for index, fields in enumerate(variants, start=1):
+        for index, (event_type, fields) in enumerate(variants, start=1):
             with self.subTest(fields=fields):
                 message_id = 100 + index
 
@@ -288,6 +350,7 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(result["status"], "dry_run")
                 self.assertEqual(result["event"]["post_url"], f"https://t.me/boosted/{message_id}")
+                self.assertEqual(result["event"]["event_type"], event_type)
                 self.assertEqual(result["request"]["request"]["link"], f"https://t.me/boosted/{message_id}")
                 self.assertEqual(self._count_events(), index)
 
@@ -337,6 +400,30 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second["reason"], "already_has_event")
         self.assertEqual(second["event"]["canonical_message_id"], 10)
         self.assertEqual(self._count_events(), 1)
+
+    async def test_list_boost_events_returns_latest_with_channel_snapshot(self):
+        save_boost_settings({"boost_enabled": True}, self.db, self.config)
+        ch = add_tracked_channel(
+            "@boosted",
+            owner_id=100,
+            title="Boosted Channel",
+            enabled=True,
+            database=self.db,
+            config=self.config,
+        )
+
+        await handle_boost_channel_post_dry_run(self._message(message_id=50, text="first"), self.db, self.config)
+        await handle_boost_channel_post_dry_run(self._message(message_id=51, photo=[object()]), self.db, self.config)
+
+        events = list_boost_events(limit=10, database=self.db)
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0]["message_id"], 51)
+        self.assertEqual(events[0]["event_type"], "photo")
+        self.assertEqual(events[0]["boost_channel_id"], ch["id"])
+        self.assertEqual(events[0]["channel_username"], "boosted")
+        self.assertEqual(events[0]["channel_title"], "Boosted Channel")
+        self.assertEqual(events[1]["message_id"], 50)
 
 
 class TwiBoostClientDryRunTests(unittest.IsolatedAsyncioTestCase):
