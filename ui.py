@@ -1729,6 +1729,10 @@ _DRAFT_STANDALONE_LINK_LABEL_RE = re.compile(
     r"^\s*(?:🔗\s*)?(?:ссылка(?:\s+на\s+товар)?|смотреть(?:\s+на\s+(?:wildberries|wb|ozon|aliexpress))?)\s*$",
     re.IGNORECASE,
 )
+_DRAFT_TRAILING_LINK_PHRASE_RE = re.compile(
+    r"\s+(?:по|по этой|по товарной)\s+ссылке(?:\s+ниже)?\s*$",
+    re.IGNORECASE,
+)
 
 
 def _draft_clean_url(url: str) -> str:
@@ -1791,7 +1795,10 @@ def _strip_draft_generated_links(text: str) -> str:
         clean = re.sub(r"\s{2,}", " ", clean)
         if _DRAFT_STANDALONE_LINK_LABEL_RE.fullmatch(clean):
             continue
-        lines.append(line.rstrip())
+        line = _DRAFT_TRAILING_LINK_PHRASE_RE.sub("", line.rstrip())
+        if not line.strip():
+            continue
+        lines.append(line)
     text = "\n".join(lines)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -2096,6 +2103,46 @@ def _draft_created_kb(d: dict, batch_count: int = 0) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def _draft_card_kb(d: dict) -> InlineKeyboardMarkup:
+    handle = d["channel_id"]
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Текст", callback_data=f"ui:draft_edit:{d['id']}"),
+            InlineKeyboardButton("🖼 Медиа", callback_data=f"ui:draft_media:{d['id']}"),
+        ],
+        [InlineKeyboardButton("🤖 Улучшить текст", callback_data=f"ui:draft_ai:{d['id']}")],
+        [
+            InlineKeyboardButton("📤 В очередь", callback_data=f"ui:draft_q:{d['id']}"),
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"ui:draft_del:{d['id']}"),
+        ],
+        [InlineKeyboardButton("◀️ К черновикам", callback_data=f"ui:ch_draft:{handle}")],
+    ])
+
+
+def _draft_card_caption(d: dict, num: str) -> str:
+    preview = (d.get("content") or "").strip()
+    preview = preview if preview else "<i>(без подписи)</i>"
+    cap = f"{num} <b>{_draft_type_label(d)}</b>\n{preview}"
+    if len(cap) > 1024:
+        cap = cap[:1020] + "…"
+    return cap
+
+
+async def _edit_draft_card_message(qm, d: dict, num: str) -> bool:
+    cap = _draft_card_caption(d, num)
+    kb = _draft_card_kb(d)
+    try:
+        msg = qm.message
+        if getattr(msg, "photo", None) or getattr(msg, "video", None) or getattr(msg, "animation", None) or getattr(msg, "document", None):
+            await qm.edit_message_caption(caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+        else:
+            await qm.edit_message_text(cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+        return True
+    except Exception as e:
+        logger.debug(f"draft card edit failed: {e}")
+        return False
+
+
 async def _reply_draft_card(
     msg_obj,
     d: dict,
@@ -2105,22 +2152,8 @@ async def _reply_draft_card(
     context: ContextTypes.DEFAULT_TYPE | None = None,
 ):
     """Отправляет одну карточку черновика: реальное медиа (по file_id) + кнопки."""
-    preview = (d.get("content") or "").strip()
-    preview = preview if preview else "<i>(без подписи)</i>"
-    cap = f"{num} <b>{_draft_type_label(d)}</b>\n{preview}"
-    if len(cap) > 1024:
-        cap = cap[:1020] + "…"
-    kb = _draft_created_kb(d, batch_count) if created else InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✏️ Текст", callback_data=f"ui:draft_edit:{d['id']}"),
-            InlineKeyboardButton("🖼 Медиа",  callback_data=f"ui:draft_media:{d['id']}"),
-        ],
-        [InlineKeyboardButton("🤖 Улучшить текст", callback_data=f"ui:draft_ai:{d['id']}")],
-        [
-            InlineKeyboardButton("📤 В очередь", callback_data=f"ui:draft_q:{d['id']}"),
-            InlineKeyboardButton("🗑 Удалить",   callback_data=f"ui:draft_del:{d['id']}"),
-        ],
-    ])
+    cap = _draft_card_caption(d, num)
+    kb = _draft_created_kb(d, batch_count) if created else _draft_card_kb(d)
     mt, fid = d.get("media_type"), d.get("tg_file_id")
     sent = None
     try:
@@ -2354,16 +2387,12 @@ async def action_draft_ai_polish(qm, context: ContextTypes.DEFAULT_TYPE, post_id
         post_id[:8], handle, validation.get("reason_code"), len(links), llm_called,
     )
     updated = next((x for x in buffer.get_drafts(handle) if x["id"] == post_id), None)
-    await _send_result(
-        "✅ Текст улучшен ИИ. Черновик остался в черновиках.",
-        InlineKeyboardMarkup([
-            [InlineKeyboardButton("📤 В очередь", callback_data=f"ui:draft_q:{post_id}")],
-            [InlineKeyboardButton("✍️ Черновики", callback_data=f"ui:ch_draft:{handle}")],
-            [InlineKeyboardButton("◀️ Создать пост", callback_data=f"ui:ch_create:{handle}")],
-        ]),
-    )
     if updated and isinstance(qm, CallbackQuery):
-        await _reply_draft_card(qm.message, updated, "🤖 Обновлённый черновик", context=context)
+        edited = await _edit_draft_card_message(qm, updated, "🤖 Обновлённый черновик")
+        if not edited:
+            await _reply_draft_card(qm.message, updated, "🤖 Обновлённый черновик", context=context)
+    elif updated:
+        await _reply_draft_card(qm, updated, "🤖 Обновлённый черновик", context=context)
 
 
 async def action_draft_clear_confirm(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):

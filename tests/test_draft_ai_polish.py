@@ -59,6 +59,18 @@ class DraftAiPolishTests(unittest.TestCase):
         self.assertIn('href="https://www.wildberries.ru/catalog/1/detail.aspx"', content)
         self.assertNotIn("catalog/2", content)
 
+    def test_trailing_link_phrase_is_removed_before_restoring_link(self):
+        original = '<a href="https://aliexpress.ru/item/1.html">ссылка</a>'
+        content, parse_mode = _merge_draft_polished_text(
+            "Поймать его можно на Aliexpress по ссылке",
+            original,
+        )
+
+        self.assertEqual(parse_mode, "HTML")
+        self.assertIn("Поймать его можно на Aliexpress", content)
+        self.assertNotIn("по ссылке", content)
+        self.assertIn('<a href="https://aliexpress.ru/item/1.html">Смотреть на Aliexpress</a>', content)
+
 
 if __name__ == "__main__":
     unittest.main()
