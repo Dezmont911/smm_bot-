@@ -1722,17 +1722,54 @@ def _manual_import_rejection_message(validation: dict) -> str:
 
 
 _DRAFT_LINK_RE = re.compile(r'<a\s+href="([^"]+)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+_DRAFT_URL_RE = re.compile(r'https?://[^\s<>"\]\)]+', re.IGNORECASE)
+_DRAFT_MARKDOWN_LINK_RE = re.compile(r'\[([^\]]{1,120})\]\((https?://[^)\s]+)\)', re.IGNORECASE)
+_DRAFT_LABEL_URL_RE = re.compile(r'\b([^\n()]{1,80}?)\s*\((https?://[^)\s]+)\)', re.IGNORECASE)
+_DRAFT_STANDALONE_LINK_LABEL_RE = re.compile(
+    r"^\s*(?:🔗\s*)?(?:ссылка(?:\s+на\s+товар)?|смотреть(?:\s+на\s+(?:wildberries|wb|ozon|aliexpress))?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _draft_clean_url(url: str) -> str:
+    return (url or "").strip().rstrip(".,;:!?)»”'")
+
+
+def _draft_link_label(url: str, label: str | None = None) -> str:
+    label = re.sub(r"<[^>]+>", "", label or "").strip()
+    low = (url or "").lower()
+    if label and not _DRAFT_STANDALONE_LINK_LABEL_RE.fullmatch(label):
+        return label
+    if "wildberries." in low:
+        return "Смотреть на Wildberries"
+    if "ozon." in low:
+        return "Смотреть на Ozon"
+    if "aliexpress." in low or "aliexpress.ru" in low:
+        return "Смотреть на Aliexpress"
+    return label or "Смотреть товар"
 
 
 def _draft_html_links(text_html: str | None) -> list[tuple[str, str]]:
     out, seen = [], set()
     for url, label in _DRAFT_LINK_RE.findall(text_html or ""):
-        url = (url or "").strip()
+        url = _draft_clean_url(url)
         if not url.lower().startswith(("http://", "https://")) or url in seen:
             continue
         seen.add(url)
-        label = re.sub(r"<[^>]+>", "", label or "").strip() or url
+        out.append((url, _draft_link_label(url, label)))
+    return out
+
+
+def _draft_links(text_html: str | None) -> list[tuple[str, str]]:
+    out, seen = [], set()
+    for url, label in _draft_html_links(text_html):
+        seen.add(url)
         out.append((url, label))
+    for url in _DRAFT_URL_RE.findall(text_html or ""):
+        url = _draft_clean_url(url)
+        if url and url not in seen:
+            seen.add(url)
+            out.append((url, _draft_link_label(url)))
     return out
 
 
@@ -1743,10 +1780,27 @@ def _draft_plain_text(text_html: str | None) -> str:
     return html.unescape(text).strip()
 
 
+def _strip_draft_generated_links(text: str) -> str:
+    text = _DRAFT_LINK_RE.sub("", text or "")
+    text = _DRAFT_MARKDOWN_LINK_RE.sub(r"\1", text)
+    text = _DRAFT_LABEL_URL_RE.sub(r"\1", text)
+    text = _DRAFT_URL_RE.sub("", text)
+    lines = []
+    for line in text.splitlines():
+        clean = line.strip()
+        clean = re.sub(r"\s{2,}", " ", clean)
+        if _DRAFT_STANDALONE_LINK_LABEL_RE.fullmatch(clean):
+            continue
+        lines.append(line.rstrip())
+    text = "\n".join(lines)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def _merge_draft_polished_text(polished: str, original_html: str | None) -> tuple[str, str | None]:
     """Возвращает publish-ready текст и parse_mode, сохраняя реальные HTML-ссылки черновика."""
-    links = _draft_html_links(original_html)
-    body = (polished or "").strip()
+    links = _draft_links(original_html)
+    body = _strip_draft_generated_links(polished)
     if not links:
         return body, None
     body_html = html.escape(body)
@@ -1767,6 +1821,30 @@ def _draft_batch_state(context: ContextTypes.DEFAULT_TYPE, handle: str, reset: b
         state = {"handle": handle, "ids": [], "pending_albums": [], "overflow_warned": False}
         context.user_data["draft_batch"] = state
     return state
+
+
+async def _disable_tracked_draft_cards(context: ContextTypes.DEFAULT_TYPE, handle: str):
+    tracked = context.user_data.get("draft_card_messages") or {}
+    items = tracked.pop(handle, [])
+    context.user_data["draft_card_messages"] = tracked
+    for item in items:
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=item["chat_id"],
+                message_id=item["message_id"],
+                reply_markup=None,
+            )
+        except Exception as e:
+            logger.debug(f"draft card cleanup skipped [{handle}]: {e}")
+
+
+def _track_draft_card_message(context: ContextTypes.DEFAULT_TYPE | None, handle: str, sent):
+    if context is None or not sent:
+        return
+    tracked = context.user_data.setdefault("draft_card_messages", {})
+    items = tracked.setdefault(handle, [])
+    items.append({"chat_id": sent.chat_id, "message_id": sent.message_id})
+    del items[:-30]
 
 
 def _draft_batch_count(context: ContextTypes.DEFAULT_TYPE, handle: str) -> int:
@@ -1873,6 +1951,53 @@ async def _flush_draft_batch_summary(context: ContextTypes.DEFAULT_TYPE, handle:
     if not chat_id:
         return
     batch_count = _draft_batch_count(context, handle)
+    quiet_single = (
+        int(summary.get("accepted") or 0) == 1
+        and not int(summary.get("rejected") or 0)
+        and not int(summary.get("duplicates") or 0)
+        and not int(summary.get("overflow") or 0)
+        and batch_count == 1
+    )
+    if quiet_single:
+        post_id = (summary.get("ids") or [None])[-1]
+        draft = next((d for d in buffer.get_drafts(handle) if d["id"] == post_id), None)
+        if draft:
+            await _disable_tracked_draft_cards(context, handle)
+            cap = f"👀 <b>Превью черновика</b>\n{(draft.get('content') or '<i>(без подписи)</i>').strip()}"
+            if len(cap) > 1024:
+                cap = cap[:1020] + "…"
+            kb = _draft_created_kb(draft, 1)
+            sent = None
+            mt, fid = draft.get("media_type"), draft.get("tg_file_id")
+            try:
+                if mt == "album" and fid:
+                    data = json.loads(fid or "{}")
+                    members, items = data.get("members", []), data.get("items", {})
+                    first = items.get(str(members[0])) if members else None
+                    if first:
+                        if first.get("type") == "video":
+                            sent = await context.bot.send_video(chat_id, first["file_id"], caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+                        else:
+                            sent = await context.bot.send_photo(chat_id, first["file_id"], caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+                elif mt == "photo" and fid:
+                    sent = await context.bot.send_photo(chat_id, fid, caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+                elif mt == "video" and fid:
+                    sent = await context.bot.send_video(chat_id, fid, caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+                elif mt == "animation" and fid:
+                    sent = await context.bot.send_animation(chat_id, fid, caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+                elif mt == "document" and fid:
+                    sent = await context.bot.send_document(chat_id, fid, caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+                if sent is None:
+                    sent = await context.bot.send_message(chat_id, cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+            except Exception as e:
+                logger.debug(f"single draft preview failed [{handle}]: {e}")
+                sent = await context.bot.send_message(chat_id, "✅ Черновик создан.", reply_markup=_draft_created_kb(draft, 1))
+            _track_draft_card_message(context, handle, sent)
+            state["summary"] = {
+                "ids": [], "accepted": 0, "rejected": 0, "duplicates": 0, "overflow": 0, "last_reason": "", "chat_id": chat_id,
+            }
+            context.user_data["draft_batch"] = state
+            return
     text = _draft_batch_summary_text(summary, batch_count)
     await context.bot.send_message(
         chat_id=chat_id,
@@ -1971,7 +2096,14 @@ def _draft_created_kb(d: dict, batch_count: int = 0) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-async def _reply_draft_card(msg_obj, d: dict, num: str, created: bool = False, batch_count: int = 0):
+async def _reply_draft_card(
+    msg_obj,
+    d: dict,
+    num: str,
+    created: bool = False,
+    batch_count: int = 0,
+    context: ContextTypes.DEFAULT_TYPE | None = None,
+):
     """Отправляет одну карточку черновика: реальное медиа (по file_id) + кнопки."""
     preview = (d.get("content") or "").strip()
     preview = preview if preview else "<i>(без подписи)</i>"
@@ -1990,6 +2122,7 @@ async def _reply_draft_card(msg_obj, d: dict, num: str, created: bool = False, b
         ],
     ])
     mt, fid = d.get("media_type"), d.get("tg_file_id")
+    sent = None
     try:
         if mt == "album" and fid:
             data = json.loads(fid or "{}")
@@ -1997,20 +2130,26 @@ async def _reply_draft_card(msg_obj, d: dict, num: str, created: bool = False, b
             first = items.get(str(members[0])) if members else None
             if first:
                 send = msg_obj.reply_video if first.get("type") == "video" else msg_obj.reply_photo
-                await send(first["file_id"], caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+                sent = await send(first["file_id"], caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+                _track_draft_card_message(context, d["channel_id"], sent)
                 return
         elif fid and mt == "video":
-            await msg_obj.reply_video(fid, caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb); return
+            sent = await msg_obj.reply_video(fid, caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+            _track_draft_card_message(context, d["channel_id"], sent); return
         elif fid and mt == "animation":
-            await msg_obj.reply_animation(fid, caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb); return
+            sent = await msg_obj.reply_animation(fid, caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+            _track_draft_card_message(context, d["channel_id"], sent); return
         elif fid and mt == "document":
-            await msg_obj.reply_document(fid, caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb); return
+            sent = await msg_obj.reply_document(fid, caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+            _track_draft_card_message(context, d["channel_id"], sent); return
         elif fid:
-            await msg_obj.reply_photo(fid, caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb); return
+            sent = await msg_obj.reply_photo(fid, caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+            _track_draft_card_message(context, d["channel_id"], sent); return
     except Exception as e:
         logger.debug(f"draft card media fail: {e}")
     # текст или фолбэк
-    await msg_obj.reply_text(cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+    sent = await msg_obj.reply_text(cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+    _track_draft_card_message(context, d["channel_id"], sent)
 
 
 async def screen_drafts(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
@@ -2034,6 +2173,7 @@ async def screen_drafts(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
     msg_obj = qm.message if isinstance(qm, CallbackQuery) else qm
     if isinstance(qm, CallbackQuery):
         await qm.answer()
+        await _disable_tracked_draft_cards(context, handle)
         try:
             await qm.edit_message_text(
                 f"🔥 <b>Черновики</b> — {name}\n📌 Сейчас в черновиках: <b>{len(drafts)}</b>",
@@ -2045,7 +2185,7 @@ async def screen_drafts(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
     # Карточки черновиков
     for i, d in enumerate(drafts):
         num = _NUM_EMOJI[i] if i < len(_NUM_EMOJI) else f"{i+1}."
-        await _reply_draft_card(msg_obj, d, num)
+        await _reply_draft_card(msg_obj, d, num, context=context)
 
     # Массовые действия снизу
     foot = []
@@ -2086,6 +2226,23 @@ async def action_draft_ai_polish(qm, context: ContextTypes.DEFAULT_TYPE, post_id
 
     original = (draft.get("content") or "").strip()
     plain = _draft_plain_text(original)
+    links = _draft_links(original)
+    html_links = _draft_html_links(original)
+    plain_urls = [u for u in _DRAFT_URL_RE.findall(original or "") if _draft_clean_url(u)]
+    llm_called = False
+    logger.debug(
+        "draft_ai_polish start | draft_id={} owner_id={} channel_id={} channel_type={} "
+        "has_text={} has_media={} has_html_link={} has_plain_url={} extracted_links_count={}",
+        post_id[:8],
+        ch.get("owner_id"),
+        handle,
+        ch.get("channel_type"),
+        bool(plain),
+        bool(draft.get("media_type") or draft.get("tg_file_id")),
+        bool(html_links),
+        bool(plain_urls),
+        len(links),
+    )
     if not plain:
         if isinstance(qm, CallbackQuery):
             await qm.answer("В черновике нет текста для улучшения.", show_alert=True)
@@ -2098,21 +2255,34 @@ async def action_draft_ai_polish(qm, context: ContextTypes.DEFAULT_TYPE, post_id
         validate_imported_post,
     )
 
+    validation_content = original
+    if links and not html_links:
+        validation_content, _ = _merge_draft_polished_text(_strip_draft_generated_links(plain), original)
+
     import_validation = validate_imported_post(ch, {
         "channel_id": handle,
-        "content": original,
+        "content": validation_content,
         "format": draft.get("format") or "manual",
         "topic": draft.get("topic") or "manual draft",
         "media_type": draft.get("media_type"),
         "tg_file_id": draft.get("tg_file_id"),
     })
     if not import_validation.get("allowed"):
+        logger.warning(
+            "draft_ai_polish rejected before LLM | draft_id={} channel_id={} reason={} llm_called=False",
+            post_id[:8], handle, import_validation.get("reason_code"),
+        )
         if isinstance(qm, CallbackQuery):
             await qm.answer(_manual_import_rejection_message(import_validation), show_alert=True)
         return
 
-    safety = evaluate_topic_candidate(ch, {"topic": plain[:700], "source": "manual_draft_ai_polish"})
+    plain_for_llm = _strip_draft_generated_links(plain) or plain
+    safety = evaluate_topic_candidate(ch, {"topic": plain_for_llm[:700], "source": "manual_draft_ai_polish"})
     if safety.get("decision") in ("blocked", "review") or not safety.get("safe_topic"):
+        logger.warning(
+            "draft_ai_polish topic rejected | draft_id={} channel_id={} reason={} llm_called=False",
+            post_id[:8], handle, safety.get("reason_code"),
+        )
         if isinstance(qm, CallbackQuery):
             await qm.answer("⚠️ Такой текст ИИ не будет переписывать по политике бота.", show_alert=True)
         return
@@ -2135,13 +2305,18 @@ async def action_draft_ai_polish(qm, context: ContextTypes.DEFAULT_TYPE, post_id
 
     try:
         from ai_client import rephrase_text
-        polished_raw = await rephrase_text(plain, ch)
+        llm_called = True
+        polished_raw = await rephrase_text(plain_for_llm, ch)
         polished_raw = (polished_raw or "").strip()
     except Exception as e:
         logger.warning(f"draft_ai_polish failed {post_id[:8]}: {e}")
         polished_raw = ""
 
-    if not polished_raw or polished_raw == plain:
+    if not polished_raw or polished_raw == plain_for_llm:
+        logger.warning(
+            "draft_ai_polish empty_or_same | draft_id={} channel_id={} llm_called={}",
+            post_id[:8], handle, llm_called,
+        )
         await _send_result(
             "😔 ИИ не смог улучшить текст. Черновик не изменён.",
             InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К черновикам", callback_data=f"ui:ch_draft:{handle}")]]),
@@ -2163,7 +2338,10 @@ async def action_draft_ai_polish(qm, context: ContextTypes.DEFAULT_TYPE, post_id
         brief,
     )
     if not validation.get("allowed"):
-        logger.warning(f"draft_ai_polish validation skipped [{handle}] {post_id[:8]}: {validation.get('reason_code')}")
+        logger.warning(
+            "draft_ai_polish validation skipped | draft_id={} channel_id={} validator_result={} failure_reason={} llm_called={}",
+            post_id[:8], handle, validation.get("decision"), validation.get("reason_code"), llm_called,
+        )
         await _send_result(
             f"⚠️ ИИ-текст не прошёл проверку: <code>{validation.get('reason_code')}</code>\nЧерновик не изменён.",
             InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К черновикам", callback_data=f"ui:ch_draft:{handle}")]]),
@@ -2171,6 +2349,10 @@ async def action_draft_ai_polish(qm, context: ContextTypes.DEFAULT_TYPE, post_id
         return
 
     buffer.set_draft_content(post_id, content, parse_mode)
+    logger.info(
+        "draft_ai_polish updated | draft_id={} channel_id={} validator_result={} links={} llm_called={}",
+        post_id[:8], handle, validation.get("reason_code"), len(links), llm_called,
+    )
     updated = next((x for x in buffer.get_drafts(handle) if x["id"] == post_id), None)
     await _send_result(
         "✅ Текст улучшен ИИ. Черновик остался в черновиках.",
@@ -2181,7 +2363,7 @@ async def action_draft_ai_polish(qm, context: ContextTypes.DEFAULT_TYPE, post_id
         ]),
     )
     if updated and isinstance(qm, CallbackQuery):
-        await _reply_draft_card(qm.message, updated, "🤖 Обновлённый черновик")
+        await _reply_draft_card(qm.message, updated, "🤖 Обновлённый черновик", context=context)
 
 
 async def action_draft_clear_confirm(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
@@ -2200,6 +2382,7 @@ async def action_draft_clear_ok(qm, context: ContextTypes.DEFAULT_TYPE, handle: 
     from telegram import CallbackQuery
     if isinstance(qm, CallbackQuery):
         await qm.answer(f"🗑 Удалено: {n}")
+        await _disable_tracked_draft_cards(context, handle)
     await screen_drafts(qm, context, handle)
 
 
@@ -2508,7 +2691,10 @@ async def action_draft_preview_batch(qm, context: ContextTypes.DEFAULT_TYPE, han
         except Exception:
             pass
         for i, draft in enumerate(drafts, start=1):
-            await _reply_draft_card(qm.message, draft, f"👀 Превью {i}/{len(drafts)}", created=True, batch_count=len(drafts))
+            await _reply_draft_card(
+                qm.message, draft, f"👀 Превью {i}/{len(drafts)}",
+                created=True, batch_count=len(drafts), context=context,
+            )
 
 
 async def action_draft_queue(qm, context: ContextTypes.DEFAULT_TYPE, post_id: str):

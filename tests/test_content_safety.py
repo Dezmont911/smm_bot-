@@ -137,6 +137,20 @@ class ContentSafetyTest(unittest.TestCase):
         self.assertFalse(validation["allowed"])
         self.assertEqual(validation["reason_code"], "meta_or_refusal_output")
 
+    def test_output_validator_rejects_meta_explanation_tail(self):
+        safety_and_brief = dry_run_topic(
+            ROBO_CHANNEL,
+            "Почему робототехника развивает логику у детей",
+        )
+        validation = validate_generated_post(
+            ROBO_CHANNEL,
+            {"content": "Пояснение: я оставил ссылку и сделал текст короче."},
+            safety_and_brief["safety"],
+            safety_and_brief["content_brief"],
+        )
+        self.assertFalse(validation["allowed"])
+        self.assertEqual(validation["reason_code"], "meta_or_refusal_output")
+
     def test_safe_channel_profile_blocks_forbidden_analysis(self):
         profile = build_safe_channel_profile({
             "topic": "порно и наркотики",
