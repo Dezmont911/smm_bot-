@@ -103,6 +103,55 @@ if 'due_at' not in pcols:
     print("  ✅ processed_ads.due_at добавлена")
 else:
     print("  ℹ️  processed_ads.due_at уже есть")
+conn.executescript("""
+CREATE TABLE IF NOT EXISTS boost_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    boost_enabled INTEGER NOT NULL DEFAULT 0,
+    boost_dry_run INTEGER NOT NULL DEFAULT 1,
+    real_orders_enabled INTEGER NOT NULL DEFAULT 0,
+    default_quantity INTEGER NOT NULL DEFAULT 500,
+    default_service_id TEXT,
+    provider TEXT NOT NULL DEFAULT 'twiboost',
+    last_error TEXT,
+    updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS boost_channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_key TEXT UNIQUE NOT NULL,
+    owner_id INTEGER,
+    tg_chat_id TEXT,
+    username TEXT,
+    title TEXT,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    quantity INTEGER,
+    service_id TEXT,
+    note TEXT,
+    last_seen_message_id INTEGER,
+    last_order_id TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS boost_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    boost_channel_id INTEGER NOT NULL,
+    tg_chat_id TEXT,
+    message_id INTEGER NOT NULL,
+    post_url TEXT,
+    quantity INTEGER NOT NULL,
+    service_id TEXT,
+    provider_order_id TEXT,
+    status TEXT NOT NULL,
+    dry_run INTEGER NOT NULL DEFAULT 1,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (boost_channel_id) REFERENCES boost_channels(id)
+);
+CREATE INDEX IF NOT EXISTS idx_boost_channels_enabled ON boost_channels(enabled);
+CREATE INDEX IF NOT EXISTS idx_boost_orders_channel ON boost_orders(boost_channel_id, message_id);
+""")
+print("  ✅ boost tables ready")
 updated = conn.execute(
     "UPDATE posts SET parse_mode = 'HTML' WHERE (parse_mode IS NULL OR parse_mode = 'Markdown') AND content LIKE '%<b>%' AND status IN ('ready', 'pending_review')"
 ).rowcount

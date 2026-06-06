@@ -61,10 +61,12 @@ from ui import (
     ui_router,
     screen_main,
     handle_settings_text_input,
+    handle_boost_text_input,
     handle_img_test_input,
     MENU_KEYBOARD,
     admin_default_rsy_enabled,
 )
+from boost_manager import handle_boost_channel_post_dry_run
 import accounts
 from accounts import (
     has_access, is_registered, is_superadmin,
@@ -3299,6 +3301,9 @@ async def handle_image_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await screen_admin_costs_custom(update.message, context, update.message.text or "")
         return
 
+    if await handle_boost_text_input(update, context):
+        return
+
     # Сначала пробуем обработать как ввод настроек (ui.py)
     if context.user_data.get("editing"):
         handled = await handle_settings_text_input(update, context)
@@ -3429,6 +3434,16 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     message = update.channel_post
     if not message:
         return
+
+    try:
+        boost_result = await handle_boost_channel_post_dry_run(message)
+        if boost_result.get("status") == "dry_run":
+            logger.info(
+                f"Boost dry-run event created | message_id={message.message_id} "
+                f"event_id={boost_result['event']['id']}"
+            )
+    except Exception as e:
+        logger.exception(f"Boost dry-run handler failed: {e}")
 
     channel_id = f"@{message.chat.username}" if message.chat.username else str(message.chat.id)
 
