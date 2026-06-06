@@ -214,12 +214,17 @@ class Database:
                     boost_channel_id INTEGER NOT NULL,
                     tg_chat_id TEXT,
                     message_id INTEGER NOT NULL,
+                    event_key TEXT,
+                    media_group_id TEXT,
+                    canonical_message_id INTEGER,
+                    event_type TEXT NOT NULL DEFAULT 'post',
                     post_url TEXT,
                     quantity INTEGER NOT NULL,
                     service_id TEXT,
                     provider_order_id TEXT,
                     status TEXT NOT NULL,
                     dry_run INTEGER NOT NULL DEFAULT 1,
+                    reason_code TEXT,
                     error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -231,6 +236,9 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_boost_orders_channel
                     ON boost_orders(boost_channel_id, message_id);
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_boost_orders_unique_event
+                    ON boost_orders(boost_channel_id, event_key, COALESCE(service_id, ''));
 
                 -- --------------------------------------------------------
                 -- Индексы для быстрых запросов

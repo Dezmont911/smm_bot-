@@ -137,12 +137,17 @@ CREATE TABLE IF NOT EXISTS boost_orders (
     boost_channel_id INTEGER NOT NULL,
     tg_chat_id TEXT,
     message_id INTEGER NOT NULL,
+    event_key TEXT,
+    media_group_id TEXT,
+    canonical_message_id INTEGER,
+    event_type TEXT NOT NULL DEFAULT 'post',
     post_url TEXT,
     quantity INTEGER NOT NULL,
     service_id TEXT,
     provider_order_id TEXT,
     status TEXT NOT NULL,
     dry_run INTEGER NOT NULL DEFAULT 1,
+    reason_code TEXT,
     error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -151,6 +156,39 @@ CREATE TABLE IF NOT EXISTS boost_orders (
 CREATE INDEX IF NOT EXISTS idx_boost_channels_enabled ON boost_channels(enabled);
 CREATE INDEX IF NOT EXISTS idx_boost_orders_channel ON boost_orders(boost_channel_id, message_id);
 ''')
+order_cols = [r[1] for r in conn.execute("PRAGMA table_info(boost_orders)").fetchall()]
+for _col, _definition in (
+    ('event_key', 'TEXT'),
+    ('media_group_id', 'TEXT'),
+    ('canonical_message_id', 'INTEGER'),
+    ('event_type', "TEXT NOT NULL DEFAULT 'post'"),
+    ('reason_code', 'TEXT'),
+):
+    if _col not in order_cols:
+        conn.execute(f"ALTER TABLE boost_orders ADD COLUMN {_col} {_definition}")
+        print(f"  ✅ boost_orders.{_col} добавлена")
+    else:
+        print(f"  ℹ️  boost_orders.{_col} уже есть")
+conn.execute(
+    '''
+    UPDATE boost_orders
+    SET
+        canonical_message_id = COALESCE(canonical_message_id, message_id),
+        event_type = COALESCE(NULLIF(event_type, ''), 'post'),
+        event_key = COALESCE(NULLIF(event_key, ''), 'msg:' || message_id)
+    WHERE canonical_message_id IS NULL
+       OR event_type IS NULL
+       OR event_type = ''
+       OR event_key IS NULL
+       OR event_key = ''
+    '''
+)
+conn.execute(
+    '''
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_boost_orders_unique_event
+    ON boost_orders(boost_channel_id, event_key, COALESCE(service_id, ''))
+    '''
+)
 print("  ✅ boost tables ready")
 updated = conn.execute(
     "UPDATE posts SET parse_mode = 'HTML' WHERE (parse_mode IS NULL OR parse_mode = 'Markdown') AND content LIKE '%<b>%' AND status IN ('ready', 'pending_review')"

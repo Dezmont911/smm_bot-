@@ -7,6 +7,7 @@ from database import Database
 from boost_manager import (
     TwiBoostClientWrapper,
     add_tracked_channel,
+    build_telegram_post_url,
     boost_configured,
     boost_real_orders_allowed,
     delete_tracked_channel,
@@ -103,11 +104,27 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.tmp.cleanup()
 
-    def _message(self, username="boosted", chat_id=-1001234567890, message_id=42):
+    def _message(
+        self,
+        username="boosted",
+        chat_id=-1001234567890,
+        message_id=42,
+        media_group_id=None,
+        **fields,
+    ):
         return SimpleNamespace(
             message_id=message_id,
+            media_group_id=media_group_id,
             chat=SimpleNamespace(id=chat_id, username=username),
+            **fields,
         )
+
+    def _count_events(self):
+        conn = self.db.connect()
+        try:
+            return conn.execute("SELECT COUNT(*) FROM boost_orders").fetchone()[0]
+        finally:
+            conn.close()
 
     async def test_tracked_enabled_channel_creates_dry_run_event(self):
         save_boost_settings({"boost_enabled": True}, self.db, self.config)
@@ -118,6 +135,10 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "dry_run")
         self.assertEqual(result["event"]["boost_channel_id"], ch["id"])
         self.assertEqual(result["event"]["post_url"], "https://t.me/boosted/42")
+        self.assertEqual(result["event"]["event_key"], "msg:42")
+        self.assertEqual(result["event"]["canonical_message_id"], 42)
+        self.assertEqual(result["event"]["event_type"], "post")
+        self.assertEqual(result["event"]["reason_code"], "public_username")
         self.assertEqual(result["event"]["quantity"], 500)
 
     async def test_untracked_or_disabled_or_global_off_is_ignored(self):
@@ -137,6 +158,96 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
             (await handle_boost_channel_post_dry_run(self._message(), self.db, self.config))["reason"],
             "channel_disabled",
         )
+
+    async def test_post_url_helper_requires_public_username(self):
+        channel = {"username": "boosted", "tg_chat_id": "-1001234567890"}
+        public_result = build_telegram_post_url(channel, self._message(caption="https://wrong.example/post"))
+
+        self.assertTrue(public_result["ok"])
+        self.assertEqual(public_result["post_url"], "https://t.me/boosted/42")
+        self.assertEqual(public_result["reason_code"], "public_username")
+        self.assertTrue(public_result["is_public"])
+
+        private_channel = {"username": None, "tg_chat_id": "-1001234567890"}
+        private_result = build_telegram_post_url(private_channel, self._message(username=None))
+
+        self.assertFalse(private_result["ok"])
+        self.assertIsNone(private_result["post_url"])
+        self.assertEqual(private_result["reason_code"], "no_public_post_url")
+        self.assertFalse(private_result["is_public"])
+
+    async def test_text_photo_and_video_posts_create_dry_run_events(self):
+        save_boost_settings({"boost_enabled": True}, self.db, self.config)
+        add_tracked_channel("@boosted", owner_id=100, enabled=True, database=self.db, config=self.config)
+
+        variants = (
+            {"text": "plain text"},
+            {"photo": [object()], "caption": None},
+            {"photo": [object()], "caption": "caption with https://wrong.example"},
+            {"video": object(), "caption": None},
+            {"video": object(), "caption": "video caption"},
+        )
+        for index, fields in enumerate(variants, start=1):
+            with self.subTest(fields=fields):
+                message_id = 100 + index
+
+                result = await handle_boost_channel_post_dry_run(
+                    self._message(message_id=message_id, **fields),
+                    self.db,
+                    self.config,
+                )
+
+                self.assertEqual(result["status"], "dry_run")
+                self.assertEqual(result["event"]["post_url"], f"https://t.me/boosted/{message_id}")
+                self.assertEqual(result["request"]["request"]["link"], f"https://t.me/boosted/{message_id}")
+                self.assertEqual(self._count_events(), index)
+
+    async def test_private_tracked_channel_records_review_event_without_client_call(self):
+        class ExplodingDryRunClient(TwiBoostClientWrapper):
+            async def create_views_order(self, *args, **kwargs):
+                raise AssertionError("private post must not be sent to TwiBoost dry-run wrapper")
+
+        save_boost_settings({"boost_enabled": True}, self.db, self.config)
+        add_tracked_channel("-1001234567890", owner_id=100, enabled=True, database=self.db, config=self.config)
+
+        result = await handle_boost_channel_post_dry_run(
+            self._message(username=None),
+            self.db,
+            self.config,
+            client=ExplodingDryRunClient(config=self.config),
+        )
+
+        self.assertEqual(result["status"], "dry_run")
+        self.assertEqual(result["reason"], "no_public_post_url")
+        self.assertIsNone(result["event"]["post_url"])
+        self.assertEqual(result["event"]["reason_code"], "no_public_post_url")
+        self.assertEqual(result["event"]["error"], "no_public_post_url")
+        self.assertEqual(self._count_events(), 1)
+
+    async def test_media_group_is_idempotent_by_group_and_service(self):
+        save_boost_settings({"boost_enabled": True}, self.db, self.config)
+        add_tracked_channel("@boosted", owner_id=100, enabled=True, database=self.db, config=self.config)
+
+        first = await handle_boost_channel_post_dry_run(
+            self._message(message_id=10, media_group_id="album-1", photo=[object()]),
+            self.db,
+            self.config,
+        )
+        second = await handle_boost_channel_post_dry_run(
+            self._message(message_id=11, media_group_id="album-1", photo=[object()], caption="album caption"),
+            self.db,
+            self.config,
+        )
+
+        self.assertEqual(first["status"], "dry_run")
+        self.assertEqual(first["event"]["event_key"], "mg:album-1")
+        self.assertEqual(first["event"]["media_group_id"], "album-1")
+        self.assertEqual(first["event"]["canonical_message_id"], 10)
+        self.assertEqual(first["event"]["event_type"], "media_group")
+        self.assertEqual(second["status"], "duplicate")
+        self.assertEqual(second["reason"], "already_has_event")
+        self.assertEqual(second["event"]["canonical_message_id"], 10)
+        self.assertEqual(self._count_events(), 1)
 
 
 class TwiBoostClientDryRunTests(unittest.IsolatedAsyncioTestCase):

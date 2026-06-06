@@ -21,6 +21,11 @@ BOOST_PROVIDER = "twiboost"
 BOOST_STATUS_DISABLED = "disabled"
 BOOST_STATUS_DRY_RUN = "dry_run"
 BOOST_STATUS_ENABLED = "enabled"
+BOOST_STATUS_IGNORED = "ignored"
+BOOST_EVENT_TYPE_MEDIA_GROUP = "media_group"
+BOOST_EVENT_TYPE_POST = "post"
+BOOST_REASON_NO_PUBLIC_POST_URL = "no_public_post_url"
+BOOST_REASON_PUBLIC_USERNAME = "public_username"
 
 REQUIRED_ENV_VARS = (
     "TWIBOOST_API_KEY",
@@ -88,12 +93,17 @@ def ensure_boost_schema(database=db):
                 boost_channel_id INTEGER NOT NULL,
                 tg_chat_id TEXT,
                 message_id INTEGER NOT NULL,
+                event_key TEXT,
+                media_group_id TEXT,
+                canonical_message_id INTEGER,
+                event_type TEXT NOT NULL DEFAULT 'post',
                 post_url TEXT,
                 quantity INTEGER NOT NULL,
                 service_id TEXT,
                 provider_order_id TEXT,
                 status TEXT NOT NULL,
                 dry_run INTEGER NOT NULL DEFAULT 1,
+                reason_code TEXT,
                 error TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -106,7 +116,42 @@ def ensure_boost_schema(database=db):
                 ON boost_orders(boost_channel_id, message_id);
             """
         )
+        _ensure_boost_order_columns(conn)
         conn.commit()
+
+
+def _ensure_boost_order_columns(conn):
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(boost_orders)").fetchall()}
+    required = {
+        "event_key": "TEXT",
+        "media_group_id": "TEXT",
+        "canonical_message_id": "INTEGER",
+        "event_type": "TEXT NOT NULL DEFAULT 'post'",
+        "reason_code": "TEXT",
+    }
+    for name, definition in required.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE boost_orders ADD COLUMN {name} {definition}")
+    conn.execute(
+        """
+        UPDATE boost_orders
+        SET
+            canonical_message_id = COALESCE(canonical_message_id, message_id),
+            event_type = COALESCE(NULLIF(event_type, ''), 'post'),
+            event_key = COALESCE(NULLIF(event_key, ''), 'msg:' || message_id)
+        WHERE canonical_message_id IS NULL
+           OR event_type IS NULL
+           OR event_type = ''
+           OR event_key IS NULL
+           OR event_key = ''
+        """
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_boost_orders_unique_event
+            ON boost_orders(boost_channel_id, event_key, COALESCE(service_id, ''))
+        """
+    )
 
 
 def _row_to_dict(row) -> dict | None:
@@ -377,16 +422,77 @@ def delete_tracked_channel(channel_id: int, database=db) -> bool:
     return count > 0
 
 
-def build_telegram_post_url(channel: dict | None, message_id: int | str | None) -> str | None:
-    if not channel or not message_id:
+def _message_value(message, attr: str, default=None):
+    return getattr(message, attr, default)
+
+
+def build_boost_event_key(message) -> str | None:
+    message_id = int(_message_value(message, "message_id", 0) or 0)
+    if not message_id:
         return None
-    username = channel.get("username")
+    media_group_id = _message_value(message, "media_group_id", None)
+    if media_group_id:
+        return f"mg:{media_group_id}"
+    return f"msg:{message_id}"
+
+
+def build_telegram_post_url(channel: dict | None, message) -> dict:
+    message_id = int(_message_value(message, "message_id", 0) or 0)
+    chat = _message_value(message, "chat", None)
+    chat_id = _message_value(chat, "id", None) if chat is not None else None
+    username = _message_value(chat, "username", None) if chat is not None else None
+
+    if channel:
+        chat_id = chat_id if chat_id is not None else channel.get("tg_chat_id")
+        username = username or channel.get("username")
+
+    username = str(username).lstrip("@").strip() if username else ""
+    result = {
+        "ok": False,
+        "post_url": None,
+        "reason_code": BOOST_REASON_NO_PUBLIC_POST_URL,
+        "canonical_message_id": message_id or None,
+        "chat_id": str(chat_id) if chat_id is not None else None,
+        "username": username or None,
+        "is_public": False,
+    }
+
+    if not channel or not message_id:
+        result["reason_code"] = "missing_channel_or_message_id"
+        return result
+
     if username:
-        return f"https://t.me/{str(username).lstrip('@')}/{message_id}"
-    chat_id = str(channel.get("tg_chat_id") or "")
-    if chat_id.startswith("-100") and len(chat_id) > 4:
-        return f"https://t.me/c/{chat_id[4:]}/{message_id}"
-    return None
+        result.update(
+            {
+                "ok": True,
+                "post_url": f"https://t.me/{username}/{message_id}",
+                "reason_code": BOOST_REASON_PUBLIC_USERNAME,
+                "is_public": True,
+            }
+        )
+    return result
+
+
+def get_boost_event_by_key(
+    boost_channel_id: int,
+    event_key: str,
+    service_id: int | str | None,
+    database=db,
+) -> dict | None:
+    ensure_boost_schema(database)
+    with _connect(database) as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM boost_orders
+            WHERE boost_channel_id = ?
+              AND event_key = ?
+              AND COALESCE(service_id, '') = COALESCE(?, '')
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (int(boost_channel_id), event_key, str(service_id) if service_id is not None else None),
+        ).fetchone()
+    return _row_to_dict(row)
 
 
 def create_boost_event(
@@ -397,6 +503,11 @@ def create_boost_event(
     service_id: int | str | None,
     status: str,
     dry_run: bool,
+    event_key: str | None = None,
+    media_group_id: str | None = None,
+    canonical_message_id: int | None = None,
+    event_type: str | None = None,
+    reason_code: str | None = None,
     provider_order_id: int | str | None = None,
     error: str | None = None,
     database=db,
@@ -407,20 +518,26 @@ def create_boost_event(
         cur = conn.execute(
             """
             INSERT INTO boost_orders (
-                boost_channel_id, tg_chat_id, message_id, post_url, quantity,
-                service_id, provider_order_id, status, dry_run, error, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                boost_channel_id, tg_chat_id, message_id, event_key, media_group_id,
+                canonical_message_id, event_type, post_url, quantity, service_id,
+                provider_order_id, status, dry_run, reason_code, error, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(boost_channel["id"]),
                 boost_channel.get("tg_chat_id"),
                 int(message_id),
+                event_key or f"msg:{int(message_id)}",
+                str(media_group_id) if media_group_id is not None else None,
+                int(canonical_message_id or message_id),
+                event_type or BOOST_EVENT_TYPE_POST,
                 post_url,
                 int(quantity),
                 str(service_id) if service_id is not None else None,
                 str(provider_order_id) if provider_order_id is not None else None,
                 status,
                 _bool_int(dry_run),
+                reason_code,
                 error,
                 now,
                 now,
@@ -470,27 +587,64 @@ async def handle_boost_channel_post_dry_run(message, database=db, config=cfg, cl
     message_id = int(getattr(message, "message_id", 0) or 0)
     if not message_id:
         return {"status": "ignored", "reason": "no_message_id", "channel": channel}
-    last_seen = int(channel.get("last_seen_message_id") or 0)
-    if last_seen and message_id <= last_seen:
-        return {"status": "ignored", "reason": "already_seen", "channel": channel}
 
     quantity = int(channel.get("quantity") or settings.get("default_quantity") or getattr(config, "BOOST_DEFAULT_QUANTITY", 500) or 500)
     service_id = channel.get("service_id") or settings.get("default_service_id") or getattr(config, "TWIBOOST_VIEWS_SERVICE_ID", None)
-    post_url = build_telegram_post_url(channel, message_id)
+    event_key = build_boost_event_key(message)
+    if not event_key:
+        return {"status": "ignored", "reason": "no_event_key", "channel": channel}
+
+    existing = get_boost_event_by_key(channel["id"], event_key, service_id, database)
+    if existing:
+        return {"status": "duplicate", "reason": "already_has_event", "channel": channel, "event": existing}
+
+    media_group_id = getattr(message, "media_group_id", None)
+    event_type = BOOST_EVENT_TYPE_MEDIA_GROUP if media_group_id else BOOST_EVENT_TYPE_POST
+    post_url_result = build_telegram_post_url(channel, message)
+
+    if not post_url_result["ok"]:
+        event = create_boost_event(
+            channel,
+            message_id,
+            post_url_result["post_url"],
+            quantity,
+            service_id,
+            status=BOOST_STATUS_DRY_RUN,
+            dry_run=True,
+            event_key=event_key,
+            media_group_id=str(media_group_id) if media_group_id is not None else None,
+            canonical_message_id=post_url_result["canonical_message_id"] or message_id,
+            event_type=event_type,
+            reason_code=post_url_result["reason_code"],
+            error=post_url_result["reason_code"],
+            database=database,
+        )
+        return {
+            "status": BOOST_STATUS_DRY_RUN,
+            "reason": post_url_result["reason_code"],
+            "event": event,
+            "url": post_url_result,
+        }
+
     wrapper = client or TwiBoostClientWrapper(config=config)
-    result = await wrapper.create_views_order(post_url or "", quantity, service_id, dry_run=True)
+    result = await wrapper.create_views_order(post_url_result["post_url"] or "", quantity, service_id, dry_run=True)
     event = create_boost_event(
         channel,
         message_id,
-        post_url,
+        post_url_result["post_url"],
         quantity,
         service_id,
         status=BOOST_STATUS_DRY_RUN,
         dry_run=True,
+        event_key=event_key,
+        media_group_id=str(media_group_id) if media_group_id is not None else None,
+        canonical_message_id=post_url_result["canonical_message_id"] or message_id,
+        event_type=event_type,
+        reason_code=post_url_result["reason_code"],
         error=None if result.get("would_create_order") else result.get("error"),
         database=database,
     )
-    return {"status": BOOST_STATUS_DRY_RUN, "event": event, "request": result}
+    return {"status": BOOST_STATUS_DRY_RUN, "event": event, "request": result, "url": post_url_result}
 
 
 @dataclass
