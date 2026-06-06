@@ -193,6 +193,29 @@ def _utc_to_msk(hours: list[int]) -> list[int]:
     return sorted((h + 3) % 24 for h in hours)
 
 
+_SCHEDULE_DAY_LABELS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+_SCHEDULE_ALL_DAYS = list(range(7))
+
+
+def _schedule_days(ch: dict) -> list[int]:
+    days = ch.get("schedule_days")
+    if not isinstance(days, list):
+        return _SCHEDULE_ALL_DAYS[:]
+    clean = sorted({int(d) for d in days if isinstance(d, int) and 0 <= d <= 6})
+    return clean or _SCHEDULE_ALL_DAYS[:]
+
+
+def _schedule_days_label(days: list[int]) -> str:
+    days = sorted(set(days))
+    if days == _SCHEDULE_ALL_DAYS:
+        return "каждый день"
+    if days == [0, 1, 2, 3, 4]:
+        return "будни"
+    if days == [5, 6]:
+        return "выходные"
+    return " · ".join(_SCHEDULE_DAY_LABELS[d] for d in days)
+
+
 def _images_enabled(ch: dict) -> bool:
     """Включены ли картинки у канала (единый критерий)."""
     src = ch.get("image_source", "auto")
@@ -785,6 +808,8 @@ async def screen_schedule(qm, context, handle: str):
     channel_id = ch["channel_id"]
     utc_hours  = sorted(ch.get("post_times_utc", []))
     msk_active = sorted((h + 3) % 24 for h in utc_hours)
+    days = _schedule_days(ch)
+    days_str = _schedule_days_label(days)
 
     # Популярные часы для быстрого выбора (МСК)
     POPULAR = [7, 9, 11, 13, 15, 17, 19, 21]
@@ -804,6 +829,7 @@ async def screen_schedule(qm, context, handle: str):
     active_str = " · ".join(f"{h:02d}:00" for h in msk_active) or "не задано"
 
     sched_rows = [
+        [InlineKeyboardButton(f"📆 Дни: {days_str}", callback_data=f"ui:ch_sched_days:{channel_id}")],
         *time_buttons,
         [InlineKeyboardButton("➕ Добавить своё время", callback_data=f"ui:ch_sched_custom:{channel_id}")],
         [InlineKeyboardButton("📋 Скопировать с другого канала", callback_data=f"ui:ch_sched_copy:{channel_id}")],
@@ -823,12 +849,78 @@ async def screen_schedule(qm, context, handle: str):
     await _answer_or_send(
         qm,
         f"📅 <b>Расписание</b>  <code>{channel_id}</code>\n\n"
-        f"Текущее: <b>{active_str}{' МСК' if msk_active else ''}</b>\n"
+        f"Дни: <b>{days_str}</b>\n"
+        f"Время: <b>{active_str}{' МСК' if msk_active else ''}</b>\n"
         f"{hint}\n\n"
         f"✅ — включено · 🕐 — выключено\n"
         f"Нажми на время чтобы включить или убрать:",
         kb,
     )
+
+
+async def screen_schedule_days(qm, context, handle: str):
+    """Выбор дней недели для обычного расписания публикаций (МСК)."""
+    ch = _load_channel(handle)
+    if not ch:
+        await _answer_or_send(qm, f"❌ Канал {handle} не найден.", None)
+        return
+
+    channel_id = ch["channel_id"]
+    days = set(_schedule_days(ch))
+    rows = []
+    row = []
+    for i, label in enumerate(_SCHEDULE_DAY_LABELS):
+        mark = "✅" if i in days else "⬜️"
+        row.append(InlineKeyboardButton(f"{mark} {label}", callback_data=f"ui:ch_sched_day:{channel_id}:{i}"))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.extend([
+        [
+            InlineKeyboardButton("✅ Каждый день", callback_data=f"ui:ch_sched_daypreset:{channel_id}:all"),
+            InlineKeyboardButton("💼 Будни", callback_data=f"ui:ch_sched_daypreset:{channel_id}:weekdays"),
+        ],
+        [InlineKeyboardButton("🏖 Выходные", callback_data=f"ui:ch_sched_daypreset:{channel_id}:weekend")],
+        [InlineKeyboardButton("◀️ К расписанию", callback_data=f"ui:ch_schedule:{channel_id}")],
+    ])
+    await _answer_or_send(
+        qm,
+        f"📆 <b>Дни публикаций</b>  <code>{channel_id}</code>\n\n"
+        f"Текущее: <b>{_schedule_days_label(sorted(days))}</b>\n"
+        f"Часовой пояс: <b>МСК</b>\n\n"
+        f"Нажми на день, чтобы включить или убрать.",
+        InlineKeyboardMarkup(rows),
+    )
+
+
+async def action_schedule_day_toggle(qm, context, handle: str, day: int):
+    ch = _load_channel(handle)
+    if not ch or not 0 <= day <= 6:
+        return
+    days = set(_schedule_days(ch))
+    if day in days:
+        days.remove(day)
+    else:
+        days.add(day)
+    ch["schedule_days"] = sorted(days) or _SCHEDULE_ALL_DAYS[:]
+    _save_channel(ch)
+    await screen_schedule_days(qm, context, handle)
+
+
+async def action_schedule_day_preset(qm, context, handle: str, preset: str):
+    ch = _load_channel(handle)
+    if not ch:
+        return
+    if preset == "weekdays":
+        ch["schedule_days"] = [0, 1, 2, 3, 4]
+    elif preset == "weekend":
+        ch["schedule_days"] = [5, 6]
+    else:
+        ch["schedule_days"] = _SCHEDULE_ALL_DAYS[:]
+    _save_channel(ch)
+    await screen_schedule_days(qm, context, handle)
 
 
 async def action_schedule_toggle(qm, context, handle: str, hour_msk: int):
@@ -3547,6 +3639,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ch", "ch_settings", "ch_topic_redo", "ch_pause", "ch_delete", "ch_delete_ok",
         "ch_clear", "ch_clear_ok", "ch_create", "ch_generate", "ch_gen_run", "ch_postnow",
         "ch_review", "ch_schedule", "ch_sched_toggle", "ch_sched_clear",
+        "ch_sched_days", "ch_sched_day", "ch_sched_daypreset",
         "ch_sched_custom", "ch_sched_copy", "ch_sched_copy_ok", "ch_images_toggle",
         "ch_history", "ch_set", "ch_set_img", "ch_folder", "ch_setfold",
         "ch_newfold", "ch_restore", "ch_draft", "draft_new", "draft_qlast",
@@ -3850,6 +3943,19 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hour_msk = int(parts[3])
         await action_schedule_toggle(query, context, handle, hour_msk)
 
+    elif action == "ch_sched_days" and len(parts) >= 3:
+        handle = parts[2]
+        await screen_schedule_days(query, context, handle)
+
+    elif action == "ch_sched_day" and len(parts) >= 4:
+        handle = parts[2]
+        day = int(parts[3])
+        await action_schedule_day_toggle(query, context, handle, day)
+
+    elif action == "ch_sched_daypreset" and len(parts) >= 4:
+        handle = parts[2]
+        await action_schedule_day_preset(query, context, handle, parts[3])
+
     elif action == "ch_sched_clear" and len(parts) >= 3:
         handle = parts[2]
         await action_schedule_clear(query, context, handle)
@@ -3899,6 +4005,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("⛔ Нет доступа к одному из каналов.", show_alert=True)
             return
         ch_dst["post_times_utc"] = ch_src.get("post_times_utc", [6, 9, 13, 17])
+        ch_dst["schedule_days"] = _schedule_days(ch_src)
         _save_channel(ch_dst)
         await query.answer("✅ Расписание скопировано!")
         await screen_schedule(query, context, handle)

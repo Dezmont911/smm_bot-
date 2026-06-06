@@ -20,7 +20,7 @@ poster.py — Планировщик публикаций (Слой 4 из handb
 
 import asyncio
 import random
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from io import BytesIO
 
 import aiohttp
@@ -80,6 +80,7 @@ class Poster:
 
         now_utc = datetime.now(timezone.utc)
         current_hour = now_utc.hour
+        current_weekday_msk = (now_utc + timedelta(hours=3)).weekday()
 
         channels = self._load_active_channels()
         if not channels:
@@ -89,11 +90,11 @@ class Poster:
 
         for channel in channels:
             try:
-                await self._process_channel(channel, current_hour)
+                await self._process_channel(channel, current_hour, current_weekday_msk)
             except Exception as e:
                 logger.error(f"Ошибка постера для {channel['channel_id']}: {e}")
 
-    async def _process_channel(self, channel: dict, current_hour: int):
+    async def _process_channel(self, channel: dict, current_hour: int, current_weekday_msk: int):
         """
         Обрабатывает один канал: постит если пришло время,
         проверяет буфер и при необходимости запускает генерацию.
@@ -110,6 +111,12 @@ class Poster:
         post_hours = channel.get("post_times_utc") or []
         if not post_hours or current_hour not in post_hours:
             return  # расписание не задано или не наш час — пропускаем
+
+        schedule_days = channel.get("schedule_days")
+        if isinstance(schedule_days, list):
+            allowed_days = {int(d) for d in schedule_days if isinstance(d, int) and 0 <= d <= 6}
+            if allowed_days and current_weekday_msk not in allowed_days:
+                return
 
         # Правило 1: есть ожидающее РСЯ-перекрытие → слот пропускаем,
         # перекрытие выйдет само (иначе был бы дубль: плановый + перекрытие рядом).
