@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import bot as bot_module
 import views_monitor
 
 
@@ -90,6 +91,30 @@ class ViewsMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ch[views_monitor.SUBS_ALERT_LAST_FIELD], now.isoformat())
         self.assertFalse(views_monitor.subscriber_alert_due(ch, now + timedelta(hours=23)))
         self.assertTrue(views_monitor.subscriber_alert_due(ch, now + timedelta(hours=24)))
+
+    async def test_monitor_channel_views_saves_subscriber_cooldown_without_db_replace(self):
+        channel = {"channel_id": "@rsy", "folder": views_monitor.DEFAULT_FOLDER}
+        report = {"checked": 1, "rows": [], "flagged": [], "created_at": "2026-06-07T12:00:00+00:00"}
+        alert_report = {
+            "checked": 1,
+            "rows": [],
+            "flagged": [{"channel": channel, "subs_low": True, "low_posts": []}],
+            "created_at": "2026-06-07T12:00:00+00:00",
+        }
+        fake_bot = SimpleNamespace(send_message=AsyncMock())
+
+        with patch.object(bot_module, "load_all_channels", return_value=[channel]), \
+                patch.object(bot_module, "collect_monitor_report", new=AsyncMock(return_value=report)), \
+                patch.object(bot_module, "build_hourly_alert_report", return_value=(alert_report, [channel])), \
+                patch.object(bot_module, "views_digest_text", return_value="alert"), \
+                patch.object(bot_module, "save_channel_json_only") as json_save, \
+                patch.object(bot_module, "save_channel_card") as db_save:
+            await bot_module.monitor_channel_views(fake_bot)
+
+        fake_bot.send_message.assert_awaited_once()
+        json_save.assert_called_once_with(channel)
+        db_save.assert_not_called()
+        self.assertIn(views_monitor.SUBS_ALERT_LAST_FIELD, channel)
 
 
 if __name__ == "__main__":

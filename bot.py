@@ -323,6 +323,15 @@ def save_channel_card(channel: dict):
     logger.info(f"Канал сохранён: {channel['channel_id']}")
 
 
+def save_channel_json_only(channel: dict):
+    """Сохраняет карточку канала без INSERT OR REPLACE в БД."""
+    channels_dir = Path(__file__).parent / "channels"
+    handle_clean = safe_slug(channel["channel_id"])
+    file_path = channels_dir / f"{handle_clean}.json"
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(channel, f, ensure_ascii=False, indent=2)
+
+
 def deactivate_channel(channel_id: str):
     """Деактивирует канал — ставит active=false в JSON и БД."""
     channels_dir = Path(__file__).parent / "channels"
@@ -3922,7 +3931,7 @@ async def monitor_channel_views(bot):
         for ch in subs_channels_to_mark:
             try:
                 mark_subscriber_alert_sent(ch)
-                save_channel_card(ch)
+                save_channel_json_only(ch)
             except Exception as e:
                 logger.warning(f"views-monitor: не удалось сохранить кулдаун подписчиков {ch.get('channel_id')}: {e}")
         logger.info(f"views-monitor: алерт отправлен, каналов в списке {len(alert_report.get('flagged') or [])}")
