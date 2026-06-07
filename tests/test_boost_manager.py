@@ -331,6 +331,11 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
         finally:
             conn.close()
 
+    async def _await_album_result(self, *results):
+        task = next((result.get("task") for result in results if result.get("task")), None)
+        self.assertIsNotNone(task)
+        return await task
+
     async def test_tracked_enabled_channel_creates_dry_run_event(self):
         save_boost_settings({"boost_enabled": True}, self.db, self.config)
         ch = add_tracked_channel("@boosted", owner_id=100, enabled=True, database=self.db, config=self.config)
@@ -455,21 +460,32 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
             self._message(message_id=10, media_group_id="album-1", photo=[object()]),
             self.db,
             self.config,
+            album_settle_seconds=0.01,
         )
         second = await handle_boost_channel_post_dry_run(
             self._message(message_id=11, media_group_id="album-1", photo=[object()], caption="album caption"),
             self.db,
             self.config,
+            album_settle_seconds=0.01,
+        )
+        final = await self._await_album_result(first, second)
+        duplicate = await handle_boost_channel_post_dry_run(
+            self._message(message_id=11, media_group_id="album-1", photo=[object()], caption="album caption"),
+            self.db,
+            self.config,
+            album_settle_seconds=0.01,
         )
 
-        self.assertEqual(first["status"], "dry_run")
-        self.assertEqual(first["event"]["event_key"], "mg:album-1")
-        self.assertEqual(first["event"]["media_group_id"], "album-1")
-        self.assertEqual(first["event"]["canonical_message_id"], 10)
-        self.assertEqual(first["event"]["event_type"], "media_group")
-        self.assertEqual(second["status"], "duplicate")
-        self.assertEqual(second["reason"], "already_has_event")
-        self.assertEqual(second["event"]["canonical_message_id"], 10)
+        self.assertEqual(first["status"], "pending")
+        self.assertEqual(second["status"], "pending")
+        self.assertEqual(final["status"], "dry_run")
+        self.assertEqual(final["event"]["event_key"], "mg:album-1")
+        self.assertEqual(final["event"]["media_group_id"], "album-1")
+        self.assertEqual(final["event"]["canonical_message_id"], 10)
+        self.assertEqual(final["event"]["event_type"], "media_group")
+        self.assertEqual(duplicate["status"], "duplicate")
+        self.assertEqual(duplicate["reason"], "already_has_event")
+        self.assertEqual(duplicate["event"]["canonical_message_id"], 10)
         self.assertEqual(self._count_events(), 1)
 
     async def test_media_group_duplicate_can_correct_album_main_link(self):
@@ -480,19 +496,22 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
             self._message(message_id=2042, media_group_id="album-out-of-order", photo=[object()]),
             self.db,
             self.config,
+            album_settle_seconds=0.01,
         )
         second = await handle_boost_channel_post_dry_run(
             self._message(message_id=2041, media_group_id="album-out-of-order", photo=[object()], caption="album text"),
             self.db,
             self.config,
+            album_settle_seconds=0.01,
         )
+        final = await self._await_album_result(first, second)
 
-        self.assertEqual(first["status"], "dry_run")
-        self.assertEqual(second["status"], "duplicate")
-        self.assertEqual(second["event"]["id"], first["event"]["id"])
-        self.assertEqual(second["event"]["message_id"], 2041)
-        self.assertEqual(second["event"]["canonical_message_id"], 2041)
-        self.assertEqual(second["event"]["post_url"], "https://t.me/boosted/2041")
+        self.assertEqual(first["status"], "pending")
+        self.assertEqual(second["status"], "pending")
+        self.assertEqual(final["status"], "dry_run")
+        self.assertEqual(final["event"]["message_id"], 2041)
+        self.assertEqual(final["event"]["canonical_message_id"], 2041)
+        self.assertEqual(final["event"]["post_url"], "https://t.me/boosted/2041")
         self.assertEqual(self._count_events(), 1)
 
     async def test_list_boost_events_returns_latest_with_channel_snapshot(self):
@@ -689,19 +708,31 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
             self.db,
             config,
             client=client,
+            album_settle_seconds=0.01,
         )
         second = await handle_boost_channel_post_dry_run(
             self._message(message_id=71, media_group_id="album-real", photo=[object()]),
             self.db,
             config,
             client=client,
+            album_settle_seconds=0.01,
+        )
+        final = await self._await_album_result(first, second)
+        duplicate = await handle_boost_channel_post_dry_run(
+            self._message(message_id=71, media_group_id="album-real", photo=[object()]),
+            self.db,
+            config,
+            client=client,
+            album_settle_seconds=0.01,
         )
 
-        self.assertEqual(first["status"], "ordered")
-        self.assertEqual(second["status"], "duplicate")
+        self.assertEqual(first["status"], "pending")
+        self.assertEqual(second["status"], "pending")
+        self.assertEqual(final["status"], "ordered")
+        self.assertEqual(duplicate["status"], "duplicate")
         self.assertEqual(client.calls, 1)
 
-    async def test_real_order_album_out_of_order_still_calls_provider_once(self):
+    async def test_real_order_album_out_of_order_uses_lowest_message_link_once(self):
         class RecordingClient:
             api_key = "secret"
             api_url = "https://twiboost.example/api"
@@ -723,19 +754,23 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
             self.db,
             config,
             client=client,
+            album_settle_seconds=0.01,
         )
         second = await handle_boost_channel_post_dry_run(
             self._message(message_id=2041, media_group_id="album-real-out-of-order", photo=[object()]),
             self.db,
             config,
             client=client,
+            album_settle_seconds=0.01,
         )
+        final = await self._await_album_result(first, second)
 
-        self.assertEqual(first["status"], "ordered")
-        self.assertEqual(second["status"], "duplicate")
-        self.assertEqual(client.calls, ["https://t.me/boosted/2042"])
-        self.assertEqual(second["event"]["post_url"], "https://t.me/boosted/2041")
-        self.assertEqual(second["event"]["canonical_message_id"], 2041)
+        self.assertEqual(first["status"], "pending")
+        self.assertEqual(second["status"], "pending")
+        self.assertEqual(final["status"], "ordered")
+        self.assertEqual(client.calls, ["https://t.me/boosted/2041"])
+        self.assertEqual(final["event"]["post_url"], "https://t.me/boosted/2041")
+        self.assertEqual(final["event"]["canonical_message_id"], 2041)
 
 
 class TwiBoostClientDryRunTests(unittest.IsolatedAsyncioTestCase):

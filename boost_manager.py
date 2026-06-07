@@ -12,6 +12,7 @@ import json
 import random
 import re
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -41,8 +42,10 @@ BOOST_REASON_CHANNEL_DISABLED = "boost_channel_disabled"
 BOOST_REASON_MISSING_SERVICE_ID = "missing_service_id"
 BOOST_REASON_TWIBOOST_NOT_CONFIGURED = "twiboost_not_configured"
 BOOST_REASON_PROVIDER_ERROR = "provider_error"
+BOOST_REASON_ALBUM_COLLECTING = "album_collecting"
 MIN_BOOST_QUANTITY = 500
 MAX_BOOST_QUANTITY = 100000
+BOOST_ALBUM_SETTLE_SECONDS = 2.0
 
 REQUIRED_ENV_VARS = (
     "TWIBOOST_API_KEY",
@@ -69,6 +72,10 @@ def utc_now() -> str:
 
 def required_env_vars() -> list[str]:
     return list(REQUIRED_ENV_VARS)
+
+
+_ALBUM_PENDING_LOCK = threading.Lock()
+_ALBUM_PENDING: dict[tuple, dict] = {}
 
 
 def ensure_boost_schema(database=db):
@@ -917,6 +924,75 @@ def update_boost_album_canonical_event(
     return dict(row) if row else existing
 
 
+def _boost_album_key(channel: dict, media_group_id: Any, service_id: int | str | None) -> tuple:
+    return (
+        int(channel["id"]),
+        str(media_group_id),
+        str(service_id) if service_id is not None else "",
+    )
+
+
+def _choose_album_canonical_message(messages: dict[int, Any]):
+    return messages[min(messages)]
+
+
+def _album_settle_seconds(config=cfg, override: float | None = None) -> float:
+    if override is not None:
+        return max(0.0, float(override))
+    return max(0.0, float(getattr(config, "BOOST_ALBUM_SETTLE_SECONDS", BOOST_ALBUM_SETTLE_SECONDS) or 0.0))
+
+
+async def _process_pending_boost_album(key: tuple, settle_seconds: float):
+    await asyncio.sleep(settle_seconds)
+    with _ALBUM_PENDING_LOCK:
+        state = _ALBUM_PENDING.pop(key, None)
+    if not state:
+        return {"status": "ignored", "reason": "album_state_missing"}
+
+    message = _choose_album_canonical_message(state["messages"])
+    try:
+        return await handle_boost_channel_post_dry_run(
+            message,
+            database=state["database"],
+            config=state["config"],
+            client=state["client"],
+            defer_media_groups=False,
+        )
+    except Exception as exc:
+        logger.exception(f"Boost album delayed handler failed: {exc}")
+        return {"status": BOOST_STATUS_FAILED, "reason": str(exc)}
+
+
+def _schedule_pending_boost_album(
+    key: tuple,
+    message,
+    database,
+    config,
+    client,
+    settle_seconds: float,
+) -> asyncio.Task:
+    message_id = int(getattr(message, "message_id", 0) or 0)
+    with _ALBUM_PENDING_LOCK:
+        state = _ALBUM_PENDING.get(key)
+        if not state:
+            state = {
+                "messages": {},
+                "database": database,
+                "config": config,
+                "client": client,
+                "task": None,
+            }
+            _ALBUM_PENDING[key] = state
+        state["messages"][message_id] = message
+        if client is not None:
+            state["client"] = client
+        task = state.get("task")
+        if task is None or task.done():
+            task = asyncio.create_task(_process_pending_boost_album(key, settle_seconds))
+            state["task"] = task
+    return task
+
+
 def list_boost_events(
     limit: int = 10,
     boost_channel_id: int | None = None,
@@ -1076,7 +1152,14 @@ def create_boost_event(
     return dict(row)
 
 
-async def handle_boost_channel_post_dry_run(message, database=db, config=cfg, client=None) -> dict:
+async def handle_boost_channel_post_dry_run(
+    message,
+    database=db,
+    config=cfg,
+    client=None,
+    defer_media_groups: bool = True,
+    album_settle_seconds: float | None = None,
+) -> dict:
     """Prepare a Boost event for a tracked channel post; real orders require the full safety gate."""
     chat = getattr(message, "chat", None)
     if chat is None:
@@ -1120,6 +1203,24 @@ async def handle_boost_channel_post_dry_run(message, database=db, config=cfg, cl
         existing = update_boost_album_canonical_event(existing, channel, message, database)
         _log_boost_result("duplicate", "already_has_event", message=message, channel=channel, event=existing, event_key=event_key, event_type=event_type, settings=settings)
         return {"status": "duplicate", "reason": "already_has_event", "channel": channel, "event": existing}
+
+    if media_group_id and defer_media_groups:
+        settle_seconds = _album_settle_seconds(config, album_settle_seconds)
+        task = _schedule_pending_boost_album(
+            _boost_album_key(channel, media_group_id, service_id),
+            message,
+            database,
+            config,
+            client,
+            settle_seconds,
+        )
+        _log_boost_result("pending", BOOST_REASON_ALBUM_COLLECTING, message=message, channel=channel, event_key=event_key, event_type=event_type, settings=settings)
+        return {
+            "status": "pending",
+            "reason": BOOST_REASON_ALBUM_COLLECTING,
+            "channel": channel,
+            "task": task,
+        }
 
     quantity_spec = boost_quantity_spec_from_channel(channel, settings, config)
     quantity = select_boost_quantity(quantity_spec["quantity_min"], quantity_spec["quantity_max"], config=config)
