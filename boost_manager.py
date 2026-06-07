@@ -870,6 +870,53 @@ def get_boost_event_by_key(
     return _row_to_dict(row)
 
 
+def update_boost_album_canonical_event(
+    existing: dict,
+    boost_channel: dict,
+    message,
+    database=db,
+) -> dict:
+    """Keep one album event, but point it at the lowest known album message link."""
+    media_group_id = getattr(message, "media_group_id", None)
+    if not existing or not media_group_id or str(existing.get("media_group_id") or "") != str(media_group_id):
+        return existing
+    message_id = int(getattr(message, "message_id", 0) or 0)
+    if not message_id:
+        return existing
+    current_canonical = int(existing.get("canonical_message_id") or existing.get("message_id") or message_id)
+    if message_id >= current_canonical:
+        return existing
+
+    post_url_result = build_telegram_post_url(boost_channel, message)
+    post_url = post_url_result["post_url"] if post_url_result["ok"] else existing.get("post_url")
+    now = utc_now()
+    ensure_boost_schema(database)
+    with _connect(database) as conn:
+        conn.execute(
+            """
+            UPDATE boost_orders
+            SET
+                message_id = ?,
+                canonical_message_id = ?,
+                post_url = COALESCE(?, post_url),
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (message_id, message_id, post_url, now, int(existing["id"])),
+        )
+        conn.execute(
+            """
+            UPDATE boost_channels
+            SET last_seen_message_id = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (message_id, now, int(boost_channel["id"])),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM boost_orders WHERE id = ?", (int(existing["id"]),)).fetchone()
+    return dict(row) if row else existing
+
+
 def list_boost_events(
     limit: int = 10,
     boost_channel_id: int | None = None,
@@ -1070,6 +1117,7 @@ async def handle_boost_channel_post_dry_run(message, database=db, config=cfg, cl
 
     existing = get_boost_event_by_key(channel["id"], event_key, service_id, database)
     if existing:
+        existing = update_boost_album_canonical_event(existing, channel, message, database)
         _log_boost_result("duplicate", "already_has_event", message=message, channel=channel, event=existing, event_key=event_key, event_type=event_type, settings=settings)
         return {"status": "duplicate", "reason": "already_has_event", "channel": channel, "event": existing}
 

@@ -472,6 +472,29 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second["event"]["canonical_message_id"], 10)
         self.assertEqual(self._count_events(), 1)
 
+    async def test_media_group_duplicate_can_correct_album_main_link(self):
+        save_boost_settings({"boost_enabled": True}, self.db, self.config)
+        add_tracked_channel("@boosted", owner_id=100, enabled=True, database=self.db, config=self.config)
+
+        first = await handle_boost_channel_post_dry_run(
+            self._message(message_id=2042, media_group_id="album-out-of-order", photo=[object()]),
+            self.db,
+            self.config,
+        )
+        second = await handle_boost_channel_post_dry_run(
+            self._message(message_id=2041, media_group_id="album-out-of-order", photo=[object()], caption="album text"),
+            self.db,
+            self.config,
+        )
+
+        self.assertEqual(first["status"], "dry_run")
+        self.assertEqual(second["status"], "duplicate")
+        self.assertEqual(second["event"]["id"], first["event"]["id"])
+        self.assertEqual(second["event"]["message_id"], 2041)
+        self.assertEqual(second["event"]["canonical_message_id"], 2041)
+        self.assertEqual(second["event"]["post_url"], "https://t.me/boosted/2041")
+        self.assertEqual(self._count_events(), 1)
+
     async def test_list_boost_events_returns_latest_with_channel_snapshot(self):
         save_boost_settings({"boost_enabled": True}, self.db, self.config)
         ch = add_tracked_channel(
@@ -677,6 +700,42 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["status"], "ordered")
         self.assertEqual(second["status"], "duplicate")
         self.assertEqual(client.calls, 1)
+
+    async def test_real_order_album_out_of_order_still_calls_provider_once(self):
+        class RecordingClient:
+            api_key = "secret"
+            api_url = "https://twiboost.example/api"
+
+            def __init__(self):
+                self.calls = []
+
+            async def create_views_order(self, post_url, quantity, service_id, dry_run=True):
+                self.calls.append(post_url)
+                return {"order": len(self.calls)}
+
+        config = SimpleNamespace(**{**self.config.__dict__, "BOOST_REAL_ORDERS_ENABLED": True, "BOOST_DRY_RUN": False})
+        save_boost_settings({"boost_enabled": True}, self.db, config)
+        add_tracked_channel("@boosted", owner_id=100, enabled=True, database=self.db, config=config)
+        client = RecordingClient()
+
+        first = await handle_boost_channel_post_dry_run(
+            self._message(message_id=2042, media_group_id="album-real-out-of-order", photo=[object()]),
+            self.db,
+            config,
+            client=client,
+        )
+        second = await handle_boost_channel_post_dry_run(
+            self._message(message_id=2041, media_group_id="album-real-out-of-order", photo=[object()]),
+            self.db,
+            config,
+            client=client,
+        )
+
+        self.assertEqual(first["status"], "ordered")
+        self.assertEqual(second["status"], "duplicate")
+        self.assertEqual(client.calls, ["https://t.me/boosted/2042"])
+        self.assertEqual(second["event"]["post_url"], "https://t.me/boosted/2041")
+        self.assertEqual(second["event"]["canonical_message_id"], 2041)
 
 
 class TwiBoostClientDryRunTests(unittest.IsolatedAsyncioTestCase):
