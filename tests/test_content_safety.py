@@ -10,6 +10,11 @@ from content_safety import (
     validate_generated_post,
     validate_imported_post,
 )
+from channel_questionnaire import (
+    build_proposed_channel_dna,
+    questionnaire_supported,
+    validate_questionnaire_input,
+)
 
 
 ROBO_CHANNEL = {
@@ -439,6 +444,117 @@ class ContentSafetyTest(unittest.TestCase):
             safety_and_brief["content_brief"],
         )
         self.assertTrue(validation["allowed"])
+
+    def test_questionnaire_age_groups_normalizes_robotop(self):
+        result = validate_questionnaire_input(
+            "age_groups",
+            "4-6: Lego WeDo, Lego WeDo 2.0\nс 7: Lego Mindstorms EV3, разработка игр",
+            ROBO_CHANNEL,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["normalized"][0]["age"], "4–6")
+        self.assertIn("Lego WeDo 2.0", result["normalized"][0]["directions"])
+        self.assertEqual(result["normalized"][1]["age"], "с 7")
+
+    def test_questionnaire_age_groups_rejects_long_and_blocked(self):
+        too_long = "4-6: " + ("Lego " * 250)
+        self.assertFalse(validate_questionnaire_input("age_groups", too_long, ROBO_CHANNEL)["ok"])
+        self.assertFalse(validate_questionnaire_input("age_groups", "4-6: казино", ROBO_CHANNEL)["ok"])
+
+    def test_questionnaire_merge_updates_known_facts_and_unknowns(self):
+        age_result = validate_questionnaire_input(
+            "age_groups",
+            "4-6: Lego WeDo, Lego WeDo 2.0\nс 7: Lego Mindstorms EV3, разработка игр",
+            ROBO_CHANNEL,
+        )
+        dna = build_proposed_channel_dna(
+            {
+                **ROBO_CHANNEL["channel_dna"],
+                "unknown_facts": ["age_range", "free_trial", "price", "address"],
+                "known_facts": {"manual_note": "не трогать"},
+                "known_facts_source": {"manual_note": "manual"},
+            },
+            {"age_groups": age_result["normalized"], "city": "Владивосток", "free_trial": None},
+        )
+        self.assertIn("manual_note", dna["known_facts"])
+        self.assertEqual(dna["known_facts_source"]["age_groups"], "questionnaire")
+        self.assertNotIn("age_range", dna["unknown_facts"])
+        self.assertIn("free_trial", dna["unknown_facts"])
+        self.assertIn("price", dna["unknown_facts"])
+        self.assertEqual(dna["known_facts"]["city"], "Владивосток")
+
+    def test_content_brief_uses_known_age_groups_and_directions(self):
+        channel = {
+            **ROBO_CHANNEL,
+            "channel_dna": {
+                **ROBO_CHANNEL["channel_dna"],
+                "unknown_facts": ["free_trial", "price"],
+                "known_facts": {
+                    "age_groups": [
+                        {"age": "4–6", "directions": ["Lego WeDo", "Lego WeDo 2.0"]},
+                        {"age": "с 7", "directions": ["Lego Mindstorms EV3", "разработка игр"]},
+                    ],
+                    "directions": ["Lego WeDo", "Lego WeDo 2.0", "Lego Mindstorms EV3", "разработка игр"],
+                },
+            },
+        }
+        safety = dry_run_topic(channel, "Как выбрать направление робототехники")["safety"]
+        brief = build_content_brief(channel, safety)
+        include = "\n".join(brief["must_include"])
+        avoid = "\n".join(brief["must_avoid"])
+        self.assertIn("4–6", include)
+        self.assertIn("Lego Mindstorms EV3", include)
+        self.assertNotIn("age_range", avoid)
+
+    def test_output_validator_allows_known_age_groups(self):
+        channel = {
+            **ROBO_CHANNEL,
+            "channel_dna": {
+                **ROBO_CHANNEL["channel_dna"],
+                "unknown_facts": ["age_range"],
+                "known_facts": {
+                    "age_groups": [
+                        {"age": "4–6", "directions": ["Lego WeDo"]},
+                        {"age": "с 7", "directions": ["Lego Mindstorms EV3"]},
+                    ],
+                    "directions": ["Lego WeDo", "Lego Mindstorms EV3"],
+                },
+            },
+        }
+        safety_and_brief = dry_run_topic(channel, "С какого возраста начинать робототехнику")
+        validation = validate_generated_post(
+            channel,
+            {"content": "Для 4–6 лет подойдет Lego WeDo, а с 7 лет можно перейти к Lego Mindstorms EV3. Напишите, подберем направление по возрасту."},
+            safety_and_brief["safety"],
+            safety_and_brief["content_brief"],
+        )
+        self.assertTrue(validation["allowed"])
+
+    def test_output_validator_rejects_unconfirmed_specific_direction(self):
+        channel = {
+            **ROBO_CHANNEL,
+            "channel_dna": {
+                **ROBO_CHANNEL["channel_dna"],
+                "unknown_facts": [],
+                "known_facts": {
+                    "age_groups": [{"age": "4–6", "directions": ["Lego WeDo"]}],
+                    "directions": ["Lego WeDo"],
+                },
+            },
+        }
+        safety_and_brief = dry_run_topic(channel, "Как выбрать направление робототехники")
+        validation = validate_generated_post(
+            channel,
+            {"content": "На занятиях дети изучают Scratch и быстро создают свои игры. Напишите, подберем направление."},
+            safety_and_brief["safety"],
+            safety_and_brief["content_brief"],
+        )
+        self.assertFalse(validation["allowed"])
+        self.assertEqual(validation["reason_code"], "unsupported_claim_or_unknown_fact")
+
+    def test_questionnaire_not_forced_for_generic_and_marketplace(self):
+        self.assertFalse(questionnaire_supported({"channel_id": "@news", "archetype": "news"}))
+        self.assertFalse(questionnaire_supported({**MARKETPLACE_CHANNEL, "archetype": "kids_education"}))
 
     def test_marketplace_reference_requires_product_link(self):
         validation = validate_generated_post(

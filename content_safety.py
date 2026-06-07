@@ -158,6 +158,61 @@ def _known_facts(channel: dict) -> dict:
     return facts if isinstance(facts, dict) else {}
 
 
+def _known_age_groups_text(known: dict) -> str:
+    groups = known.get("age_groups")
+    if not isinstance(groups, list):
+        return ""
+    rendered = []
+    for item in groups[:6]:
+        if isinstance(item, dict):
+            age = _clean_text(item.get("age"), 40)
+            dirs = _as_list(item.get("directions"), 8)
+            if age and dirs:
+                rendered.append(f"{age}: {', '.join(dirs)}")
+    return "; ".join(rendered)
+
+
+def _known_directions(known: dict) -> list[str]:
+    directions = _as_list(known.get("directions"), 20)
+    for item in known.get("age_groups") or []:
+        if isinstance(item, dict):
+            directions.extend(_as_list(item.get("directions"), 8))
+    result = []
+    seen = set()
+    for direction in directions:
+        key = _low(direction)
+        if key and key not in seen:
+            seen.add(key)
+            result.append(direction)
+    return result[:20]
+
+
+SPECIFIC_DIRECTION_MARKERS = (
+    "lego wedo",
+    "wedo",
+    "wedo 2.0",
+    "mindstorms",
+    "ev3",
+    "scratch",
+    "roblox",
+    "minecraft",
+    "python",
+    "unity",
+    "разработка игр",
+)
+
+
+def _unsupported_direction_claim(known: dict, low_content: str) -> str | None:
+    known_directions = _known_directions(known)
+    if not known_directions:
+        return None
+    known_low = " | ".join(_low(direction) for direction in known_directions)
+    for marker in SPECIFIC_DIRECTION_MARKERS:
+        if marker in low_content and marker not in known_low:
+            return marker
+    return None
+
+
 def _profile_text(channel: dict) -> str:
     dna = _channel_dna(channel)
     parts = [
@@ -337,6 +392,9 @@ def build_content_brief(channel: dict, safety: dict, format_name: str | None = N
     pain_points = _as_list(dna.get("pain_points"), 8)
     forbidden_angles = _as_list(dna.get("forbidden_angles"), 10)
     unknown_facts = _unknown_facts(channel)
+    known_facts = _known_facts(channel)
+    known_age_groups = _known_age_groups_text(known_facts)
+    known_directions = _known_directions(known_facts)
 
     must_include = []
     if offer:
@@ -345,6 +403,10 @@ def build_content_brief(channel: dict, safety: dict, format_name: str | None = N
         must_include.append("связать с болью аудитории: " + "; ".join(pain_points[:3]))
     if is_kids_education_channel(channel):
         must_include.append("показать пользу для ребенка или ответить на вопрос родителя")
+    if known_age_groups:
+        must_include.append("подтвержденные возрастные группы: " + known_age_groups)
+    if known_directions:
+        must_include.append("подтвержденные направления: " + ", ".join(known_directions))
 
     must_avoid = list(forbidden_angles)
     if dna:
@@ -367,7 +429,7 @@ def build_content_brief(channel: dict, safety: dict, format_name: str | None = N
             "не упоминать бесплатность, скидки, акции и цены; вместо этого писать: "
             "актуальные условия подскажем в WhatsApp или подберем направление по возрасту"
         )
-    if "age_range" in unknown_facts:
+    if "age_range" in unknown_facts and not known_age_groups:
         must_avoid.append("не указывать конкретные возрастные диапазоны, если age_range нет в known_facts")
     if "address" in unknown_facts:
         must_avoid.append("не указывать адрес")
@@ -403,12 +465,15 @@ def _unsupported_fact_claim(channel: dict, content: str) -> str | None:
     if not _channel_dna(channel):
         return None
 
+    known = _known_facts(channel)
+    low = _low(content)
+    unsupported_direction = _unsupported_direction_claim(known, low)
+    if unsupported_direction:
+        return "directions"
+
     unknown = _unknown_facts(channel)
     if not unknown:
         return None
-
-    known = _known_facts(channel)
-    low = _low(content)
 
     if "free_trial" in unknown and not known.get("free_trial") and any(marker in low for marker in FREE_TRIAL_MARKERS):
         return "free_trial"
@@ -433,7 +498,7 @@ def _unsupported_fact_claim(channel: dict, content: str) -> str | None:
         low,
     ):
         return "schedule"
-    if "age_range" in unknown and not known.get("age_range") and re.search(
+    if "age_range" in unknown and not known.get("age_range") and not known.get("age_groups") and re.search(
         r"(?:\b\d{1,2}\s*[-–]\s*\d{1,2}\s*(?:лет|года|год)\b|\b(?:после|с|от)\s*\d{1,2}\s*(?:лет|года|год)?\b)",
         low,
     ):

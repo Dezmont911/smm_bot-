@@ -346,6 +346,49 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
         post_now_mock.assert_awaited_once_with("@two")
         self.assertIn("Anime", query.edits[-1][0])
 
+    async def test_channel_diagnostics_rejects_foreign_owner(self):
+        captured = {}
+        channel = {"channel_id": "@kids", "owner_id": 200, "archetype": "kids_education"}
+
+        async def fake_answer_or_send(qm, text, kb):
+            captured["text"] = text
+
+        with patch.object(ui, "_load_channel", return_value=channel), \
+                patch.object(ui.accounts, "is_superadmin", return_value=False), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
+            await ui.screen_channel_diagnostics(FakeQuery(100), SimpleNamespace(user_data={}), "@kids")
+
+        self.assertIn("Нет доступа", captured["text"])
+
+    async def test_channel_diagnostics_allows_superadmin(self):
+        captured = {}
+        channel = {
+            "channel_id": "@kids",
+            "owner_id": 200,
+            "name": "Kids",
+            "archetype": "kids_education",
+            "channel_dna": {
+                "audience": "родители",
+                "known_facts": {
+                    "age_groups": [{"age": "4–6", "directions": ["Lego WeDo"]}],
+                    "city": "Владивосток",
+                },
+                "unknown_facts": ["free_trial"],
+            },
+        }
+
+        async def fake_answer_or_send(qm, text, kb):
+            captured["text"] = text
+            captured["kb"] = kb
+
+        with patch.object(ui, "_load_channel", return_value=channel), \
+                patch.object(ui.accounts, "is_superadmin", return_value=True), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
+            await ui.screen_channel_diagnostics(FakeQuery(100), SimpleNamespace(user_data={}), "@kids")
+
+        self.assertIn("Диагностика канала", captured["text"])
+        self.assertIn("4–6", captured["text"])
+
 
 if __name__ == "__main__":
     unittest.main()

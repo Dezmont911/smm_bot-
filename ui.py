@@ -47,6 +47,14 @@ from config import cfg
 from content_generator import generator
 from poster import poster
 import accounts
+from channel_questionnaire import (
+    QUESTIONNAIRE_TEMPLATE,
+    build_proposed_channel_dna,
+    diagnostics_for_channel,
+    format_known_facts,
+    parse_questionnaire_text,
+    questionnaire_supported,
+)
 from boost_manager import (
     add_tracked_channel,
     add_tracked_channel_from_smm_channel,
@@ -1036,6 +1044,8 @@ async def screen_channel_settings(qm, context: ContextTypes.DEFAULT_TYPE, handle
         [InlineKeyboardButton(f"🖼 Картинки: {img_str}",        callback_data=f"ui:ch_images_toggle:{channel_id}")],
         [InlineKeyboardButton(f"📰 Источники тем: {src_mode_short}", callback_data=f"ui:ch_set:{channel_id}:rss")],
         [InlineKeyboardButton(f"🚫 Запрещённые темы: {forb_str}", callback_data=f"ui:ch_set:{channel_id}:forbidden")],
+        [InlineKeyboardButton("🔍 Диагностика канала", callback_data=f"ui:ch_diag:{channel_id}")],
+        [InlineKeyboardButton("🧬 Данные канала", callback_data=f"ui:ch_data:{channel_id}")],
         [InlineKeyboardButton(f"{rsy_icon} Перекрытие рекламы РСЯ", callback_data=f"ui:rsy_toggle:{channel_id}")],
     ]
 
@@ -1052,6 +1062,131 @@ async def screen_channel_settings(qm, context: ContextTypes.DEFAULT_TYPE, handle
         qm,
         f"⚙️ <b>Настройки</b>  <code>{channel_id}</code>\n\nНажми параметр чтобы изменить:",
         InlineKeyboardMarkup(rows),
+    )
+
+
+def _can_view_channel_dna(user_id: int | None, ch: dict) -> bool:
+    return bool(user_id is not None and ch and (accounts.is_superadmin(user_id) or ch.get("owner_id") == user_id))
+
+
+async def screen_channel_diagnostics(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
+    ch = _load_channel(handle)
+    uid = _acting_uid(qm)
+    if not ch:
+        await _answer_or_send(qm, f"❌ Канал {html.escape(handle)} не найден.", None)
+        return
+    if not _can_view_channel_dna(uid, ch):
+        await _answer_or_send(qm, "⛔ Нет доступа к диагностике этого канала.", None)
+        return
+
+    channel_id = ch.get("channel_id", handle)
+    data = diagnostics_for_channel(ch)
+    dna = data["dna"]
+    safe_profile = ch.get("safe_profile") if isinstance(ch.get("safe_profile"), dict) else {}
+    known_lines = format_known_facts(data["known_facts"])
+    warnings = data["warnings"] or ["критичных предупреждений нет"]
+
+    lines = [
+        "🔍 <b>Диагностика канала</b>",
+        f"Канал: <code>{html.escape(channel_id)}</code>",
+        f"Название: {html.escape(str(ch.get('name') or 'нет'))}",
+        f"Тип: {html.escape(str(ch.get('channel_type') or 'content'))}",
+        f"Архетип: {html.escape(str(ch.get('archetype') or 'default'))}",
+        f"Источник тем: {html.escape(str(ch.get('topic_source') or 'rss'))}",
+        f"Safe profile: {'есть' if safe_profile else 'нет'}",
+        "",
+        "🧬 <b>Channel DNA</b>",
+        f"Аудитория: {html.escape(str(dna.get('audience') or 'нет'))}",
+        f"Цель: {html.escape(str(dna.get('goal') or 'нет'))}",
+        f"Оффер: {html.escape(str(dna.get('offer') or 'нет'))}",
+        f"Тон: {html.escape(str(dna.get('tone') or ch.get('tone') or 'нет'))}",
+        f"CTA: {html.escape(str(dna.get('cta') or 'нет'))}",
+        f"Режим генерации: {html.escape(str(ch.get('generation_mode') or ch.get('content_mode') or 'обычный'))}",
+        "",
+        "✅ <b>Известные факты</b>",
+    ]
+    lines.extend(html.escape(x) for x in (known_lines or ["нет"]))
+    lines.extend([
+        "",
+        "❓ <b>Неизвестные факты</b>",
+        html.escape(", ".join(str(x) for x in data["unknown_facts"]) or "нет"),
+        "",
+        "🚫 <b>Запрещенные углы</b>",
+        html.escape(", ".join(str(x) for x in (dna.get("forbidden_angles") or [])) or "нет"),
+        "",
+        "✅ <b>Разрешенные типы тем</b>",
+        html.escape(", ".join(str(x) for x in (dna.get("allowed_topic_types") or [])) or "нет"),
+        "",
+        "⚠️ <b>Предупреждения</b>",
+        html.escape("; ".join(warnings)),
+    ])
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧬 Данные канала", callback_data=f"ui:ch_data:{channel_id}")],
+        [InlineKeyboardButton("◀️ К настройкам", callback_data=f"ui:ch_settings:{channel_id}")],
+    ])
+    await _answer_or_send(qm, "\n".join(lines), kb)
+
+
+async def screen_channel_data(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
+    ch = _load_channel(handle)
+    uid = _acting_uid(qm)
+    if not ch:
+        await _answer_or_send(qm, f"❌ Канал {html.escape(handle)} не найден.", None)
+        return
+    if not _can_view_channel_dna(uid, ch):
+        await _answer_or_send(qm, "⛔ Нет доступа к данным этого канала.", None)
+        return
+
+    channel_id = ch.get("channel_id", handle)
+    if not questionnaire_supported(ch):
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К настройкам", callback_data=f"ui:ch_settings:{channel_id}")]])
+        await _answer_or_send(
+            qm,
+            "🧬 <b>Данные канала</b>\n\nАнкета v1 включена только для детских, локальных и образовательных каналов. Для новостей, маркетплейса и общих каналов она не применяется, чтобы не тащить чужие факты в промпт.",
+            kb,
+        )
+        return
+
+    data = diagnostics_for_channel(ch)
+    known_lines = format_known_facts(data["known_facts"])
+    text = (
+        "🧬 <b>Данные канала</b>\n\n"
+        "Эти факты попадают в Content Brief после нормализации. Сырой текст анкеты в промпт не идет.\n\n"
+        "<b>Сейчас известно:</b>\n"
+        + "\n".join(html.escape(x) for x in (known_lines or ["нет подтвержденных фактов"]))
+        + "\n\n<b>Шаблон для уточнения:</b>\n"
+        f"<pre>{html.escape(QUESTIONNAIRE_TEMPLATE)}</pre>"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Уточнить факты", callback_data=f"ui:ch_data_edit:{channel_id}")],
+        [InlineKeyboardButton("🔍 Диагностика канала", callback_data=f"ui:ch_diag:{channel_id}")],
+        [InlineKeyboardButton("◀️ К настройкам", callback_data=f"ui:ch_settings:{channel_id}")],
+    ])
+    await _answer_or_send(qm, text, kb)
+
+
+async def screen_channel_data_edit(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
+    ch = _load_channel(handle)
+    uid = _acting_uid(qm)
+    if not ch:
+        await _answer_or_send(qm, f"❌ Канал {html.escape(handle)} не найден.", None)
+        return
+    if not _can_view_channel_dna(uid, ch):
+        await _answer_or_send(qm, "⛔ Нет доступа к данным этого канала.", None)
+        return
+    if not questionnaire_supported(ch):
+        await screen_channel_data(qm, context, handle)
+        return
+
+    channel_id = ch.get("channel_id", handle)
+    context.user_data["editing"] = {"handle": channel_id, "field": "channel_facts"}
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data=f"ui:ch_data:{channel_id}")]])
+    await _answer_or_send(
+        qm,
+        "✏️ <b>Уточнить факты канала</b>\n\nСкопируй шаблон, заполни только реальные факты и отправь одним сообщением.\n\n"
+        f"<pre>{html.escape(QUESTIONNAIRE_TEMPLATE)}</pre>",
+        kb,
     )
 
 
@@ -3678,6 +3813,31 @@ async def handle_settings_text_input(update: Update, context: ContextTypes.DEFAU
 
     success_msg = None
 
+    if field == "channel_facts":
+        if not _can_view_channel_dna(getattr(update.effective_user, "id", None), ch):
+            context.user_data.pop("editing", None)
+            await update.message.reply_text("⛔ Нет доступа к данным этого канала.")
+            return True
+        if not questionnaire_supported(ch):
+            context.user_data.pop("editing", None)
+            await update.message.reply_text("Анкета v1 для этого типа канала недоступна.")
+            return True
+        parsed = parse_questionnaire_text(text, ch)
+        if not parsed["ok"]:
+            context.user_data["editing"] = {"handle": handle, "field": "channel_facts"}
+            errors = parsed.get("errors") or ["проверь формат анкеты"]
+            await update.message.reply_text("⚠️ Не смог сохранить факты.\n\n" + "\n".join(f"• {e}" for e in errors))
+            return True
+        ch["channel_dna"] = build_proposed_channel_dna(ch.get("channel_dna") or {}, parsed["answers"])
+        _save_channel(ch)
+        context.user_data.pop("editing", None)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🧬 Данные канала", callback_data=f"ui:ch_data:{handle}")],
+            [InlineKeyboardButton("🔍 Диагностика канала", callback_data=f"ui:ch_diag:{handle}")],
+        ])
+        await update.message.reply_text("✅ Факты сохранены. Сырой текст анкеты не используется в промпте.", reply_markup=kb)
+        return True
+
     # Ввод количества для «📥 Взять референсы» — не сохраняем карточку, а сразу импортируем
     if field == "ref_count":
         context.user_data.pop("editing", None)
@@ -5249,6 +5409,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ch_sched_days", "ch_sched_day", "ch_sched_daypreset",
         "ch_sched_custom", "ch_sched_copy", "ch_sched_copy_ok", "ch_images_toggle",
         "ch_history", "ch_set", "ch_set_img", "ch_folder", "ch_setfold",
+        "ch_diag", "ch_data", "ch_data_edit",
         "ch_newfold", "ch_restore", "ch_draft", "draft_new", "draft_qlast",
         "draft_qall", "draft_qbatch", "draft_preview_batch", "draft_clear", "draft_clearok", "rsy_toggle",
         "ch_archetype", "ch_set_arche", "ch_source_toggle", "ch_src_mode",
@@ -5517,6 +5678,18 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "ch_settings" and len(parts) >= 3:
         handle = parts[2]
         await screen_channel_settings(query, context, handle)
+
+    elif action == "ch_diag" and len(parts) >= 3:
+        handle = parts[2]
+        await screen_channel_diagnostics(query, context, handle)
+
+    elif action == "ch_data" and len(parts) >= 3:
+        handle = parts[2]
+        await screen_channel_data(query, context, handle)
+
+    elif action == "ch_data_edit" and len(parts) >= 3:
+        handle = parts[2]
+        await screen_channel_data_edit(query, context, handle)
 
     elif action == "ch_topic_redo" and len(parts) >= 3:
         handle = parts[2]
