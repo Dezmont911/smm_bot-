@@ -63,7 +63,6 @@ from boost_manager import (
     list_tracked_channels,
     normalize_channel_input,
     parse_boost_quantity,
-    required_env_vars,
     set_boost_enabled,
     set_tracked_channel_enabled,
     set_tracked_channel_quantity,
@@ -123,6 +122,30 @@ def _boost_mode_label() -> str:
     if boost_real_orders_allowed(settings, cfg):
         return "реальные заказы"
     return "тестовый режим"
+
+
+def _boost_real_order_hint(settings: dict) -> str:
+    if boost_real_orders_allowed(settings, cfg):
+        return "Реальные заказы включены. Новые публичные посты будут отправляться в TwiBoost."
+
+    reasons = []
+    if not settings.get("boost_enabled"):
+        reasons.append("глобальный Boost выключен")
+    if getattr(cfg, "BOOST_DRY_RUN", True):
+        reasons.append("включен тестовый режим")
+    if not getattr(cfg, "BOOST_REAL_ORDERS_ENABLED", False):
+        reasons.append("реальные заказы не разрешены в настройках")
+    if not boost_configured(cfg):
+        reasons.append("TwiBoost API не настроен")
+    if not _boost_service_configured(settings):
+        reasons.append("ID сервиса не настроен")
+
+    reason_text = "; ".join(reasons) if reasons else "не выполнены условия безопасности"
+    return (
+        "Реальные заказы сейчас НЕ отправляются. "
+        f"Причина: {reason_text}. "
+        "Бот только записывает тестовые или диагностические события."
+    )
 
 
 BOOST_PICKER_PAGE_SIZE = 8
@@ -1245,6 +1268,10 @@ async def screen_queue(qm, context: ContextTypes.DEFAULT_TYPE):
             f"{icon} {ch['channel_id']} · {lvl}",
             callback_data=f"ui:ch_review:{ch['channel_id']}"
         )])
+    if channels:
+        buttons.append([InlineKeyboardButton(
+            "📤 Опубликовать по 1 посту во всех каналах", callback_data="ui:queue_publish_all"
+        )])
     # Очистка буфера сразу по всем каналам
     if total > 0:
         buttons.append([InlineKeyboardButton(
@@ -1320,6 +1347,149 @@ async def action_clear_all_ok(qm, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Действия с каналом ────────────────────────────────────────────────────
+
+async def action_queue_publish_all_confirm(qm, context: ContextTypes.DEFAULT_TYPE):
+    """Запрашивает подтверждение срочной публикации по одному посту во все каналы."""
+    channels = _load_channels(owner_id=_acting_uid(qm), scope="mine")
+    if not channels:
+        await _answer_or_send(
+            qm,
+            "📭 Активных каналов нет.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="ui:queue")]]),
+        )
+        return
+
+    ready_now = sum(1 for ch in channels if buffer.get_ready_count(ch["channel_id"]) > 0)
+    empty_now = len(channels) - ready_now
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"✅ Опубликовать по 1 посту ({len(channels)})", callback_data="ui:queue_publish_all_ok")],
+        [InlineKeyboardButton("◀️ Отмена", callback_data="ui:queue")],
+    ])
+    await _answer_or_send(
+        qm,
+        "📤 <b>Срочная публикация во все каналы</b>\n\n"
+        f"Каналов: <b>{len(channels)}</b>\n"
+        f"С готовым постом в очереди: <b>{ready_now}</b>\n"
+        f"Без готового поста прямо сейчас: <b>{empty_now}</b>\n\n"
+        "После подтверждения бот опубликует по одному <b>готовому</b> посту в каждом канале. "
+        "Если готового поста нет, сначала попробует взять один пост из референсов, затем сгенерировать один пост, "
+        "и только после этого опубликовать.",
+        kb,
+    )
+
+
+async def _ensure_one_ready_post_for_channel(channel: dict) -> tuple[str | None, str | None]:
+    """Возвращает источник готового поста или причину, почему готового поста нет."""
+    cid = channel["channel_id"]
+    if buffer.get_ready_count(cid) > 0:
+        return "буфер", None
+
+    if channel.get("reference_channels"):
+        try:
+            from reference_importer import import_for_channel
+            res = await import_for_channel(channel, count=1)
+            if res.get("added", 0) > 0 and buffer.get_ready_count(cid) > 0:
+                return "референс", None
+        except Exception as e:
+            logger.warning(f"Срочная публикация [{cid}]: референс не дал готовый пост: {e}")
+
+    try:
+        res = await generator.run_for_channel(channel, target_count=1, force=True)
+        if res.get("generated", 0) > 0 and buffer.get_ready_count(cid) > 0:
+            return "генерация", None
+        reason = res.get("reason") or "не удалось создать готовый пост"
+        return None, str(reason)
+    except Exception as e:
+        return None, str(e)
+
+
+async def action_queue_publish_all_run(qm, context: ContextTypes.DEFAULT_TYPE):
+    """Публикует по одному посту во все owner-scoped каналы: ready -> reference -> generation."""
+    from telegram import CallbackQuery
+
+    if context.user_data.get("queue_publish_all_running"):
+        if isinstance(qm, CallbackQuery):
+            await qm.answer("Публикация уже идет.", show_alert=True)
+        return
+
+    channels = _load_channels(owner_id=_acting_uid(qm), scope="mine")
+    if not channels:
+        await _answer_or_send(
+            qm,
+            "📭 Активных каналов нет.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="ui:queue")]]),
+        )
+        return
+
+    context.user_data["queue_publish_all_running"] = True
+    if isinstance(qm, CallbackQuery):
+        await qm.answer("Запускаю срочную публикацию...")
+        try:
+            await qm.edit_message_text(
+                f"⏳ <b>Публикую по одному посту во все каналы...</b>\n\nКаналов: <b>{len(channels)}</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏳ Идет публикация...", callback_data="ui:noop")]]),
+            )
+        except Exception:
+            pass
+
+    ok_lines: list[str] = []
+    fail_lines: list[str] = []
+    source_counts = {"буфер": 0, "референс": 0, "генерация": 0}
+
+    try:
+        for ch in channels:
+            cid = ch["channel_id"]
+            source, reason = await _ensure_one_ready_post_for_channel(ch)
+            if not source:
+                fail_lines.append(f"❌ {html.escape(cid)} — {html.escape(reason or 'нет готового поста')}")
+                continue
+
+            result = await poster.post_now(cid)
+            if result.get("success"):
+                source_counts[source] = source_counts.get(source, 0) + 1
+                ok_lines.append(f"✅ {html.escape(cid)} — {source}")
+            else:
+                fail_lines.append(f"❌ {html.escape(cid)} — {html.escape(result.get('error') or 'ошибка публикации')}")
+    finally:
+        context.user_data.pop("queue_publish_all_running", None)
+
+    def _clip(lines: list[str], limit: int = 25) -> list[str]:
+        if len(lines) <= limit:
+            return lines
+        return lines[:limit] + [f"... еще {len(lines) - limit}"]
+
+    parts = [
+        "📤 <b>Срочная публикация завершена</b>",
+        "",
+        f"Опубликовано: <b>{len(ok_lines)}</b>",
+        f"Ошибок: <b>{len(fail_lines)}</b>",
+        f"Источники: буфер {source_counts.get('буфер', 0)}, референсы {source_counts.get('референс', 0)}, генерация {source_counts.get('генерация', 0)}",
+    ]
+    if ok_lines:
+        parts.extend(["", "<b>Опубликовано:</b>", *_clip(ok_lines)])
+    if fail_lines:
+        parts.extend(["", "<b>Не получилось:</b>", *_clip(fail_lines)])
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Очередь постов", callback_data="ui:queue")],
+        [InlineKeyboardButton("◀️ В меню", callback_data="ui:main")],
+    ])
+    final_text = "\n".join(parts)
+    if isinstance(qm, CallbackQuery):
+        try:
+            await qm.edit_message_text(final_text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            if getattr(qm, "message", None):
+                await context.bot.send_message(
+                    chat_id=qm.message.chat_id,
+                    text=final_text,
+                    reply_markup=kb,
+                    parse_mode=ParseMode.HTML,
+                )
+    else:
+        await _answer_or_send(qm, final_text, kb)
+
 
 async def action_pause_toggle(qm, context, handle: str):
     """Переключает паузу канала."""
@@ -3987,8 +4157,8 @@ async def screen_boost_admin(qm, context: ContextTypes.DEFAULT_TYPE):
     api_state = _boost_config_label(boost_configured(cfg))
     service_state = _boost_config_label(_boost_service_configured(settings))
     real_allowed = _boost_yesno_label(boost_real_orders_allowed(settings, cfg))
-    env_lines = "\n".join(f"• <code>{name}</code>" for name in required_env_vars())
     global_hint = "\n\nБуст выключен глобально. Новые посты не обрабатываются." if not settings.get("boost_enabled") else ""
+    real_order_hint = _boost_real_order_hint(settings)
 
     text = (
         "🚀 <b>Настройки Boost</b>\n\n"
@@ -4002,9 +4172,7 @@ async def screen_boost_admin(qm, context: ContextTypes.DEFAULT_TYPE):
         f"Отслеживаемые каналы: <b>{len(channels)}</b>\n"
         f"Включено каналов: <b>{enabled_count}</b>\n"
         f"Последняя ошибка: <b>{html.escape(_boost_reason_label(settings.get('last_error')))}</b>\n\n"
-        "Переменные окружения:\n"
-        f"{env_lines}\n\n"
-        "В текущем режиме реальные заказы не отправляются: создаются только тестовые события."
+        f"{real_order_hint}"
         f"{global_hint}"
     )
     rows = [
@@ -5027,6 +5195,12 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "queue":
         await screen_queue(query, context)
+
+    elif action == "queue_publish_all":
+        await action_queue_publish_all_confirm(query, context)
+
+    elif action == "queue_publish_all_ok":
+        await action_queue_publish_all_run(query, context)
 
     elif action == "queue_clear_all":
         await action_clear_all_confirm(query, context)

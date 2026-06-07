@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import ui
 
@@ -188,6 +188,88 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
         callbacks = " ".join(str(button.callback_data) for button in buttons)
         self.assertNotIn("Boost", labels)
         self.assertNotIn("boost", callbacks.lower())
+
+    async def test_boost_admin_screen_hides_env_variable_list(self):
+        captured = {}
+        settings = {
+            "boost_enabled": True,
+            "default_service_id": 123,
+            "default_quantity": 500,
+            "last_error": None,
+        }
+
+        async def fake_answer_or_send(qm, text, kb):
+            captured["text"] = text
+
+        with patch.object(ui.accounts, "is_superadmin", return_value=True), \
+                patch.object(ui, "get_boost_settings", return_value=settings), \
+                patch.object(ui, "list_tracked_channels", return_value=[]), \
+                patch.object(ui, "boost_configured", return_value=True), \
+                patch.object(ui, "boost_real_orders_allowed", return_value=False), \
+                patch.object(ui, "boost_status", return_value="dry_run"), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
+            await ui.screen_boost_admin(FakeQuery(100), SimpleNamespace(user_data={}))
+
+        self.assertNotIn("TWIBOOST_API_KEY", captured["text"])
+        self.assertNotIn("Переменные окружения", captured["text"])
+        self.assertIn("Реальные заказы сейчас НЕ отправляются", captured["text"])
+
+    async def test_queue_screen_has_publish_all_button(self):
+        captured = {}
+        channels = [
+            {"channel_id": "@one", "name": "One"},
+            {"channel_id": "@two", "name": "Two"},
+        ]
+
+        async def fake_answer_or_send(qm, text, kb):
+            captured["kb"] = kb
+
+        with patch.object(ui, "_load_channels", return_value=channels), \
+                patch.object(ui.buffer, "get_level", side_effect=[1, 0]), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
+            await ui.screen_queue(FakeQuery(100), SimpleNamespace(user_data={}))
+
+        callbacks = [
+            button.callback_data
+            for row in captured["kb"].inline_keyboard
+            for button in row
+        ]
+        self.assertIn("ui:queue_publish_all", callbacks)
+
+    async def test_ensure_one_ready_post_keeps_existing_ready_post(self):
+        with patch.object(ui.buffer, "get_ready_count", return_value=1), \
+                patch.object(ui.generator, "run_for_channel", new=AsyncMock()) as gen_mock:
+            source, reason = await ui._ensure_one_ready_post_for_channel({"channel_id": "@one"})
+
+        self.assertEqual(source, "буфер")
+        self.assertIsNone(reason)
+        gen_mock.assert_not_called()
+
+    async def test_queue_publish_all_publishes_once_per_channel(self):
+        query = FakeQuery(100)
+        context = SimpleNamespace(user_data={})
+        channels = [
+            {"channel_id": "@one", "name": "One"},
+            {"channel_id": "@two", "name": "Two"},
+        ]
+
+        async def fake_answer_or_send(qm, text, kb):
+            query.edits.append((text, None, kb))
+
+        with patch.object(ui, "_load_channels", return_value=channels), \
+                patch.object(ui, "_ensure_one_ready_post_for_channel", new=AsyncMock(side_effect=[
+                    ("буфер", None),
+                    ("генерация", None),
+                ])), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send), \
+                patch.object(ui.poster, "post_now", new=AsyncMock(return_value={"success": True})) as post_now_mock:
+            await ui.action_queue_publish_all_run(query, context)
+
+        self.assertEqual(post_now_mock.await_count, 2)
+        post_now_mock.assert_any_await("@one")
+        post_now_mock.assert_any_await("@two")
+        self.assertNotIn("queue_publish_all_running", context.user_data)
+        self.assertIn("Опубликовано: <b>2</b>", query.edits[-1][0])
 
 
 if __name__ == "__main__":
