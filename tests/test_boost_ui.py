@@ -1,8 +1,12 @@
 import unittest
+import json
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import ui
+from database import Database
 
 
 class FakeQuery:
@@ -388,6 +392,113 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Диагностика канала", captured["text"])
         self.assertIn("4–6", captured["text"])
+
+    async def test_deleted_channels_screen_offers_restore_and_purge(self):
+        captured = {}
+        channels = [
+            {"channel_id": "@gone", "name": "Gone", "owner_id": 100, "active": False},
+        ]
+
+        async def fake_answer_or_send(qm, text, kb):
+            captured["text"] = text
+            captured["kb"] = kb
+
+        with patch.object(ui, "_load_channels", return_value=channels), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
+            await ui.screen_channels_deleted(FakeQuery(100), SimpleNamespace(user_data={}), page=0)
+
+        callbacks = [
+            button.callback_data
+            for row in captured["kb"].inline_keyboard
+            for button in row
+        ]
+        self.assertIn("ui:ch_restore:@gone", callbacks)
+        self.assertIn("ui:ch_purge:@gone", callbacks)
+        self.assertIn("удалить его навсегда", captured["text"])
+
+    def test_permanent_delete_channel_removes_database_rows_and_json(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            database = Database(root / "purge.db")
+            database.init()
+            channels_dir = root / "channels"
+            channels_dir.mkdir()
+            channel_json = channels_dir / "gone.json"
+            channel_json.write_text(
+                json.dumps({"channel_id": "@gone", "active": False}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with database.connect() as conn:
+                conn.execute(
+                    "INSERT INTO channels (tg_handle, name, topic, tone, config_json, active) VALUES (?, ?, ?, ?, ?, 0)",
+                    ("@gone", "Gone", "topic", "tone", "{}"),
+                )
+                conn.execute(
+                    "INSERT INTO posts (id, channel_id, content, status, generated_at) VALUES (?, ?, ?, ?, ?)",
+                    ("p1", "@gone", "content", "ready", "2026-06-07T00:00:00+00:00"),
+                )
+                conn.execute(
+                    "INSERT INTO processed_ads (id, channel_id, ad_message_id, detected_at, status) VALUES (?, ?, ?, ?, ?)",
+                    ("ad1", "@gone", 1, "2026-06-07T00:00:00+00:00", "detected"),
+                )
+                conn.execute(
+                    "INSERT INTO topic_cache (channel_id, topic, created_at, used) VALUES (?, ?, ?, 0)",
+                    ("@gone", "topic", "2026-06-07T00:00:00+00:00"),
+                )
+                conn.execute(
+                    "INSERT INTO evergreen_topics (channel_id, topic, last_used_at, use_count) VALUES (?, ?, ?, 0)",
+                    ("@gone", "evergreen", None),
+                )
+                conn.execute(
+                    "INSERT INTO error_log (channel_id, error_type, message, occurred_at) VALUES (?, ?, ?, ?)",
+                    ("@gone", "test", "error", "2026-06-07T00:00:00+00:00"),
+                )
+                boost_cur = conn.execute(
+                    """
+                    INSERT INTO boost_channels (
+                        channel_key, smm_channel_id, enabled, created_at, updated_at
+                    ) VALUES (?, ?, 1, ?, ?)
+                    """,
+                    ("user:gone", "@gone", "2026-06-07T00:00:00+00:00", "2026-06-07T00:00:00+00:00"),
+                )
+                boost_id = boost_cur.lastrowid
+                conn.execute(
+                    """
+                    INSERT INTO boost_orders (
+                        boost_channel_id, message_id, event_type, quantity, status, dry_run, created_at, updated_at
+                    ) VALUES (?, 10, 'post', 500, 'dry_run', 1, ?, ?)
+                    """,
+                    (boost_id, "2026-06-07T00:00:00+00:00", "2026-06-07T00:00:00+00:00"),
+                )
+                conn.commit()
+
+            counts = ui._permanently_delete_channel("@gone", database=database, channels_dir=channels_dir)
+
+            self.assertEqual(counts["posts"], 1)
+            self.assertEqual(counts["processed_ads"], 1)
+            self.assertEqual(counts["topic_cache"], 1)
+            self.assertEqual(counts["evergreen_topics"], 1)
+            self.assertEqual(counts["error_log"], 1)
+            self.assertEqual(counts["channels"], 1)
+            self.assertEqual(counts["boost_orders"], 1)
+            self.assertEqual(counts["boost_channels"], 1)
+            self.assertEqual(counts["json_deleted"], 1)
+            self.assertFalse(channel_json.exists())
+
+            with database.connect() as conn:
+                for table, field in (
+                    ("channels", "tg_handle"),
+                    ("posts", "channel_id"),
+                    ("processed_ads", "channel_id"),
+                    ("topic_cache", "channel_id"),
+                    ("evergreen_topics", "channel_id"),
+                    ("error_log", "channel_id"),
+                ):
+                    count = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE {field} = ?", ("@gone",)).fetchone()[0]
+                    self.assertEqual(count, 0, table)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM boost_channels").fetchone()[0], 0)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM boost_orders").fetchone()[0], 0)
 
 
 if __name__ == "__main__":

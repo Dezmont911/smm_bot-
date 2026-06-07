@@ -674,8 +674,12 @@ async def screen_channels_deleted(qm, context: ContextTypes.DEFAULT_TYPE, page: 
     buttons = []
     for ch in chunk:
         name = ch.get("name") or ch["channel_id"]
-        buttons.append([InlineKeyboardButton(f"♻️ Восстановить «{name}»",
-                                             callback_data=f"ui:ch_restore:{ch['channel_id']}")])
+        buttons.append([
+            InlineKeyboardButton(f"♻️ Восстановить «{name}»", callback_data=f"ui:ch_restore:{ch['channel_id']}"),
+        ])
+        buttons.append([
+            InlineKeyboardButton("🧨 Удалить навсегда", callback_data=f"ui:ch_purge:{ch['channel_id']}"),
+        ])
 
     if pages > 1:
         nav = []
@@ -689,7 +693,11 @@ async def screen_channels_deleted(qm, context: ContextTypes.DEFAULT_TYPE, page: 
     header = f"🗑 <b>Удалённые каналы</b> ({total})"
     if pages > 1:
         header += f" · стр. {page + 1}/{pages}"
-    await _answer_or_send(qm, f"{header}\n\nНажми, чтобы восстановить:", InlineKeyboardMarkup(buttons))
+    await _answer_or_send(
+        qm,
+        f"{header}\n\nМожно восстановить канал или удалить его навсегда вместе с данными из базы.",
+        InlineKeyboardMarkup(buttons),
+    )
 
 
 async def action_channel_restore(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
@@ -703,6 +711,122 @@ async def action_channel_restore(qm, context: ContextTypes.DEFAULT_TYPE, handle:
             await qm.answer(f"♻️ {handle} восстановлен")
         logger.info(f"Канал {handle} восстановлен")
     await screen_channels_deleted(qm, context, 0)
+
+
+def _can_purge_channel(user_id: int | None, ch: dict | None) -> bool:
+    if user_id is None or not ch:
+        return False
+    return accounts.is_superadmin(user_id) or ch.get("owner_id") == user_id
+
+
+def _permanently_delete_channel(handle: str, database=None, channels_dir: Path | None = None) -> dict:
+    """Hard-delete channel JSON and related database rows. Does not touch Telegram."""
+    from database import db as default_db
+
+    database = database or default_db
+    channels_dir = channels_dir or (Path(__file__).parent / "channels")
+    channel_id = handle if str(handle).startswith("@") else f"@{handle}"
+    counts = {
+        "posts": 0,
+        "processed_ads": 0,
+        "topic_cache": 0,
+        "evergreen_topics": 0,
+        "error_log": 0,
+        "channels": 0,
+        "boost_orders": 0,
+        "boost_channels": 0,
+        "json_deleted": 0,
+    }
+
+    with database.connect() as conn:
+        boost_ids = [
+            int(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM boost_channels WHERE smm_channel_id = ?",
+                (channel_id,),
+            ).fetchall()
+        ]
+        for boost_id in boost_ids:
+            counts["boost_orders"] += conn.execute(
+                "DELETE FROM boost_orders WHERE boost_channel_id = ?",
+                (boost_id,),
+            ).rowcount
+        counts["boost_channels"] = conn.execute(
+            "DELETE FROM boost_channels WHERE smm_channel_id = ?",
+            (channel_id,),
+        ).rowcount
+
+        for table in ("processed_ads", "topic_cache", "evergreen_topics", "error_log", "posts"):
+            counts[table] = conn.execute(
+                f"DELETE FROM {table} WHERE channel_id = ?",
+                (channel_id,),
+            ).rowcount
+        counts["channels"] = conn.execute(
+            "DELETE FROM channels WHERE tg_handle = ?",
+            (channel_id,),
+        ).rowcount
+        conn.commit()
+
+    path = channels_dir / f"{_safe_slug(channel_id)}.json"
+    if path.exists():
+        path.unlink()
+        counts["json_deleted"] = 1
+
+    return counts
+
+
+async def action_channel_purge_confirm(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
+    ch = _load_channel(handle)
+    uid = _acting_uid(qm)
+    if not ch:
+        await _answer_or_send(qm, f"❌ Канал {html.escape(handle)} не найден.", None)
+        return
+    if not _can_purge_channel(uid, ch):
+        await _answer_or_send(qm, "⛔ Полностью удалить канал может только владелец или суперадмин.", None)
+        return
+
+    channel_id = ch.get("channel_id", handle)
+    name = html.escape(ch.get("name") or channel_id)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧨 Да, удалить навсегда", callback_data=f"ui:ch_purge_ok:{channel_id}")],
+        [InlineKeyboardButton("◀️ Отмена", callback_data="ui:ch_deleted:0")],
+    ])
+    await _answer_or_send(
+        qm,
+        f"🧨 <b>Удалить навсегда {name}?</b>\n\n"
+        "Это удалит карточку канала и связанные данные из базы: посты, очередь, историю РСЯ, темы, ошибки и привязанный Boost.\n\n"
+        "Восстановить после этого уже будет нечего.",
+        kb,
+    )
+
+
+async def action_channel_purge_ok(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
+    ch = _load_channel(handle)
+    uid = _acting_uid(qm)
+    if not ch:
+        await _answer_or_send(qm, f"❌ Канал {html.escape(handle)} уже не найден.", None)
+        return
+    if not _can_purge_channel(uid, ch):
+        await _answer_or_send(qm, "⛔ Полностью удалить канал может только владелец или суперадмин.", None)
+        return
+
+    channel_id = ch.get("channel_id", handle)
+    counts = _permanently_delete_channel(channel_id)
+    logger.warning(f"Канал {channel_id} удалён навсегда: {counts}")
+    text = (
+        f"🧨 <b>Канал {html.escape(channel_id)} удалён навсегда.</b>\n\n"
+        f"Постов удалено: <b>{counts['posts']}</b>\n"
+        f"РСЯ-записей: <b>{counts['processed_ads']}</b>\n"
+        f"Тем/резервов: <b>{counts['topic_cache'] + counts['evergreen_topics']}</b>\n"
+        f"Ошибок: <b>{counts['error_log']}</b>\n"
+        f"Boost-заказов: <b>{counts['boost_orders']}</b>\n"
+        f"Boost-каналов: <b>{counts['boost_channels']}</b>"
+    )
+    await _answer_or_send(
+        qm,
+        text,
+        InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К удалённым", callback_data="ui:ch_deleted:0")]]),
+    )
 
 
 async def prompt_channel_search(qm, context: ContextTypes.DEFAULT_TYPE):
@@ -5410,7 +5534,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ch_sched_custom", "ch_sched_copy", "ch_sched_copy_ok", "ch_images_toggle",
         "ch_history", "ch_set", "ch_set_img", "ch_folder", "ch_setfold",
         "ch_diag", "ch_data", "ch_data_edit",
-        "ch_newfold", "ch_restore", "ch_draft", "draft_new", "draft_qlast",
+        "ch_newfold", "ch_restore", "ch_purge", "ch_purge_ok", "ch_draft", "draft_new", "draft_qlast",
         "draft_qall", "draft_qbatch", "draft_preview_batch", "draft_clear", "draft_clearok", "rsy_toggle",
         "ch_archetype", "ch_set_arche", "ch_source_toggle", "ch_src_mode",
         "ch_refs", "ref_tgl", "ref_del", "ref_add", "ref_take", "ref_go",
@@ -5573,6 +5697,12 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "ch_restore" and len(parts) >= 3:
         await action_channel_restore(query, context, parts[2])
+
+    elif action == "ch_purge" and len(parts) >= 3:
+        await action_channel_purge_confirm(query, context, parts[2])
+
+    elif action == "ch_purge_ok" and len(parts) >= 3:
+        await action_channel_purge_ok(query, context, parts[2])
 
     # ── Черновик ──
     elif action == "ch_draft" and len(parts) >= 3:
