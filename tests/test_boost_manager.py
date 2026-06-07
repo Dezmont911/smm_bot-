@@ -317,6 +317,9 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
         media_group_id=None,
         **fields,
     ):
+        content_keys = {"text", "caption", "photo", "video", "animation", "document", "audio", "voice", "video_note", "sticker"}
+        if not any(key in fields for key in content_keys):
+            fields["text"] = "plain text"
         return SimpleNamespace(
             message_id=message_id,
             media_group_id=media_group_id,
@@ -771,6 +774,52 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.calls, ["https://t.me/boosted/2041"])
         self.assertEqual(final["event"]["post_url"], "https://t.me/boosted/2041")
         self.assertEqual(final["event"]["canonical_message_id"], 2041)
+
+    async def test_empty_channel_post_after_album_is_ignored_without_provider_call(self):
+        class RecordingClient:
+            api_key = "secret"
+            api_url = "https://twiboost.example/api"
+
+            def __init__(self):
+                self.calls = []
+
+            async def create_views_order(self, post_url, quantity, service_id, dry_run=True):
+                self.calls.append(post_url)
+                return {"order": len(self.calls)}
+
+        config = SimpleNamespace(**{**self.config.__dict__, "BOOST_REAL_ORDERS_ENABLED": True, "BOOST_DRY_RUN": False})
+        save_boost_settings({"boost_enabled": True}, self.db, config)
+        add_tracked_channel("@boosted", owner_id=100, enabled=True, database=self.db, config=config)
+        client = RecordingClient()
+
+        first = await handle_boost_channel_post_dry_run(
+            self._message(message_id=2056, media_group_id="album-empty-tail", photo=[object()]),
+            self.db,
+            config,
+            client=client,
+            album_settle_seconds=0.01,
+        )
+        second = await handle_boost_channel_post_dry_run(
+            self._message(message_id=2059, media_group_id="album-empty-tail", photo=[object()]),
+            self.db,
+            config,
+            client=client,
+            album_settle_seconds=0.01,
+        )
+        final = await self._await_album_result(first, second)
+        phantom = await handle_boost_channel_post_dry_run(
+            self._message(message_id=2060, text=None),
+            self.db,
+            config,
+            client=client,
+        )
+
+        self.assertEqual(final["status"], "ordered")
+        self.assertEqual(final["event"]["post_url"], "https://t.me/boosted/2056")
+        self.assertEqual(phantom["status"], "ignored")
+        self.assertEqual(phantom["reason"], "no_boostable_content")
+        self.assertEqual(client.calls, ["https://t.me/boosted/2056"])
+        self.assertEqual(self._count_events(), 1)
 
 
 class TwiBoostClientDryRunTests(unittest.IsolatedAsyncioTestCase):

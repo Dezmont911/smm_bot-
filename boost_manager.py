@@ -43,6 +43,7 @@ BOOST_REASON_MISSING_SERVICE_ID = "missing_service_id"
 BOOST_REASON_TWIBOOST_NOT_CONFIGURED = "twiboost_not_configured"
 BOOST_REASON_PROVIDER_ERROR = "provider_error"
 BOOST_REASON_ALBUM_COLLECTING = "album_collecting"
+BOOST_REASON_NO_BOOSTABLE_CONTENT = "no_boostable_content"
 MIN_BOOST_QUANTITY = 500
 MAX_BOOST_QUANTITY = 100000
 BOOST_ALBUM_SETTLE_SECONDS = 2.0
@@ -818,6 +819,28 @@ def infer_boost_event_type(message) -> str:
     return BOOST_EVENT_TYPE_TEXT
 
 
+def is_boostable_post_message(message) -> bool:
+    if _message_value(message, "media_group_id", None):
+        return True
+    if str(_message_value(message, "text", "") or "").strip():
+        return True
+    if str(_message_value(message, "caption", "") or "").strip():
+        return True
+    for attr in (
+        "photo",
+        "video",
+        "animation",
+        "document",
+        "audio",
+        "voice",
+        "video_note",
+        "sticker",
+    ):
+        if _message_value(message, attr, None):
+            return True
+    return False
+
+
 def build_telegram_post_url(channel: dict | None, message) -> dict:
     message_id = int(_message_value(message, "message_id", 0) or 0)
     chat = _message_value(message, "chat", None)
@@ -1197,6 +1220,10 @@ async def handle_boost_channel_post_dry_run(
     if not event_key:
         _log_boost_result("ignored", "no_event_key", message=message, channel=channel, event_type=event_type, settings=settings)
         return {"status": "ignored", "reason": "no_event_key", "channel": channel}
+
+    if not is_boostable_post_message(message):
+        _log_boost_result(BOOST_STATUS_IGNORED, BOOST_REASON_NO_BOOSTABLE_CONTENT, message=message, channel=channel, event_key=event_key, event_type=event_type, settings=settings)
+        return {"status": BOOST_STATUS_IGNORED, "reason": BOOST_REASON_NO_BOOSTABLE_CONTENT, "channel": channel}
 
     existing = get_boost_event_by_key(channel["id"], event_key, service_id, database)
     if existing:
