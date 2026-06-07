@@ -54,6 +54,7 @@ from channel_questionnaire import (
     format_known_facts,
     parse_questionnaire_text,
     questionnaire_supported,
+    validate_questionnaire_input,
 )
 from boost_manager import (
     add_tracked_channel,
@@ -1339,16 +1340,17 @@ async def screen_channel_data(qm, context: ContextTypes.DEFAULT_TYPE, handle: st
 
     data = diagnostics_for_channel(ch)
     known_lines = format_known_facts(data["known_facts"])
+    warnings = data.get("warnings") or []
     text = (
         "🧬 <b>Данные канала</b>\n\n"
         "Эти факты попадают в Content Brief после нормализации. Сырой текст анкеты в промпт не идет.\n\n"
         "<b>Сейчас известно:</b>\n"
         + "\n".join(html.escape(x) for x in (known_lines or ["нет подтвержденных фактов"]))
-        + "\n\n<b>Шаблон для уточнения:</b>\n"
-        f"<pre>{html.escape(QUESTIONNAIRE_TEMPLATE)}</pre>"
     )
+    if warnings:
+        text += "\n\n<b>Что стоит уточнить:</b>\n" + "\n".join(f"• {html.escape(str(x))}" for x in warnings[:6])
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Уточнить факты", callback_data=f"ui:ch_data_edit:{channel_id}")],
+        [InlineKeyboardButton("✏️ Заполнить / исправить факты", callback_data=f"ui:ch_data_edit:{channel_id}")],
         [InlineKeyboardButton("🔍 Диагностика канала", callback_data=f"ui:ch_diag:{channel_id}")],
         [InlineKeyboardButton("◀️ К настройкам", callback_data=f"ui:ch_settings:{channel_id}")],
     ])
@@ -1369,14 +1371,166 @@ async def screen_channel_data_edit(qm, context: ContextTypes.DEFAULT_TYPE, handl
         return
 
     channel_id = ch.get("channel_id", handle)
-    context.user_data["editing"] = {"handle": channel_id, "field": "channel_facts"}
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data=f"ui:ch_data:{channel_id}")]])
+    context.user_data.pop("editing", None)
+    await screen_channel_fact_menu(qm, context, channel_id)
+
+
+_FACT_FIELDS = [
+    ("age", "age_groups", "Возраст и направления", "text"),
+    ("city", "city", "Город", "text"),
+    ("contact", "contact", "Контакт", "text"),
+    ("address", "address", "Адрес", "text"),
+    ("trial", "trial_lesson", "Пробное занятие", "enum"),
+    ("free", "free_trial", "Бесплатное пробное", "enum"),
+    ("price", "price_policy", "Цены/скидки", "enum"),
+    ("cta", "cta", "Что просить сделать", "enum"),
+    ("forbid", "forbidden_promises", "Что нельзя обещать", "text"),
+]
+
+_FACT_CODE_TO_FIELD = {code: field for code, field, _label, _kind in _FACT_FIELDS}
+_FACT_FIELD_TO_LABEL = {field: label for _code, field, label, _kind in _FACT_FIELDS}
+_FACT_ENUM_VALUES = {
+    "trial": [("yes", "есть"), ("no", "нет"), ("unknown", "не знаю")],
+    "free": [("yes", "да"), ("no", "нет"), ("unknown", "не знаю")],
+    "price": [("none", "не указывать"), ("wa", "условия в WhatsApp"), ("has", "есть цены"), ("unknown", "не знаю")],
+    "cta": [("wa", "написать в WhatsApp"), ("call", "позвонить"), ("tg", "написать в Telegram")],
+}
+
+
+def _fact_current_value(ch: dict, field: str) -> str | None:
+    dna = ch.get("channel_dna") if isinstance(ch.get("channel_dna"), dict) else {}
+    known = dna.get("known_facts") if isinstance(dna.get("known_facts"), dict) else {}
+    if field == "cta":
+        return dna.get("cta")
+    if field == "forbidden_promises":
+        forbidden = dna.get("forbidden_angles") if isinstance(dna.get("forbidden_angles"), list) else []
+        return ", ".join(str(x) for x in forbidden[:4]) if forbidden else None
+    value = known.get(field)
+    if field == "age_groups" and isinstance(value, list):
+        rendered = []
+        for item in value[:3]:
+            if isinstance(item, dict):
+                rendered.append(f"{item.get('age')}: {', '.join(item.get('directions') or [])}")
+        return "; ".join(rendered) if rendered else None
+    if isinstance(value, bool):
+        return "да" if value else "нет"
+    if value:
+        return str(value)
+    return None
+
+
+def _apply_channel_fact(ch: dict, field: str, raw_value: str) -> dict:
+    result = validate_questionnaire_input(field, raw_value, ch)
+    if not result["ok"]:
+        return result
+    ch["channel_dna"] = build_proposed_channel_dna(
+        ch.get("channel_dna") or {},
+        {field: result["normalized"]},
+    )
+    _save_channel(ch)
+    return result
+
+
+async def screen_channel_fact_menu(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
+    ch = _load_channel(handle)
+    uid = _acting_uid(qm)
+    if not ch:
+        await _answer_or_send(qm, f"❌ Канал {html.escape(handle)} не найден.", None)
+        return
+    if not _can_view_channel_dna(uid, ch):
+        await _answer_or_send(qm, "⛔ Нет доступа к данным этого канала.", None)
+        return
+    if not questionnaire_supported(ch):
+        await screen_channel_data(qm, context, handle)
+        return
+
+    channel_id = ch.get("channel_id", handle)
+    rows = []
+    lines = [
+        "✏️ <b>Факты канала</b>",
+        "",
+        "Выбери пункт. Где можно — отвечай кнопкой. Где нужен текст — бот попросит короткий ответ.",
+        "",
+        "<b>Статус:</b>",
+    ]
+    for code, field, label, _kind in _FACT_FIELDS:
+        current = _fact_current_value(ch, field)
+        mark = "✅" if current else "⬜️"
+        lines.append(f"{mark} {html.escape(label)}" + (f": {html.escape(current)}" if current else ""))
+        rows.append([InlineKeyboardButton(f"{mark} {label}", callback_data=f"ui:cfask:{channel_id}:{code}")])
+    rows.append([InlineKeyboardButton("🧬 Готово", callback_data=f"ui:ch_data:{channel_id}")])
+    await _answer_or_send(qm, "\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+async def screen_channel_fact_question(qm, context: ContextTypes.DEFAULT_TYPE, handle: str, code: str):
+    ch = _load_channel(handle)
+    uid = _acting_uid(qm)
+    if not ch:
+        await _answer_or_send(qm, f"❌ Канал {html.escape(handle)} не найден.", None)
+        return
+    if not _can_view_channel_dna(uid, ch):
+        await _answer_or_send(qm, "⛔ Нет доступа к данным этого канала.", None)
+        return
+    field = _FACT_CODE_TO_FIELD.get(code)
+    if not field:
+        await screen_channel_fact_menu(qm, context, handle)
+        return
+
+    channel_id = ch.get("channel_id", handle)
+    label = _FACT_FIELD_TO_LABEL[field]
+    current = _fact_current_value(ch, field)
+    back = InlineKeyboardButton("◀️ К анкете", callback_data=f"ui:cfmenu:{channel_id}")
+    if code in _FACT_ENUM_VALUES:
+        rows = [
+            [InlineKeyboardButton(text, callback_data=f"ui:cfset:{channel_id}:{code}:{value_code}")]
+            for value_code, text in _FACT_ENUM_VALUES[code]
+        ]
+        rows.append([back])
+        text = f"✏️ <b>{html.escape(label)}</b>"
+        if current:
+            text += f"\n\nСейчас: <b>{html.escape(current)}</b>"
+        text += "\n\nВыбери вариант:"
+        await _answer_or_send(qm, text, InlineKeyboardMarkup(rows))
+        return
+
+    context.user_data["editing"] = {"handle": channel_id, "field": f"channel_fact:{code}"}
+    examples = {
+        "age": "Пример:\n<code>4-6: Lego WeDo\nс 7: EV3, Scratch</code>",
+        "city": "Пример: <code>Владивосток</code>",
+        "contact": "Пример: <code>+7 965 671-67-71</code> или <code>t.me/...</code>",
+        "address": "Напиши адрес. Если адрес не нужен — напиши <code>пропустить</code>.",
+        "forbid": "Пример: <code>гарантированный результат, результат за месяц, отучим от телефона</code>",
+    }
+    text = f"✏️ <b>{html.escape(label)}</b>"
+    if current:
+        text += f"\n\nСейчас: <b>{html.escape(current)}</b>"
+    text += f"\n\n{examples.get(code, 'Напиши короткий ответ.')}"
     await _answer_or_send(
         qm,
-        "✏️ <b>Уточнить факты канала</b>\n\nСкопируй шаблон, заполни только реальные факты и отправь одним сообщением.\n\n"
-        f"<pre>{html.escape(QUESTIONNAIRE_TEMPLATE)}</pre>",
-        kb,
+        text,
+        InlineKeyboardMarkup([[back]]),
     )
+
+
+async def action_channel_fact_set(qm, context: ContextTypes.DEFAULT_TYPE, handle: str, code: str, value_code: str):
+    ch = _load_channel(handle)
+    if not ch:
+        await _answer_or_send(qm, f"❌ Канал {html.escape(handle)} не найден.", None)
+        return
+    if not _can_view_channel_dna(_acting_uid(qm), ch):
+        await _answer_or_send(qm, "⛔ Нет доступа к данным этого канала.", None)
+        return
+    field = _FACT_CODE_TO_FIELD.get(code)
+    raw = dict(_FACT_ENUM_VALUES.get(code, [])).get(value_code)
+    if not field or raw is None:
+        await screen_channel_fact_menu(qm, context, handle)
+        return
+    result = _apply_channel_fact(ch, field, raw)
+    if result["ok"]:
+        await qm.answer("Сохранено.")
+    else:
+        await qm.answer(result["message"], show_alert=True)
+    await screen_channel_fact_menu(qm, context, ch.get("channel_id", handle))
 
 
 async def screen_archetype_picker(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
@@ -4002,6 +4156,35 @@ async def handle_settings_text_input(update: Update, context: ContextTypes.DEFAU
 
     success_msg = None
 
+    if field.startswith("channel_fact:"):
+        code = field.split(":", 1)[1]
+        fact_field = _FACT_CODE_TO_FIELD.get(code)
+        if not fact_field:
+            context.user_data.pop("editing", None)
+            await screen_channel_fact_menu(update.message, context, handle)
+            return True
+        if not _can_view_channel_dna(getattr(update.effective_user, "id", None), ch):
+            context.user_data.pop("editing", None)
+            await update.message.reply_text("⛔ Нет доступа к данным этого канала.")
+            return True
+        if not questionnaire_supported(ch):
+            context.user_data.pop("editing", None)
+            await update.message.reply_text("Анкета v1 для этого типа канала недоступна.")
+            return True
+        if text.strip().lower() in {"пропустить", "не знаю", "нет", "-"} and code in {"address", "forbid"}:
+            context.user_data.pop("editing", None)
+            await screen_channel_fact_menu(update.message, context, handle)
+            return True
+        result = _apply_channel_fact(ch, fact_field, text)
+        if not result["ok"]:
+            context.user_data["editing"] = {"handle": handle, "field": field}
+            await update.message.reply_text(f"⚠️ {result['message']}")
+            return True
+        context.user_data.pop("editing", None)
+        await update.message.reply_text("✅ Сохранено.")
+        await screen_channel_fact_menu(update.message, context, handle)
+        return True
+
     if field == "channel_facts":
         if not _can_view_channel_dna(getattr(update.effective_user, "id", None), ch):
             context.user_data.pop("editing", None)
@@ -5704,6 +5887,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ch_sched_custom", "ch_sched_copy", "ch_sched_copy_ok", "ch_images_toggle",
         "ch_history", "ch_set", "ch_set_img", "ch_folder", "ch_setfold",
         "ch_diag", "ch_data", "ch_data_edit",
+        "cfmenu", "cfask", "cfset",
         "ch_newfold", "ch_deleted_card", "ch_restore", "ch_purge", "ch_purge_ok", "ch_draft", "draft_new", "draft_qlast",
         "draft_qall", "draft_qbatch", "draft_preview_batch", "draft_clear", "draft_clearok", "rsy_toggle",
         "ch_archetype", "ch_set_arche", "ch_source_toggle", "ch_src_mode",
@@ -5984,6 +6168,15 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "ch_data_edit" and len(parts) >= 3:
         handle = parts[2]
         await screen_channel_data_edit(query, context, handle)
+
+    elif action == "cfmenu" and len(parts) >= 3:
+        await screen_channel_fact_menu(query, context, parts[2])
+
+    elif action == "cfask" and len(parts) >= 4:
+        await screen_channel_fact_question(query, context, parts[2], parts[3])
+
+    elif action == "cfset" and len(parts) >= 5:
+        await action_channel_fact_set(query, context, parts[2], parts[3], parts[4])
 
     elif action == "ch_topic_redo" and len(parts) >= 3:
         handle = parts[2]

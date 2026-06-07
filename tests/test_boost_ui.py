@@ -393,6 +393,80 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Диагностика канала", captured["text"])
         self.assertIn("4–6", captured["text"])
 
+    async def test_channel_data_screen_shows_guided_fact_entry_not_bulk_template(self):
+        captured = {}
+        channel = {
+            "channel_id": "@kids",
+            "owner_id": 100,
+            "archetype": "kids_education",
+            "channel_dna": {"known_facts": {"contact": "+7 965 671-67-71"}},
+        }
+
+        async def fake_answer_or_send(qm, text, kb):
+            captured["text"] = text
+            captured["kb"] = kb
+
+        with patch.object(ui, "_load_channel", return_value=channel), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
+            await ui.screen_channel_data(FakeQuery(100), SimpleNamespace(user_data={}), "@kids")
+
+        callbacks = [
+            button.callback_data
+            for row in captured["kb"].inline_keyboard
+            for button in row
+        ]
+        self.assertIn("ui:ch_data_edit:@kids", callbacks)
+        self.assertIn("Контакт", captured["text"])
+        self.assertNotIn("Шаблон для уточнения", captured["text"])
+
+    async def test_channel_fact_menu_lists_short_questions(self):
+        captured = {}
+        channel = {
+            "channel_id": "@kids",
+            "owner_id": 100,
+            "archetype": "kids_education",
+            "channel_dna": {"known_facts": {"contact": "+7 965 671-67-71"}},
+        }
+
+        async def fake_answer_or_send(qm, text, kb):
+            captured["text"] = text
+            captured["kb"] = kb
+
+        with patch.object(ui, "_load_channel", return_value=channel), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
+            await ui.screen_channel_fact_menu(FakeQuery(100), SimpleNamespace(user_data={}), "@kids")
+
+        callbacks = [
+            button.callback_data
+            for row in captured["kb"].inline_keyboard
+            for button in row
+        ]
+        self.assertIn("ui:cfask:@kids:age", callbacks)
+        self.assertIn("ui:cfask:@kids:free", callbacks)
+        self.assertIn("✅ Контакт", captured["text"])
+
+    async def test_channel_fact_button_saves_enum_fact(self):
+        captured = {}
+        saved = {}
+        channel = {"channel_id": "@kids", "owner_id": 100, "archetype": "kids_education", "channel_dna": {}}
+
+        async def fake_answer_or_send(qm, text, kb):
+            captured["text"] = text
+            captured["kb"] = kb
+
+        def fake_save(ch):
+            saved["channel"] = json.loads(json.dumps(ch, ensure_ascii=False))
+
+        with patch.object(ui, "_load_channel", return_value=channel), \
+                patch.object(ui, "_save_channel", side_effect=fake_save), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
+            query = FakeQuery(100)
+            await ui.action_channel_fact_set(query, SimpleNamespace(user_data={}), "@kids", "free", "yes")
+
+        self.assertEqual(saved["channel"]["channel_dna"]["known_facts"]["free_trial"], True)
+        self.assertEqual(query.answers[-1][0], "Сохранено.")
+        self.assertIn("Бесплатное пробное", captured["text"])
+
     async def test_deleted_channels_screen_lists_channels_only(self):
         captured = {}
         channels = [
