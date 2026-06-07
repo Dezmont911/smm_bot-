@@ -40,6 +40,8 @@ BOOST_REASON_CHANNEL_DISABLED = "boost_channel_disabled"
 BOOST_REASON_MISSING_SERVICE_ID = "missing_service_id"
 BOOST_REASON_TWIBOOST_NOT_CONFIGURED = "twiboost_not_configured"
 BOOST_REASON_PROVIDER_ERROR = "provider_error"
+MIN_BOOST_QUANTITY = 500
+MAX_BOOST_QUANTITY = 100000
 
 REQUIRED_ENV_VARS = (
     "TWIBOOST_API_KEY",
@@ -213,7 +215,7 @@ def _default_settings(config=cfg) -> dict:
         "boost_dry_run": bool(getattr(config, "BOOST_DRY_RUN", True)),
         "real_orders_enabled": bool(getattr(config, "BOOST_REAL_ORDERS_ENABLED", False)),
         "default_quantity": int(getattr(config, "BOOST_DEFAULT_QUANTITY", 500) or 500),
-        "default_service_id": str(getattr(config, "TWIBOOST_VIEWS_SERVICE_ID", "") or "") or None,
+        "default_service_id": _default_service_id_from_config(config),
         "provider": BOOST_PROVIDER,
         "last_error": None,
         "updated_at": None,
@@ -228,6 +230,8 @@ def _settings_from_row(row, config=cfg) -> dict:
     data["boost_dry_run"] = bool(data.get("boost_dry_run"))
     data["real_orders_enabled"] = bool(data.get("real_orders_enabled"))
     data["default_quantity"] = int(data.get("default_quantity") or getattr(config, "BOOST_DEFAULT_QUANTITY", 500) or 500)
+    if not _service_id_ok(data.get("default_service_id")):
+        data["default_service_id"] = _default_service_id_from_config(config)
     data["provider"] = data.get("provider") or BOOST_PROVIDER
     return data
 
@@ -362,9 +366,12 @@ def parse_boost_quantity(value: int | str, config=cfg) -> dict:
         raise ValueError("quantity_invalid")
     quantity_min = int(match.group(1))
     quantity_max = int(match.group(2) or match.group(1))
-    max_quantity = int(getattr(config, "BOOST_MAX_QUANTITY", 100000) or 100000)
+    min_quantity = int(getattr(config, "BOOST_MIN_QUANTITY", MIN_BOOST_QUANTITY) or MIN_BOOST_QUANTITY)
+    max_quantity = int(getattr(config, "BOOST_MAX_QUANTITY", MAX_BOOST_QUANTITY) or MAX_BOOST_QUANTITY)
     if quantity_min <= 0 or quantity_max <= 0:
         raise ValueError("quantity_must_be_positive")
+    if quantity_min < min_quantity or quantity_max < min_quantity:
+        raise ValueError("quantity_too_small")
     if quantity_min > max_quantity or quantity_max > max_quantity:
         raise ValueError("quantity_too_large")
     if quantity_max < quantity_min:
@@ -376,11 +383,13 @@ def parse_boost_quantity(value: int | str, config=cfg) -> dict:
     }
 
 
-def select_boost_quantity(quantity_min: int, quantity_max: int, rng=None) -> int:
+def select_boost_quantity(quantity_min: int, quantity_max: int, rng=None, config=cfg) -> int:
     rng = rng or random.randint
     quantity_min = int(quantity_min)
     quantity_max = int(quantity_max)
-    if quantity_min <= 0 or quantity_max < quantity_min:
+    min_quantity = int(getattr(config, "BOOST_MIN_QUANTITY", MIN_BOOST_QUANTITY) or MIN_BOOST_QUANTITY)
+    max_quantity = int(getattr(config, "BOOST_MAX_QUANTITY", MAX_BOOST_QUANTITY) or MAX_BOOST_QUANTITY)
+    if quantity_min < min_quantity or quantity_max < quantity_min or quantity_max > max_quantity:
         raise ValueError("quantity_invalid")
     if quantity_min == quantity_max:
         return quantity_min
@@ -402,9 +411,18 @@ def boost_quantity_spec_from_channel(channel: dict, settings: dict | None = None
 
 def _service_id_ok(value: int | str | None) -> bool:
     try:
-        return int(value or 0) > 0
+        return int(str(value or "").strip() or 0) > 0
     except (TypeError, ValueError):
         return False
+
+
+def _service_id_int(value: int | str | None) -> int:
+    return int(str(value or "").strip() or 0) if _service_id_ok(value) else 0
+
+
+def _default_service_id_from_config(config=cfg) -> str | None:
+    value = getattr(config, "TWIBOOST_VIEWS_SERVICE_ID", None)
+    return str(_service_id_int(value)) if _service_id_ok(value) else None
 
 
 def _smm_channel_identifier(channel: dict) -> str:
@@ -569,7 +587,7 @@ def add_tracked_channel(
         config,
     )
     qty = int(quantity_spec["quantity_min"])
-    svc = str(service_id or getattr(config, "TWIBOOST_VIEWS_SERVICE_ID", "") or "") or None
+    svc = str(_service_id_int(service_id)) if _service_id_ok(service_id) else None
     tg_chat_id = _normalize_chat_id_value(snapshot_tg_chat_id if snapshot_tg_chat_id is not None else normalized["tg_chat_id"])
     username = _normalize_username_value(snapshot_username or normalized["username"])
     with _connect(database) as conn:
@@ -1055,7 +1073,7 @@ async def handle_boost_channel_post_dry_run(message, database=db, config=cfg, cl
         return {"status": "duplicate", "reason": "already_has_event", "channel": channel, "event": existing}
 
     quantity_spec = boost_quantity_spec_from_channel(channel, settings, config)
-    quantity = select_boost_quantity(quantity_spec["quantity_min"], quantity_spec["quantity_max"])
+    quantity = select_boost_quantity(quantity_spec["quantity_min"], quantity_spec["quantity_max"], config=config)
 
     post_url_result = build_telegram_post_url(channel, message)
 
@@ -1175,7 +1193,7 @@ class TwiBoostClientWrapper:
         self.config = config
         self.api_key = api_key if api_key is not None else getattr(config, "TWIBOOST_API_KEY", "")
         self.api_url = api_url if api_url is not None else getattr(config, "TWIBOOST_API_URL", "")
-        self.service_id = int(service_id if service_id is not None else getattr(config, "TWIBOOST_VIEWS_SERVICE_ID", 0) or 0)
+        self.service_id = _service_id_int(service_id if service_id is not None else getattr(config, "TWIBOOST_VIEWS_SERVICE_ID", 0))
         self.timeout = timeout
 
     @property
@@ -1215,7 +1233,7 @@ class TwiBoostClientWrapper:
         dry_run: bool = True,
     ) -> dict:
         qty = int(quantity or getattr(self.config, "BOOST_DEFAULT_QUANTITY", 500) or 500)
-        svc = int(service_id or self.service_id or 0)
+        svc = _service_id_int(service_id or self.service_id)
         payload = {"action": "add", "service": svc, "link": post_url, "quantity": qty}
         configured_for_order = bool(self.api_key and self.api_url and svc > 0)
 

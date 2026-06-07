@@ -165,10 +165,10 @@ class Config:
         default_factory=lambda: _optional("TWIBOOST_API_URL", "https://twiboost.com/api/v2")
     )
     TWIBOOST_VIEWS_SERVICE_ID: int = field(
-        default_factory=lambda: int(v) if (v := _optional("TWIBOOST_VIEWS_SERVICE_ID", "0")).isdigit() else 0
+        default_factory=lambda: int(v) if (v := _optional("TWIBOOST_VIEWS_SERVICE_ID", "0").strip()).isdigit() else 0
     )
     BOOST_DEFAULT_QUANTITY: int = field(
-        default_factory=lambda: int(v) if (v := _optional("BOOST_DEFAULT_QUANTITY", "500")).isdigit() else 500
+        default_factory=lambda: int(v) if (v := _optional("BOOST_DEFAULT_QUANTITY", "500").strip()).isdigit() else 500
     )
     BOOST_DRY_RUN: bool = field(
         default_factory=lambda: _optional("BOOST_DRY_RUN", "true").lower() == "true"

@@ -50,8 +50,17 @@ class BoostManagerTests(unittest.TestCase):
         self.assertTrue(settings["boost_dry_run"])
         self.assertFalse(settings["real_orders_enabled"])
         self.assertEqual(settings["default_quantity"], 500)
+        self.assertEqual(settings["default_service_id"], "123")
         self.assertTrue(boost_configured(self.config))
         self.assertFalse(boost_real_orders_allowed(settings, self.config))
+
+    def test_settings_default_service_id_falls_back_to_env_config(self):
+        missing_service_config = SimpleNamespace(**{**self.config.__dict__, "TWIBOOST_VIEWS_SERVICE_ID": 0})
+        save_boost_settings({"boost_enabled": True, "default_service_id": None}, self.db, missing_service_config)
+
+        settings = get_boost_settings(self.db, self.config)
+
+        self.assertEqual(settings["default_service_id"], "123")
 
     def test_tracked_channel_storage_is_separate(self):
         conn = self.db.connect()
@@ -210,7 +219,7 @@ class BoostManagerTests(unittest.TestCase):
     def test_quantity_validation_rejects_bad_values_without_mutating(self):
         added = add_tracked_channel("@boosted", owner_id=100, quantity=900, database=self.db, config=self.config)
 
-        for bad in ("abc", "0", "-5", "100001"):
+        for bad in ("abc", "0", "-5", "499", "1-600", "100001"):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     set_tracked_channel_quantity(added["id"], bad, self.db)
@@ -221,20 +230,25 @@ class BoostManagerTests(unittest.TestCase):
 
     def test_parse_boost_quantity_fixed_and_ranges(self):
         self.assertEqual(
-            parse_boost_quantity("600", self.config),
-            {"quantity_min": 600, "quantity_max": 600, "quantity_display": "600"},
+            parse_boost_quantity("500", self.config),
+            {"quantity_min": 500, "quantity_max": 500, "quantity_display": "500"},
         )
         self.assertEqual(
-            parse_boost_quantity("600-610", self.config),
-            {"quantity_min": 600, "quantity_max": 610, "quantity_display": "600–610"},
+            parse_boost_quantity("500-550", self.config),
+            {"quantity_min": 500, "quantity_max": 550, "quantity_display": "500–550"},
+        )
+        self.assertEqual(
+            parse_boost_quantity("600-700", self.config),
+            {"quantity_min": 600, "quantity_max": 700, "quantity_display": "600–700"},
         )
         self.assertEqual(
             parse_boost_quantity("600 – 610", self.config),
             {"quantity_min": 600, "quantity_max": 610, "quantity_display": "600–610"},
         )
+        self.assertEqual(validate_boost_quantity("100000"), 100000)
 
     def test_parse_boost_quantity_rejects_invalid_inputs(self):
-        for bad in ("", "0", "-1", "600-", "-600", "600--700", "600abc", "600/700", "600,700", "600.700", "0-100", "700-600", "100001"):
+        for bad in ("", "0", "-1", "499", "1-600", "600-", "-600", "600--700", "600abc", "600/700", "600,700", "600.700", "0-100", "700-600", "100001"):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     parse_boost_quantity(bad, self.config)
@@ -257,9 +271,9 @@ class BoostManagerTests(unittest.TestCase):
         self.assertEqual(ranged["quantity_display"], "650–750")
 
     def test_manual_external_inputs_still_work(self):
-        username = add_tracked_channel("@external", owner_id=100, quantity=100, database=self.db, config=self.config)
-        link = add_tracked_channel("https://t.me/external2", owner_id=100, quantity=200, database=self.db, config=self.config)
-        private = add_tracked_channel("-1001234567890", owner_id=100, quantity=300, database=self.db, config=self.config)
+        username = add_tracked_channel("@external", owner_id=100, quantity=500, database=self.db, config=self.config)
+        link = add_tracked_channel("https://t.me/external2", owner_id=100, quantity=600, database=self.db, config=self.config)
+        private = add_tracked_channel("-1001234567890", owner_id=100, quantity=700, database=self.db, config=self.config)
 
         self.assertEqual(username["username"], "external")
         self.assertEqual(link["username"], "external2")
@@ -270,9 +284,12 @@ class BoostManagerTests(unittest.TestCase):
         names = required_env_vars()
 
         self.assertIn("TWIBOOST_API_KEY", names)
+        self.assertIn("TWIBOOST_VIEWS_SERVICE_ID", names)
         self.assertIn("BOOST_REAL_ORDERS_ENABLED", names)
         self.assertNotIn("API_KEY", names)
         self.assertNotIn("SERVICE_ID", names)
+        self.assertNotIn("BOOST_SERVICE_ID", names)
+        self.assertNotIn("SMM_SERVICE_ID", names)
 
 
 class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
@@ -581,6 +598,50 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.calls, [{"dry_run": False, "quantity": 500, "service_id": "123"}])
         self.assertEqual(result["event"]["provider_order_id"], "98765")
         self.assertFalse(bool(result["event"]["dry_run"]))
+
+    async def test_real_order_prefers_channel_service_id_over_env_default(self):
+        class RecordingClient:
+            api_key = "secret"
+            api_url = "https://twiboost.example/api"
+
+            def __init__(self):
+                self.calls = []
+
+            async def create_views_order(self, post_url, quantity, service_id, dry_run=True):
+                self.calls.append({"dry_run": dry_run, "service_id": service_id})
+                return {"order": 12345}
+
+        config = SimpleNamespace(**{**self.config.__dict__, "BOOST_REAL_ORDERS_ENABLED": True, "BOOST_DRY_RUN": False})
+        save_boost_settings({"boost_enabled": True}, self.db, config)
+        add_tracked_channel("@boosted", owner_id=100, service_id=456, enabled=True, database=self.db, config=config)
+        client = RecordingClient()
+
+        result = await handle_boost_channel_post_dry_run(self._message(message_id=65), self.db, config, client=client)
+
+        self.assertEqual(result["status"], "ordered")
+        self.assertEqual(client.calls, [{"dry_run": False, "service_id": "456"}])
+
+    async def test_real_order_uses_env_service_id_when_channel_service_id_empty(self):
+        class RecordingClient:
+            api_key = "secret"
+            api_url = "https://twiboost.example/api"
+
+            def __init__(self):
+                self.calls = []
+
+            async def create_views_order(self, post_url, quantity, service_id, dry_run=True):
+                self.calls.append({"dry_run": dry_run, "service_id": service_id})
+                return {"order": 12346}
+
+        config = SimpleNamespace(**{**self.config.__dict__, "BOOST_REAL_ORDERS_ENABLED": True, "BOOST_DRY_RUN": False})
+        save_boost_settings({"boost_enabled": True, "default_service_id": None}, self.db, config)
+        add_tracked_channel("@boosted", owner_id=100, service_id=None, enabled=True, database=self.db, config=config)
+        client = RecordingClient()
+
+        result = await handle_boost_channel_post_dry_run(self._message(message_id=66), self.db, config, client=client)
+
+        self.assertEqual(result["status"], "ordered")
+        self.assertEqual(client.calls, [{"dry_run": False, "service_id": "123"}])
 
     async def test_real_order_media_group_duplicate_calls_provider_once(self):
         class RecordingClient:

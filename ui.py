@@ -4150,7 +4150,7 @@ async def action_boost_pick_smm_channel(qm, context: ContextTypes.DEFAULT_TYPE, 
             f"📋 <b>{html.escape(_boost_smm_name(ch))}</b>\n\n"
             f"Канал: <code>{html.escape(_boost_smm_identity(ch))}</code>\n"
             f"Количество по умолчанию: <b>{settings.get('default_quantity')}</b>\n\n"
-            "Введите количество просмотров: например 600 или диапазон 600-610. Канал будет сохранен выключенным по умолчанию."
+            "Введите количество просмотров: например 500 или диапазон 500-550. Канал будет сохранен выключенным по умолчанию."
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"ui:boost_add_mine:{page}")]]),
@@ -4244,7 +4244,7 @@ async def handle_boost_text_input(update: Update, context: ContextTypes.DEFAULT_
         try:
             quantity = parse_boost_quantity(raw)["quantity_display"]
         except ValueError:
-            await update.message.reply_text("❌ Некорректное количество. Используйте число 600 или диапазон 600-610. Ноль, отрицательные числа и символы запрещены.")
+            await update.message.reply_text("❌ Минимальное количество просмотров — 500. Используйте число 500 или диапазон 500-550.")
             return True
 
         channels = _boost_smm_candidates(user.id)
@@ -4280,7 +4280,7 @@ async def handle_boost_text_input(update: Update, context: ContextTypes.DEFAULT_
             quantity = parse_boost_quantity(raw)["quantity_display"]
             ch = add_tracked_channel(external_raw, owner_id=user.id, quantity=quantity, enabled=False)
         except ValueError:
-            await update.message.reply_text("❌ Некорректное количество. Используйте число 600 или диапазон 600-610. Ноль, отрицательные числа и символы запрещены.")
+            await update.message.reply_text("❌ Минимальное количество просмотров — 500. Используйте число 500 или диапазон 500-550.")
             return True
         _clear_boost_pending(context)
         await update.message.reply_text(
@@ -4312,7 +4312,7 @@ async def handle_boost_text_input(update: Update, context: ContextTypes.DEFAULT_
         settings = get_boost_settings()
         await update.message.reply_text(
             (
-                "Введите количество просмотров: например 600 или диапазон 600-610.\n"
+                "Введите количество просмотров: например 500 или диапазон 500-550.\n"
                 f"Количество по умолчанию: {settings.get('default_quantity')}"
             )
         )
@@ -4325,7 +4325,7 @@ async def handle_boost_text_input(update: Update, context: ContextTypes.DEFAULT_
             quantity = parse_boost_quantity(raw)["quantity_display"]
             ch = set_tracked_channel_quantity(int(qty_channel_id), quantity)
         except (TypeError, ValueError):
-            await update.message.reply_text("❌ Некорректное количество. Используйте число 600 или диапазон 600-610. Ноль, отрицательные числа и символы запрещены.")
+            await update.message.reply_text("❌ Минимальное количество просмотров — 500. Используйте число 500 или диапазон 500-550.")
             return True
         context.user_data.pop("boost_set_quantity_for", None)
         await update.message.reply_text(
@@ -4697,7 +4697,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["boost_set_quantity_for"] = int(parts[2])
             await query.answer()
             await query.edit_message_text(
-                "Введите количество просмотров: например 600 или диапазон 600-610.",
+                "Введите количество просмотров: например 500 или диапазон 500-550.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"ui:boost_ch:{parts[2]}")]]),
             )
         elif action == "boost_ch_del" and len(parts) >= 3 and parts[2].isdigit():
