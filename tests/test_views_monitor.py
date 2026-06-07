@@ -48,6 +48,49 @@ class ViewsMonitorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(row["subs_low"])
 
+    def test_build_hourly_alert_report_throttles_subscriber_alerts(self):
+        now = datetime(2026, 6, 7, 12, 0, 0, tzinfo=timezone.utc)
+        due = {"channel_id": "@due", "folder": views_monitor.DEFAULT_FOLDER}
+        recent = {
+            "channel_id": "@recent",
+            "folder": views_monitor.DEFAULT_FOLDER,
+            views_monitor.SUBS_ALERT_LAST_FIELD: (now - timedelta(hours=2)).isoformat(),
+        }
+        other_folder = {"channel_id": "@other", "folder": "Other"}
+        low_views = {
+            "channel_id": "@views",
+            "folder": views_monitor.DEFAULT_FOLDER,
+            views_monitor.SUBS_ALERT_LAST_FIELD: now.isoformat(),
+        }
+        report = {
+            "checked": 4,
+            "rows": [
+                {"channel": due, "subs_low": True, "low_posts": []},
+                {"channel": recent, "subs_low": True, "low_posts": []},
+                {"channel": other_folder, "subs_low": True, "low_posts": []},
+                {"channel": low_views, "subs_low": True, "low_posts": [{"id": 10}]},
+            ],
+            "flagged": [],
+            "created_at": now.isoformat(),
+        }
+
+        alert_report, to_mark = views_monitor.build_hourly_alert_report(report, now)
+
+        self.assertEqual([ch["channel_id"] for ch in to_mark], ["@due"])
+        self.assertEqual([row["channel"]["channel_id"] for row in alert_report["flagged"]], ["@due", "@views"])
+        self.assertTrue(alert_report["flagged"][0]["subs_low"])
+        self.assertFalse(alert_report["flagged"][1]["subs_low"])
+
+    def test_mark_subscriber_alert_sent_sets_timestamp(self):
+        now = datetime(2026, 6, 7, 12, 0, 0, tzinfo=timezone.utc)
+        ch = {"channel_id": "@rsy", "folder": views_monitor.DEFAULT_FOLDER}
+
+        views_monitor.mark_subscriber_alert_sent(ch, now)
+
+        self.assertEqual(ch[views_monitor.SUBS_ALERT_LAST_FIELD], now.isoformat())
+        self.assertFalse(views_monitor.subscriber_alert_due(ch, now + timedelta(hours=23)))
+        self.assertTrue(views_monitor.subscriber_alert_due(ch, now + timedelta(hours=24)))
+
 
 if __name__ == "__main__":
     unittest.main()

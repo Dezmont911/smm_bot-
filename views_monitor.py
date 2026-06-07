@@ -18,6 +18,8 @@ WATCH_MIN_H = 18
 WATCH_MAX_H = 50
 POST_LIMIT = 25
 DEFAULT_FOLDER = "РСЯ"
+SUBS_ALERT_INTERVAL_H = 24
+SUBS_ALERT_LAST_FIELD = "views_monitor_last_subs_alert_utc"
 
 
 def is_tester_channel(ch: dict) -> bool:
@@ -31,6 +33,10 @@ def monitor_enabled(ch: dict) -> bool:
         return True
     if value is False:
         return False
+    return (ch.get("folder") or "").strip().casefold() == DEFAULT_FOLDER.casefold()
+
+
+def is_default_folder(ch: dict) -> bool:
     return (ch.get("folder") or "").strip().casefold() == DEFAULT_FOLDER.casefold()
 
 
@@ -78,6 +84,36 @@ def _parse_post_dt(value: Any):
         return datetime.strptime(str(value), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
     except Exception:
         return None
+
+
+def _parse_iso_dt(value: Any):
+    if not value:
+        return None
+    try:
+        text = str(value)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def subscriber_alert_due(ch: dict, now: datetime | None = None) -> bool:
+    if not is_default_folder(ch):
+        return False
+    now = now or datetime.now(timezone.utc)
+    last = _parse_iso_dt(ch.get(SUBS_ALERT_LAST_FIELD))
+    if last is None:
+        return True
+    return (now - last).total_seconds() >= SUBS_ALERT_INTERVAL_H * 3600
+
+
+def mark_subscriber_alert_sent(ch: dict, now: datetime | None = None) -> None:
+    now = now or datetime.now(timezone.utc)
+    ch[SUBS_ALERT_LAST_FIELD] = now.astimezone(timezone.utc).isoformat()
 
 
 async def collect_channel_snapshot(bot, ch: dict, now: datetime | None = None) -> dict:
@@ -141,6 +177,26 @@ async def collect_monitor_report(bot, channels: list[dict]) -> dict:
         rows.append(await collect_channel_snapshot(bot, ch, now))
     flagged = [row for row in rows if row.get("subs_low") or row.get("low_posts")]
     return {"checked": len(rows), "rows": rows, "flagged": flagged, "created_at": now.isoformat()}
+
+
+def build_hourly_alert_report(report: dict, now: datetime | None = None) -> tuple[dict, list[dict]]:
+    """Keep hourly view alerts, but throttle subscriber alerts to once per 24h."""
+    now = now or datetime.now(timezone.utc)
+    flagged = []
+    subs_channels_to_mark = []
+    for row in report.get("rows") or []:
+        low_posts = bool(row.get("low_posts"))
+        subs_due = bool(row.get("subs_low")) and subscriber_alert_due(row.get("channel") or {}, now)
+        if not low_posts and not subs_due:
+            continue
+        alert_row = dict(row)
+        alert_row["subs_low"] = subs_due
+        flagged.append(alert_row)
+        if subs_due:
+            subs_channels_to_mark.append(row["channel"])
+    alert_report = dict(report)
+    alert_report["flagged"] = flagged
+    return alert_report, subs_channels_to_mark
 
 
 def _channel_title(ch: dict) -> str:

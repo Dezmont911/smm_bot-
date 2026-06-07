@@ -264,6 +264,33 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("ui:ch_review:@three", callbacks)
         self.assertIn("Anime", captured["text"])
 
+    async def test_views_monitor_screen_filters_channels_by_selected_folder(self):
+        captured = {}
+        channels = [
+            {"channel_id": "@one", "name": "One", "folder": ui.VIEWS_MONITOR_DEFAULT_FOLDER, "active": True},
+            {"channel_id": "@two", "name": "Two", "folder": "Anime", "views_monitor_enabled": True, "active": True},
+            {"channel_id": "@three", "name": "Three", "active": True},
+        ]
+        context = SimpleNamespace(user_data={"viewsfolder": "Anime"})
+
+        async def fake_answer_or_send(qm, text, kb):
+            captured["text"] = text
+            captured["kb"] = kb
+
+        with patch.object(ui, "_load_channels", return_value=channels), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
+            await ui.screen_admin_views_monitor(FakeQuery(100), context)
+
+        labels = [
+            button.text
+            for row in captured["kb"].inline_keyboard
+            for button in row
+        ]
+        self.assertTrue(any("Two" in label for label in labels))
+        self.assertFalse(any("One" in label for label in labels))
+        self.assertFalse(any("Three" in label for label in labels))
+        self.assertIn("Anime", captured["text"])
+
     async def test_ensure_one_ready_post_keeps_existing_ready_post(self):
         with patch.object(ui.buffer, "get_ready_count", return_value=1), \
                 patch.object(ui.generator, "run_for_channel", new=AsyncMock()) as gen_mock:

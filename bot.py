@@ -68,7 +68,12 @@ from ui import (
     admin_default_rsy_enabled,
 )
 from boost_manager import handle_boost_channel_post_dry_run
-from views_monitor import collect_monitor_report, digest_text as views_digest_text
+from views_monitor import (
+    build_hourly_alert_report,
+    collect_monitor_report,
+    digest_text as views_digest_text,
+    mark_subscriber_alert_sent,
+)
 import accounts
 from accounts import (
     has_access, is_registered, is_superadmin,
@@ -3898,19 +3903,29 @@ async def send_alert(bot, message: str):
             text=message,
             parse_mode=ParseMode.HTML,
         )
+        return True
     except Exception as e:
         logger.error(f"Не удалось отправить алерт: {e}")
+        return False
 
 
 async def monitor_channel_views(bot):
     """Сводный дайджест по охватам отслеживаемых каналов (раз в час)."""
     report = await collect_monitor_report(bot, load_all_channels())
-    if not report.get("flagged"):
+    alert_report, subs_channels_to_mark = build_hourly_alert_report(report)
+    if not alert_report.get("flagged"):
         logger.info("views-monitor: всё в норме, алерт не нужен")
         return
 
-    await send_alert(bot, views_digest_text(report))
-    logger.info(f"views-monitor: алерт отправлен, каналов в списке {len(report.get('flagged') or [])}")
+    sent = await send_alert(bot, views_digest_text(alert_report))
+    if sent:
+        for ch in subs_channels_to_mark:
+            try:
+                mark_subscriber_alert_sent(ch)
+                save_channel_card(ch)
+            except Exception as e:
+                logger.warning(f"views-monitor: не удалось сохранить кулдаун подписчиков {ch.get('channel_id')}: {e}")
+        logger.info(f"views-monitor: алерт отправлен, каналов в списке {len(alert_report.get('flagged') or [])}")
 
 
 # ============================================================

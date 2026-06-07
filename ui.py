@@ -70,6 +70,7 @@ from boost_manager import (
 from views_monitor import (
     DEFAULT_FOLDER as VIEWS_MONITOR_DEFAULT_FOLDER,
     POST_LIMIT as VIEWS_MONITOR_POST_LIMIT,
+    SUBS_ALERT_INTERVAL_H as VIEWS_MONITOR_SUBS_ALERT_INTERVAL_H,
     SUBS_MIN as VIEWS_MONITOR_SUBS_MIN,
     VIEWS_MIN as VIEWS_MONITOR_VIEWS_MIN,
     WATCH_MAX_H as VIEWS_MONITOR_WATCH_MAX_H,
@@ -4772,6 +4773,50 @@ def _admin_monitor_channels(uid: int | None) -> list[dict]:
     ]
 
 
+def _views_monitor_folders(uid: int | None) -> list[str]:
+    seen = set()
+    for ch in _admin_monitor_channels(uid):
+        folder = (ch.get("folder") or "").strip()
+        if folder:
+            seen.add(folder)
+    return sorted(seen)
+
+
+def _views_monitor_folder(qm, context: ContextTypes.DEFAULT_TYPE) -> str:
+    folder = context.user_data.get("viewsfolder")
+    if folder:
+        return folder
+    folders = _views_monitor_folders(_acting_uid(qm))
+    for existing in folders:
+        if existing.casefold() == VIEWS_MONITOR_DEFAULT_FOLDER.casefold():
+            return existing
+    return "__all__"
+
+
+def _views_monitor_scope_channels(qm, context: ContextTypes.DEFAULT_TYPE, folder: str | None = None) -> list[dict]:
+    current = folder if folder is not None else _views_monitor_folder(qm, context)
+    return _folder_filtered_channels(_admin_monitor_channels(_acting_uid(qm)), current)
+
+
+async def screen_admin_views_folders(qm, context: ContextTypes.DEFAULT_TYPE):
+    uid = _acting_uid(qm)
+    allch = _admin_monitor_channels(uid)
+    folders = _views_monitor_folders(uid)
+    nofolder = sum(1 for c in allch if not (c.get("folder") or "").strip())
+    rows = [[InlineKeyboardButton(f"📋 Все каналы ({len(allch)})", callback_data="ui:adm_viewsfold:all")]]
+    for i, folder in enumerate(folders):
+        cnt = sum(1 for c in allch if (c.get("folder") or "").strip() == folder)
+        rows.append([InlineKeyboardButton(f"📁 {folder} ({cnt})", callback_data=f"ui:adm_viewsfold:{i}")])
+    if nofolder:
+        rows.append([InlineKeyboardButton(f"📂 Без папки ({nofolder})", callback_data="ui:adm_viewsfold:none")])
+    rows.append([InlineKeyboardButton("◀️ Мониторинг", callback_data="ui:adm_views")])
+    await _answer_or_send(
+        qm,
+        "📁 <b>Папки мониторинга</b>\n\nВыбери область, которую нужно настроить или проверить.",
+        InlineKeyboardMarkup(rows),
+    )
+
+
 def _views_monitor_button_label(ch: dict) -> str:
     enabled = monitor_enabled(ch)
     folder = (ch.get("folder") or "без папки").strip()
@@ -4796,14 +4841,23 @@ def _toggle_views_monitor_channel(ch: dict) -> bool:
 
 async def screen_admin_views_monitor(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
     uid = _acting_uid(qm)
-    channels = _admin_monitor_channels(uid)
-    monitored = select_monitored_channels(channels)
+    folder = _views_monitor_folder(qm, context)
+    all_channels = _admin_monitor_channels(uid)
+    channels = _views_monitor_scope_channels(qm, context, folder)
+    monitored = select_monitored_channels(all_channels)
+    scoped_monitored = select_monitored_channels(channels)
     total = len(channels)
     pages = max(1, (total + VIEWS_MONITOR_PAGE_SIZE - 1) // VIEWS_MONITOR_PAGE_SIZE)
     page = max(0, min(page, pages - 1))
     chunk = channels[page * VIEWS_MONITOR_PAGE_SIZE:(page + 1) * VIEWS_MONITOR_PAGE_SIZE]
 
-    rows = [[InlineKeyboardButton("🔄 Проверить сейчас", callback_data="ui:adm_views_check")]]
+    folder_row = [InlineKeyboardButton("📁 Папки", callback_data="ui:adm_views_folders")]
+    if folder != "__all__":
+        folder_row.append(InlineKeyboardButton("📋 Все каналы", callback_data="ui:adm_viewsfold:all"))
+    rows = [
+        folder_row,
+        [InlineKeyboardButton(f"🔄 Проверить сейчас: {_folder_scope_title(folder)}", callback_data="ui:adm_views_check")],
+    ]
     for i, ch in enumerate(chunk):
         rows.append([InlineKeyboardButton(
             _views_monitor_button_label(ch),
@@ -4823,10 +4877,12 @@ async def screen_admin_views_monitor(qm, context: ContextTypes.DEFAULT_TYPE, pag
         "Автопроверка: <b>каждый час</b>\n"
         f"Пост считается проблемным: <b>{VIEWS_MONITOR_WATCH_MIN_H}-{VIEWS_MONITOR_WATCH_MAX_H}ч</b> "
         f"и меньше <b>{VIEWS_MONITOR_VIEWS_MIN}</b> просмотров\n"
-        f"Подписчики: меньше <b>{VIEWS_MONITOR_SUBS_MIN}</b>\n"
+        f"Подписчики: меньше <b>{VIEWS_MONITOR_SUBS_MIN}</b>; автоалерт по РСЯ не чаще <b>1 раза в {VIEWS_MONITOR_SUBS_ALERT_INTERVAL_H}ч</b>\n"
         f"Просматривается последних постов: <b>{VIEWS_MONITOR_POST_LIMIT}</b>\n"
         f"По умолчанию включена папка: <b>{VIEWS_MONITOR_DEFAULT_FOLDER}</b>\n\n"
-        f"Отслеживается каналов: <b>{len(monitored)}</b> из <b>{total}</b>"
+        f"Область: <b>{_folder_scope_title(folder)}</b>\n"
+        f"Отслеживается в области: <b>{len(scoped_monitored)}</b> из <b>{total}</b>\n"
+        f"Всего отслеживается: <b>{len(monitored)}</b> из <b>{len(all_channels)}</b>"
     )
     if pages > 1:
         text += f"\nСтраница: <b>{page + 1}/{pages}</b>"
@@ -4834,7 +4890,7 @@ async def screen_admin_views_monitor(qm, context: ContextTypes.DEFAULT_TYPE, pag
 
 
 async def action_admin_views_toggle(qm, context: ContextTypes.DEFAULT_TYPE, page: int, index: int):
-    channels = _admin_monitor_channels(_acting_uid(qm))
+    channels = _views_monitor_scope_channels(qm, context)
     offset = page * VIEWS_MONITOR_PAGE_SIZE + index
     if 0 <= offset < len(channels):
         state = _toggle_views_monitor_channel(channels[offset])
@@ -4858,7 +4914,7 @@ async def action_admin_views_check(qm, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    report = await collect_monitor_report(context.bot, _admin_monitor_channels(_acting_uid(qm)))
+    report = await collect_monitor_report(context.bot, _views_monitor_scope_channels(qm, context))
     text = views_monitor_digest_text(report, manual=True)
     if len(text) > 3900:
         text = text[:3800].rsplit("\n", 1)[0] + "\n\n…отчёт обрезан, слишком много строк."
@@ -5068,7 +5124,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 👑 Админ-действия — только для главного владельца (superadmin)
     if action in ("admin", "adm_inv", "adm_users", "adm_revoke", "adm_pro", "adm_chans", "adm_cost",
-                  "adm_views", "adm_views_check", "adm_views_tgl",
+                  "adm_views", "adm_views_check", "adm_views_tgl", "adm_views_folders", "adm_viewsfold",
                   "boost", "boost_toggle", "boost_add", "boost_add_mine", "boost_add_ext", "boost_pick",
                   "boost_channels", "boost_events", "boost_ch", "boost_ch_events", "boost_ch_tgl", "boost_ch_qty",
                   "boost_ch_del", "boost_ch_del_ok",
@@ -5091,6 +5147,20 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action == "adm_views":
             page = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 0
             await screen_admin_views_monitor(query, context, page)
+        elif action == "adm_views_folders":
+            await screen_admin_views_folders(query, context)
+        elif action == "adm_viewsfold" and len(parts) >= 3:
+            target = parts[2]
+            if target == "all":
+                context.user_data["viewsfolder"] = "__all__"
+            elif target == "none":
+                context.user_data["viewsfolder"] = "__none__"
+            elif target.isdigit():
+                folders = _views_monitor_folders(uid)
+                idx = int(target)
+                if 0 <= idx < len(folders):
+                    context.user_data["viewsfolder"] = folders[idx]
+            await screen_admin_views_monitor(query, context)
         elif action == "adm_views_check":
             await action_admin_views_check(query, context)
         elif action == "adm_views_tgl" and len(parts) >= 4 and parts[2].isdigit() and parts[3].isdigit():
