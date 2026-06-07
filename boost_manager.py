@@ -790,6 +790,7 @@ def set_tracked_channel_quantity(channel_id: int, quantity: int | str, database=
 def delete_tracked_channel(channel_id: int, database=db) -> bool:
     ensure_boost_schema(database)
     with _connect(database) as conn:
+        conn.execute("DELETE FROM boost_orders WHERE boost_channel_id = ?", (int(channel_id),))
         count = conn.execute("DELETE FROM boost_channels WHERE id = ?", (int(channel_id),)).rowcount
         conn.commit()
     return count > 0

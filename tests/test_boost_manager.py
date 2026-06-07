@@ -94,6 +94,49 @@ class BoostManagerTests(unittest.TestCase):
         self.assertTrue(deleted)
         self.assertEqual(list_tracked_channels(self.db), [])
 
+    def test_delete_tracked_channel_removes_existing_orders_first(self):
+        added = add_tracked_channel("https://t.me/Boosted", owner_id=100, database=self.db, config=self.config)
+        conn = self.db.connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO boost_orders (
+                    boost_channel_id, tg_chat_id, message_id, event_key, event_type,
+                    post_url, quantity, service_id, status, dry_run, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    added["id"],
+                    "-1001234567890",
+                    42,
+                    "msg:42",
+                    "text",
+                    "https://t.me/boosted/42",
+                    500,
+                    "123",
+                    "dry_run",
+                    1,
+                    "2026-06-07T00:00:00",
+                    "2026-06-07T00:00:00",
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        deleted = delete_tracked_channel(added["id"], self.db)
+
+        self.assertTrue(deleted)
+        conn = self.db.connect()
+        try:
+            orders = conn.execute("SELECT COUNT(*) FROM boost_orders").fetchone()[0]
+            channels = conn.execute("SELECT COUNT(*) FROM boost_channels").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(orders, 0)
+        self.assertEqual(channels, 0)
+
     def test_duplicate_manual_add_does_not_reset_existing_settings(self):
         added = add_tracked_channel("@Boosted", owner_id=100, quantity=900, database=self.db, config=self.config)
         set_tracked_channel_enabled(added["id"], True, self.db)

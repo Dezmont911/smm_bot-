@@ -5207,8 +5207,14 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action == "boost_ch_del" and len(parts) >= 3 and parts[2].isdigit():
             await screen_boost_delete_confirm(query, context, int(parts[2]))
         elif action == "boost_ch_del_ok" and len(parts) >= 3 and parts[2].isdigit():
-            delete_tracked_channel(int(parts[2]))
-            await query.answer("Удалено.")
+            try:
+                deleted = delete_tracked_channel(int(parts[2]))
+            except Exception as e:
+                logger.exception(f"Boost delete failed: {e}")
+                await query.answer("Не удалось удалить канал Boost. Подробности в логах.", show_alert=True)
+                await screen_boost_channels(query, context)
+                return
+            await query.answer("Удалено." if deleted else "Канал Boost уже удалён.")
             await screen_boost_channels(query, context)
         elif action.startswith("boost"):
             await query.answer("Некорректное действие Boost.", show_alert=True)
