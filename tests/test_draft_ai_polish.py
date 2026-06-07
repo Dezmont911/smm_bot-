@@ -1,6 +1,13 @@
 import unittest
 
-from ui import _draft_html_links, _draft_links, _draft_plain_text, _merge_draft_polished_text
+from content_safety import validate_imported_post
+from ui import (
+    _draft_html_links,
+    _draft_links,
+    _draft_plain_text,
+    _merge_draft_polished_text,
+    _normalize_manual_draft_links_for_channel,
+)
 
 
 class DraftAiPolishTests(unittest.TestCase):
@@ -70,6 +77,37 @@ class DraftAiPolishTests(unittest.TestCase):
         self.assertIn("Поймать его можно на Aliexpress", content)
         self.assertNotIn("по ссылке", content)
         self.assertIn('<a href="https://aliexpress.ru/item/1.html">Смотреть на Aliexpress</a>', content)
+
+    def test_marketplace_manual_plain_url_is_normalized_before_validation(self):
+        channel = {"channel_id": "@shop", "channel_type": "marketplace"}
+        post = {
+            "channel_id": "@shop",
+            "format": "manual",
+            "content": "Кольцо за 600 рублей\nhttps://www.wildberries.ru/catalog/123/detail.aspx",
+        }
+
+        changed = _normalize_manual_draft_links_for_channel(channel, post)
+        validation = validate_imported_post(channel, post)
+
+        self.assertTrue(changed)
+        self.assertEqual(post["parse_mode"], "HTML")
+        self.assertIn('<a href="https://www.wildberries.ru/catalog/123/detail.aspx">Смотреть на Wildberries</a>', post["content"])
+        self.assertTrue(validation["allowed"])
+
+    def test_marketplace_manual_without_link_stays_rejected_without_llm_path(self):
+        channel = {"channel_id": "@shop", "channel_type": "marketplace"}
+        post = {
+            "channel_id": "@shop",
+            "format": "manual",
+            "content": "Кольцо за 600 рублей, ссылка будет потом",
+        }
+
+        changed = _normalize_manual_draft_links_for_channel(channel, post)
+        validation = validate_imported_post(channel, post)
+
+        self.assertFalse(changed)
+        self.assertFalse(validation["allowed"])
+        self.assertEqual(validation["reason_code"], "missing_marketplace_link")
 
 
 if __name__ == "__main__":

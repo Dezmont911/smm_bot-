@@ -1783,6 +1783,7 @@ DRAFT_BATCH_LIMIT = 20
 DRAFT_BATCH_WINDOW_SEC = 8
 DRAFT_BATCH_SUMMARY_DELAY_SEC = 2.5
 _MANUAL_DEDUP_STATUSES = ("draft", "ready", "pending_review", "awaiting_media", "published")
+_DRAFT_MARKETPLACE_FORMATS = {"manual", "reference", "marketplace", "wb_product"}
 
 
 def _draft_type_label(d: dict) -> str:
@@ -1962,6 +1963,29 @@ def _merge_draft_polished_text(polished: str, original_html: str | None) -> tupl
     return (body_html + ("\n\n" if body_html else "") + cta).strip(), "HTML"
 
 
+def _draft_requires_marketplace_link(ch: dict | None, post: dict | None) -> bool:
+    if not ch or ch.get("channel_type") != "marketplace":
+        return False
+    fmt = ((post or {}).get("format") or "manual").strip().lower()
+    return fmt in _DRAFT_MARKETPLACE_FORMATS
+
+
+def _normalize_manual_draft_links_for_channel(ch: dict | None, post: dict) -> bool:
+    """Нормализует plain marketplace URL в один HTML-link до валидации/сохранения."""
+    if not _draft_requires_marketplace_link(ch, post):
+        return False
+    original = (post.get("content") or "").strip()
+    if not original or _draft_html_links(original) or not _draft_links(original):
+        return False
+    body = _strip_draft_generated_links(_draft_plain_text(original) or original)
+    content, parse_mode = _merge_draft_polished_text(body, original)
+    if not content:
+        return False
+    post["content"] = content
+    post["parse_mode"] = parse_mode
+    return True
+
+
 async def _warn_manual_import_rejected(msg, validation: dict):
     await _reply_and_cleanup_user_msg(msg, _manual_import_rejection_message(validation))
 
@@ -1982,14 +2006,33 @@ async def _disable_tracked_draft_cards(context: ContextTypes.DEFAULT_TYPE, handl
     items = tracked.pop(handle, [])
     context.user_data["draft_card_messages"] = tracked
     for item in items:
+        chat_id = item["chat_id"]
+        message_id = item["message_id"]
         try:
             await context.bot.edit_message_reply_markup(
-                chat_id=item["chat_id"],
-                message_id=item["message_id"],
+                chat_id=chat_id,
+                message_id=message_id,
                 reply_markup=None,
             )
         except Exception as e:
             logger.debug(f"draft card cleanup skipped [{handle}]: {e}")
+        try:
+            await context.bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption="Карточка черновика устарела.",
+                reply_markup=None,
+            )
+        except Exception:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text="Карточка черновика устарела.",
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
 
 
 def _track_draft_card_message(context: ContextTypes.DEFAULT_TYPE | None, handle: str, sent):
@@ -2153,12 +2196,13 @@ async def _flush_draft_batch_summary(context: ContextTypes.DEFAULT_TYPE, handle:
             context.user_data["draft_batch"] = state
             return
     text = _draft_batch_summary_text(summary, batch_count)
-    await context.bot.send_message(
+    sent = await context.bot.send_message(
         chat_id=chat_id,
         text=text,
         parse_mode=ParseMode.HTML,
         reply_markup=_draft_batch_summary_kb(handle, batch_count),
     )
+    _track_draft_card_message(context, handle, sent)
     state["summary"] = {
         "ids": [], "accepted": 0, "rejected": 0, "duplicates": 0, "overflow": 0, "last_reason": "", "chat_id": chat_id,
     }
@@ -2343,6 +2387,8 @@ async def screen_drafts(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
     name = ch.get("name", handle)
 
     if not drafts:
+        if isinstance(qm, CallbackQuery):
+            await _disable_tracked_draft_cards(context, handle)
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Создать пост", callback_data=f"ui:ch_create:{handle}")],
             [InlineKeyboardButton("↩️ Назад к каналу", callback_data=f"ui:ch:{handle}")],
@@ -2373,7 +2419,8 @@ async def screen_drafts(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
     foot.append([InlineKeyboardButton("➕ Создать пост", callback_data=f"ui:ch_create:{handle}")])
     foot.append([InlineKeyboardButton("🗑 Очистить все черновики", callback_data=f"ui:draft_clear:{handle}")])
     foot.append([InlineKeyboardButton("↩️ Назад к каналу", callback_data=f"ui:ch:{handle}")])
-    await msg_obj.reply_text("⬇️ Действия с черновиками:", reply_markup=InlineKeyboardMarkup(foot))
+    sent = await msg_obj.reply_text("⬇️ Действия с черновиками:", reply_markup=InlineKeyboardMarkup(foot))
+    _track_draft_card_message(context, handle, sent)
 
 
 async def action_draft_edit_text(qm, context: ContextTypes.DEFAULT_TYPE, post_id: str):
@@ -2646,6 +2693,7 @@ async def _flush_album_draft(context, gid: str, reply_msg):
     }
     _draft_batch_untrack_album(context, handle, gid)
     ch = _load_channel(handle)
+    _normalize_manual_draft_links_for_channel(ch, post)
     if ch:
         from content_safety import validate_imported_post
         validation = validate_imported_post(ch, post)
@@ -2668,7 +2716,13 @@ async def _flush_album_draft(context, gid: str, reply_msg):
     post["id"] = post_id
     _draft_batch_add(context, handle, post_id)
     _draft_batch_note(context, handle, reply_msg, post_id=post_id)
-    await _delete_message_silent(reply_msg)
+    seen = set()
+    for album_msg in slot.get("messages", []) or [reply_msg]:
+        key = (getattr(album_msg, "chat_id", None), getattr(album_msg, "message_id", None))
+        if key in seen:
+            continue
+        seen.add(key)
+        await _delete_message_silent(album_msg)
 
 
 async def create_draft_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -2701,9 +2755,10 @@ async def create_draft_from_message(update: Update, context: ContextTypes.DEFAUL
                 return True
             _draft_batch_track_album(context, handle, str(gid))
         slot = slots.setdefault(str(gid), {
-            "items": [], "caption": "", "parse_mode": None, "handle": handle, "task": None
+            "items": [], "caption": "", "parse_mode": None, "handle": handle, "task": None, "messages": []
         })
         slot["items"].append((file_id, media_type))
+        slot.setdefault("messages", []).append(msg)
         if caption and not slot["caption"]:
             slot["caption"] = caption
             slot["parse_mode"] = parse_mode
@@ -2732,6 +2787,7 @@ async def create_draft_from_message(update: Update, context: ContextTypes.DEFAUL
         post["tg_file_id"] = file_id
         post["media_type"] = media_type
     ch = _load_channel(handle)
+    _normalize_manual_draft_links_for_channel(ch, post)
     if ch:
         from content_safety import validate_imported_post
         validation = validate_imported_post(ch, post)
@@ -2772,7 +2828,10 @@ async def apply_draft_edit_message(update: Update, context: ContextTypes.DEFAULT
             return True
         context.user_data.pop("draft_edit", None)
         handle = buffer.get_post_channel(pid)
-        buffer.set_draft_content(pid, text, parse_mode)
+        ch = _load_channel(handle) if handle else None
+        post = {"content": text, "format": "manual", "parse_mode": parse_mode}
+        _normalize_manual_draft_links_for_channel(ch, post)
+        buffer.set_draft_content(pid, post["content"], post.get("parse_mode"))
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К черновикам", callback_data=f"ui:ch_draft:{handle}")]])
         await msg.reply_text("✅ Текст черновика обновлён.", reply_markup=kb)
         return True
@@ -2806,18 +2865,24 @@ def _validate_draft_for_queue(draft: dict) -> tuple[bool, str]:
     ch = _load_channel(draft.get("channel_id"))
     if not ch or ch.get("channel_type") != "marketplace":
         return True, ""
+    normalized = dict(draft)
+    normalized_links = _normalize_manual_draft_links_for_channel(ch, normalized)
     from content_safety import validate_generated_post
     validation = validate_generated_post(
         ch,
         {
-            "content": draft.get("content") or "",
-            "format": draft.get("format") or "manual",
-            "topic": draft.get("topic") or "manual draft",
+            "content": normalized.get("content") or "",
+            "format": normalized.get("format") or "manual",
+            "topic": normalized.get("topic") or "manual draft",
         },
         {"decision": "allowed", "safe_topic": draft.get("topic") or "manual draft"},
         {},
     )
     if validation.get("allowed"):
+        if normalized_links:
+            buffer.set_draft_content(draft["id"], normalized["content"], normalized.get("parse_mode"))
+            draft["content"] = normalized["content"]
+            draft["parse_mode"] = normalized.get("parse_mode")
         return True, ""
     reason = validation.get("reason_code") or "invalid_marketplace_post"
     if reason in {"missing_marketplace_link", "missing_marketplace_product_link"}:
@@ -2903,14 +2968,25 @@ async def action_draft_queue_last(qm, context: ContextTypes.DEFAULT_TYPE, handle
     """Отправляет в очередь самый свежий черновик (после создания)."""
     drafts = buffer.get_drafts(handle)
     from telegram import CallbackQuery
+    target = None
+    state = context.user_data.get("draft_batch") or {}
     if drafts:
-        valid, message = _validate_draft_for_queue(drafts[-1])
+        drafts_by_id = {draft["id"]: draft for draft in drafts}
+        if state.get("handle") == handle:
+            for post_id in reversed(state.get("ids") or []):
+                if post_id in drafts_by_id:
+                    target = drafts_by_id[post_id]
+                    break
+        target = target or drafts[-1]
+    if target:
+        valid, message = _validate_draft_for_queue(target)
         if not valid:
             if isinstance(qm, CallbackQuery):
                 await qm.answer(message, show_alert=True)
             await screen_drafts(qm, context, handle)
             return
-        buffer.draft_to_ready(drafts[-1]["id"])
+        buffer.draft_to_ready(target["id"])
+        _draft_batch_remove(context, target["id"])
         if isinstance(qm, CallbackQuery):
             await qm.answer("⬆️ В очереди")
     await screen_drafts(qm, context, handle)
