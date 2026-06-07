@@ -307,6 +307,42 @@ def cleanup_reference_text_after_rephrase(text: str, source_handle: str | None, 
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+_MEANINGFUL_WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]{2,}")
+_MEANINGFUL_LETTER_RE = re.compile(r"[A-Za-zА-Яа-яЁё]")
+
+
+def has_meaningful_text(text: str) -> bool:
+    """True only for real caption/body text worth sending to the rephrase model."""
+    if not text:
+        return False
+    plain = html_lib.unescape(str(text))
+    plain = _LINK_RE.sub(" ", plain)
+    plain = re.sub(r"<[^>]+>", " ", plain)
+    plain = _MARKDOWN_LINK_RE.sub(" ", plain)
+    plain = _URL_RE.sub(" ", plain)
+    plain = re.sub(r"[@#][A-Za-zА-Яа-яЁё0-9_]+", " ", plain)
+    plain = re.sub(r"[\W_]+", " ", plain, flags=re.UNICODE).strip()
+    words = _MEANINGFUL_WORD_RE.findall(plain)
+    letters = _MEANINGFUL_LETTER_RE.findall(plain)
+    return len(words) >= 2 and len(letters) >= 8
+
+
+def _looks_like_meta_output(text: str) -> bool:
+    if not text:
+        return True
+    try:
+        from ai_client import _looks_like_refusal
+        return _looks_like_refusal(text)
+    except Exception:
+        return False
+
+
+def _ref_flag(ref_config: dict | None, key: str, default: bool) -> bool:
+    if not isinstance(ref_config, dict):
+        return default
+    return bool(ref_config.get(key, default))
+
+
 def _extract_links(text_html: str, source_handle: str | None = None, channel: dict | None = None) -> list[tuple[str, str]]:
     """
     Достаёт гиперссылки (url, видимый_текст) из HTML-текста донора. Только http(s),
@@ -420,7 +456,7 @@ async def _notify_admin(text: str):
 
 
 async def _store_reference_post(channel: dict, channel_id: str, handle: str,
-                                p: dict, do_rephrase: bool):
+                                p: dict, do_rephrase: bool, ref_config: dict | None = None):
     """
     Создаёт запись(и) в буфере для одного поста донора.
 
@@ -429,16 +465,34 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
     """
     # Ключ — по ЭФФЕКТИВНОМУ источнику (что увидит бот в forward_from_*): если донор
     # репостит из другого канала, это оригинальный канал+id. Иначе — сам донор+id.
+    include_text = _ref_flag(ref_config, "include_text", True)
+    take_media = _ref_flag(ref_config, "take_media", True)
+    generate_text_from_media = _ref_flag(ref_config, "generate_text_from_media", False)
+    if not include_text and not take_media:
+        logger.warning(
+            f"Reference skipped [{channel_id}] {handle}/{p.get('id')}: text_and_media_disabled"
+        )
+        return None
+
     topic = ref_topic(p.get("match_user") or handle, p.get("match_id") or p["id"])
     raw = p.get("text", "")
     raw_clean = cleanup_reference_text_before_rephrase(raw, handle, channel)
     html_clean = cleanup_reference_text_before_rephrase(p.get("text_html") or "", handle, channel)
     raw_for_safety = raw_clean or re.sub(r"<[^>]+>", " ", html_clean or "")
-    kind = p.get("media_kind")
+    meaningful_text = has_meaningful_text(raw_for_safety)
+    source_kind = p.get("media_kind")
+    kind = source_kind if take_media else None
+    source_has_media = bool(source_kind)
     allowed_links = _extract_reference_links(html_clean or "", raw_clean or "", handle, channel)
-    import_content = html_clean or raw_clean
+    restore_links_allowed = include_text or _is_marketplace_channel(channel)
+    import_content = (html_clean or raw_clean) if include_text else ""
     if _is_marketplace_channel(channel) and allowed_links:
         import_content, _ = _restore_allowed_links(import_content, allowed_links, channel)
+    elif _is_marketplace_channel(channel):
+        logger.warning(
+            f"Reference skipped [{channel_id}] {handle}/{p.get('id')}: missing_marketplace_product_link"
+        )
+        return None
 
     import_validation = validate_imported_post(
         channel,
@@ -447,7 +501,7 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
             "content": import_content,
             "format": "reference",
             "topic": topic,
-            "media_type": "album" if p.get("group_id") else kind,
+            "media_type": "album" if (take_media and p.get("group_id")) else kind,
         },
     )
     if not import_validation.get("allowed"):
@@ -459,7 +513,7 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
 
     safety = None
     brief = None
-    if raw_for_safety.strip():
+    if include_text and meaningful_text:
         safety = evaluate_topic_candidate(
             channel, {"topic": raw_for_safety, "source": "reference_import"}
         )
@@ -472,7 +526,25 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
         brief = build_content_brief(channel, safety, "reference")
 
     # «Как есть» — HTML (со ссылками); перефраз — простой текст без формата
-    if do_rephrase and raw_clean:
+    content = ""
+    parse_mode = None
+    if not include_text:
+        if _is_marketplace_channel(channel):
+            content, parse_mode = _restore_allowed_links("", allowed_links, channel)
+        if generate_text_from_media and source_has_media:
+            logger.info(
+                f"Reference {handle}/{p.get('id')} [{channel_id}]: media_vision_unavailable"
+            )
+    elif not meaningful_text:
+        if source_has_media and take_media:
+            reason = "media_vision_unavailable" if generate_text_from_media else "no_meaningful_text"
+            logger.debug(f"Reference {handle}/{p.get('id')} [{channel_id}]: {reason}, media-only")
+        else:
+            logger.warning(
+                f"Reference skipped [{channel_id}] {handle}/{p.get('id')}: no_meaningful_text"
+            )
+            return None
+    elif do_rephrase and raw_clean:
         from ai_client import rephrase_text  # ленивый импорт (тяжёлая зависимость)
         try:
             content = await rephrase_text(raw_clean, channel)
@@ -480,18 +552,29 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
             logger.warning(f"Перефраз {handle}/{p['id']} не удался: {e} — беру оригинал")
             content = raw_clean
         content = cleanup_reference_text_after_rephrase(content, handle, channel)
-        parse_mode = None
-        content, restored_parse_mode = _restore_allowed_links(content, allowed_links, channel)
-        parse_mode = restored_parse_mode or parse_mode
+        if _looks_like_meta_output(content):
+            logger.warning(
+                f"Reference rephrase rejected [{channel_id}] {handle}/{p.get('id')}: meta_or_refusal_output"
+            )
+            content = raw_clean if has_meaningful_text(raw_clean) else ""
+        if restore_links_allowed:
+            content, restored_parse_mode = _restore_allowed_links(content, allowed_links, channel)
+            parse_mode = restored_parse_mode or parse_mode
     else:
         content = html_clean or raw_clean
         parse_mode = "HTML"
 
     content = cleanup_reference_text_after_rephrase(content, handle, channel)
-    content, restored_parse_mode = _restore_allowed_links(content, allowed_links, channel)
-    parse_mode = restored_parse_mode or parse_mode
+    if restore_links_allowed:
+        content, restored_parse_mode = _restore_allowed_links(content, allowed_links, channel)
+        parse_mode = restored_parse_mode or parse_mode
     content = _strip_filtered_sentences(content)  # вырезаем «MAX» и пр.
 
+    if content and _looks_like_meta_output(content):
+        logger.warning(
+            f"Reference skipped [{channel_id}] {handle}/{p.get('id')}: meta_or_refusal_output"
+        )
+        return None
     if not content and not kind:
         return None  # пустой пост без медиа
     if content:
@@ -617,7 +700,7 @@ async def import_for_channel(channel: dict, count: int = DEFAULT_TAKE) -> dict:
                     skipped_limits += 1
                     continue
                 media_ids = await _store_reference_post(
-                    channel, channel_id, q["handle"], p, q["ref"].get("rephrase", True)
+                    channel, channel_id, q["handle"], p, q["ref"].get("rephrase", True), q["ref"]
                 )
                 if media_ids is None:
                     continue  # пустой пост — берём следующего

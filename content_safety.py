@@ -34,6 +34,19 @@ META_REFUSAL_MARKERS = (
     "дай исходный текст", "если нужен исходный",
 )
 
+REFERENCE_META_OUTPUT_MARKERS = (
+    "готов помочь переписать",
+    "пришли полный текст",
+    "пришли текст",
+    "отправь текст",
+    "вижу только эмодзи",
+    "не вижу текста",
+    "могу переписать",
+    "я перепишу",
+    "если пришлёшь",
+    "дай исходный текст",
+)
+
 GAME_NEWS_MARKERS = (
     "nintendo", "direct", "steam", "playstation", "xbox", "console",
     "консол", "релиз игр", "релизы игр", "новые игры", "игровая новость",
@@ -290,7 +303,7 @@ def _looks_like_refusal(text: str) -> bool:
     head = low[:700].lstrip(" \"'«»“”")
     if any(head.startswith(marker) for marker in REFUSAL_START_MARKERS):
         return True
-    return any(marker in head for marker in META_REFUSAL_MARKERS)
+    return any(marker in head for marker in META_REFUSAL_MARKERS + REFERENCE_META_OUTPUT_MARKERS)
 
 
 def _blocked_content(text: str) -> bool:

@@ -27,7 +27,7 @@ PLAIN_CHANNEL = {
 
 
 class ImportPipelineSafetyTest(unittest.IsolatedAsyncioTestCase):
-    async def test_reference_rephrase_refusal_is_not_buffered(self):
+    async def test_reference_rephrase_refusal_falls_back_to_original(self):
         fake_buffer = FakeBuffer()
         original_buffer = reference_importer.buffer
         original_rephrase = ai_client.rephrase_text
@@ -49,8 +49,9 @@ class ImportPipelineSafetyTest(unittest.IsolatedAsyncioTestCase):
             reference_importer.buffer = original_buffer
             ai_client.rephrase_text = original_rephrase
 
-        self.assertIsNone(result)
-        self.assertEqual(fake_buffer.posts, [])
+        self.assertEqual(result, [])
+        self.assertEqual(len(fake_buffer.posts), 1)
+        self.assertIn("Как вести", fake_buffer.posts[0]["content"])
 
     async def test_reference_blocked_donor_does_not_call_llm(self):
         fake_buffer = FakeBuffer()

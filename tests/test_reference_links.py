@@ -263,5 +263,167 @@ class ReattachLinkInStoreTest(unittest.TestCase):
         self.assertNotIn("t.me/+", captured["content"])
 
 
+class ReferenceTextMediaModesTest(unittest.TestCase):
+    def setUp(self):
+        self.channel = {
+            "channel_id": "@plain",
+            "name": "Plain",
+            "topic": "useful notes",
+            "post_length": "100 words",
+            "channel_type": "content",
+        }
+        self.marketplace = {
+            "channel_id": "@shop",
+            "name": "Shop",
+            "topic": "marketplace products",
+            "post_length": "100 words",
+            "channel_type": "marketplace",
+        }
+
+    def _capture_add(self):
+        captured = {}
+
+        def fake_add(record):
+            captured.update(record)
+
+        return captured, fake_add
+
+    def _allow_safety(self):
+        return [
+            mock.patch.object(ri, "evaluate_topic_candidate",
+                              return_value={"decision": "ok", "safe_topic": "safe", "reason_code": None}),
+            mock.patch.object(ri, "build_content_brief", return_value={}),
+            mock.patch.object(ri, "validate_generated_post", return_value={"allowed": True}),
+        ]
+
+    def test_has_meaningful_text_guard(self):
+        self.assertFalse(ri.has_meaningful_text(""))
+        self.assertFalse(ri.has_meaningful_text("🔥🔥🔥"))
+        self.assertFalse(ri.has_meaningful_text("https://t.me/donor"))
+        self.assertTrue(ri.has_meaningful_text("Useful caption with several real words."))
+
+    def test_old_donor_defaults_include_text(self):
+        captured, fake_add = self._capture_add()
+        p = {"id": 1, "text": "Useful caption with several real words.", "media_kind": None}
+        with mock.patch.object(ri.buffer, "add", side_effect=fake_add):
+            result = asyncio.run(ri._store_reference_post(self.channel, "@plain", "@donor", p, do_rephrase=False))
+        self.assertEqual(result, [])
+        self.assertIn("Useful caption", captured["content"])
+
+    def test_include_text_false_media_true_saves_media_only(self):
+        captured, fake_add = self._capture_add()
+        p = {"id": 2, "text": "Caption must be ignored completely", "media_kind": "photo"}
+
+        async def fake_rephrase(_text, _channel):
+            raise AssertionError("LLM must not be called when include_text=false")
+
+        with mock.patch("ai_client.rephrase_text", new=fake_rephrase), \
+             mock.patch.object(ri.buffer, "add", side_effect=fake_add):
+            result = asyncio.run(ri._store_reference_post(
+                self.channel, "@plain", "@donor", p, do_rephrase=True,
+                ref_config={"include_text": False, "take_media": True},
+            ))
+        self.assertEqual(result, [2])
+        self.assertEqual(captured["content"], "")
+        self.assertEqual(captured["media_type"], "photo")
+
+    def test_include_text_true_media_false_saves_text_only(self):
+        captured, fake_add = self._capture_add()
+        p = {"id": 3, "text": "Useful caption with several real words.", "media_kind": "photo"}
+        with mock.patch.object(ri.buffer, "add", side_effect=fake_add):
+            result = asyncio.run(ri._store_reference_post(
+                self.channel, "@plain", "@donor", p, do_rephrase=False,
+                ref_config={"include_text": True, "take_media": False},
+            ))
+        self.assertEqual(result, [])
+        self.assertEqual(captured["status"], "ready")
+        self.assertNotIn("media_type", captured)
+
+    def test_text_and_media_disabled_is_rejected(self):
+        p = {"id": 4, "text": "Useful caption with several real words.", "media_kind": "photo"}
+        with mock.patch.object(ri.buffer, "add") as add_mock:
+            result = asyncio.run(ri._store_reference_post(
+                self.channel, "@plain", "@donor", p, do_rephrase=False,
+                ref_config={"include_text": False, "take_media": False},
+            ))
+        self.assertIsNone(result)
+        add_mock.assert_not_called()
+
+    def test_empty_and_emoji_caption_do_not_call_llm(self):
+        for idx, text in enumerate(("", "🔥🔥🔥"), start=5):
+            captured, fake_add = self._capture_add()
+            p = {"id": idx, "text": text, "media_kind": "photo"}
+
+            async def fake_rephrase(_text, _channel):
+                raise AssertionError("LLM must not be called for non-meaningful captions")
+
+            with mock.patch("ai_client.rephrase_text", new=fake_rephrase), \
+                 mock.patch.object(ri.buffer, "add", side_effect=fake_add):
+                result = asyncio.run(ri._store_reference_post(
+                    self.channel, "@plain", "@donor", p, do_rephrase=True,
+                    ref_config={"include_text": True, "take_media": True},
+                ))
+            self.assertEqual(result, [idx])
+            self.assertEqual(captured["content"], "")
+
+    def test_marketplace_text_off_preserves_product_link(self):
+        captured, fake_add = self._capture_add()
+        p = {
+            "id": 7,
+            "text": "Caption must be ignored https://www.wildberries.ru/catalog/1/detail.aspx",
+            "text_html": '<a href="https://www.wildberries.ru/catalog/1/detail.aspx">WB</a>',
+            "media_kind": "photo",
+        }
+        patches = self._allow_safety()
+        with patches[0], patches[1], patches[2], mock.patch.object(ri.buffer, "add", side_effect=fake_add):
+            result = asyncio.run(ri._store_reference_post(
+                self.marketplace, "@shop", "@donor", p, do_rephrase=True,
+                ref_config={"include_text": False, "take_media": True},
+            ))
+        self.assertEqual(result, [7])
+        self.assertIn('href="https://www.wildberries.ru/catalog/1/detail.aspx"', captured["content"])
+        self.assertEqual(captured.get("parse_mode"), "HTML")
+
+    def test_marketplace_text_off_without_product_link_is_rejected(self):
+        p = {
+            "id": 8,
+            "text": "Caption must be ignored https://t.me/donor",
+            "text_html": '<a href="https://t.me/donor">donor</a>',
+            "media_kind": "photo",
+        }
+        with mock.patch.object(ri.buffer, "add") as add_mock:
+            result = asyncio.run(ri._store_reference_post(
+                self.marketplace, "@shop", "@donor", p, do_rephrase=True,
+                ref_config={"include_text": False, "take_media": True},
+            ))
+        self.assertIsNone(result)
+        add_mock.assert_not_called()
+
+    def test_meta_rephrase_falls_back_to_clean_original(self):
+        captured, fake_add = self._capture_add()
+        p = {"id": 9, "text": "Useful caption with several real words.", "media_kind": None}
+
+        async def fake_rephrase(_text, _channel):
+            return "пришли текст, и я перепишу"
+
+        with mock.patch("ai_client.rephrase_text", new=fake_rephrase), \
+             mock.patch.object(ri.buffer, "add", side_effect=fake_add):
+            result = asyncio.run(ri._store_reference_post(self.channel, "@plain", "@donor", p, do_rephrase=True))
+        self.assertEqual(result, [])
+        self.assertIn("Useful caption", captured["content"])
+        self.assertNotIn("пришли текст", captured["content"].lower())
+
+    def test_generate_text_from_media_unavailable_is_media_only(self):
+        captured, fake_add = self._capture_add()
+        p = {"id": 10, "text": "", "media_kind": "photo"}
+        with mock.patch.object(ri.buffer, "add", side_effect=fake_add):
+            result = asyncio.run(ri._store_reference_post(
+                self.channel, "@plain", "@donor", p, do_rephrase=True,
+                ref_config={"include_text": True, "take_media": True, "generate_text_from_media": True},
+            ))
+        self.assertEqual(result, [10])
+        self.assertEqual(captured["content"], "")
+
+
 if __name__ == "__main__":
     unittest.main()

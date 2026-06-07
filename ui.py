@@ -2367,15 +2367,20 @@ async def screen_references(qm, context: ContextTypes.DEFAULT_TYPE, handle: str)
     for i, r in enumerate(refs):
         rp = "вкл" if r.get("rephrase", True) else "выкл"
         md = "вкл" if r.get("take_media", True) else "выкл"
+        tx = "вкл" if r.get("include_text", True) else "выкл"
         ad = "вкл" if r.get("skip_ads", True) else "выкл"
         lines.append(f"\n{i+1}. <code>{r.get('handle')}</code>")
         rows.append([InlineKeyboardButton(f"{i+1}. {r.get('handle')}", callback_data=f"ui:ch_refs:{handle}")])
         rows.append([
-            InlineKeyboardButton(f"✍️ перефраз: {rp}", callback_data=f"ui:ref_tgl:{handle}:{i}:rephrase"),
-            InlineKeyboardButton(f"🖼 медиа: {md}",    callback_data=f"ui:ref_tgl:{handle}:{i}:take_media"),
+            InlineKeyboardButton(f"✍️ перефраз: {rp}", callback_data=f"ui:ref_tgl:{handle}:{i}:rp"),
+            InlineKeyboardButton(f"📝 текст: {tx}", callback_data=f"ui:ref_tgl:{handle}:{i}:it"),
         ])
         rows.append([
-            InlineKeyboardButton(f"🚫 фильтр рекламы: {ad}", callback_data=f"ui:ref_tgl:{handle}:{i}:skip_ads"),
+            InlineKeyboardButton(f"🖼 медиа: {md}", callback_data=f"ui:ref_tgl:{handle}:{i}:tm"),
+            InlineKeyboardButton("🤖 текст по медиа: недоступно", callback_data=f"ui:ref_tgl:{handle}:{i}:gt"),
+        ])
+        rows.append([
+            InlineKeyboardButton(f"🚫 фильтр рекламы: {ad}", callback_data=f"ui:ref_tgl:{handle}:{i}:sa"),
             InlineKeyboardButton("🗑 удалить",              callback_data=f"ui:ref_del:{handle}:{i}"),
         ])
 
@@ -2393,8 +2398,30 @@ async def action_ref_toggle(qm, context, handle: str, idx: int, flag: str):
     if not ch:
         return
     refs = ch.get("reference_channels", [])
-    if 0 <= idx < len(refs) and flag in ("rephrase", "take_media", "skip_ads"):
+    flag_map = {
+        "rp": "rephrase",
+        "tm": "take_media",
+        "sa": "skip_ads",
+        "it": "include_text",
+        "gt": "generate_text_from_media",
+        "rephrase": "rephrase",
+        "take_media": "take_media",
+        "skip_ads": "skip_ads",
+        "include_text": "include_text",
+    }
+    flag = flag_map.get(flag, flag)
+    if flag == "generate_text_from_media":
+        await qm.answer("Текст по медиа пока недоступен: нет безопасного vision-пайплайна.", show_alert=True)
+        await screen_references(qm, context, handle)
+        return
+    if 0 <= idx < len(refs) and flag in ("rephrase", "take_media", "skip_ads", "include_text"):
         cur = refs[idx].get(flag, True)
+        next_ref = dict(refs[idx])
+        next_ref[flag] = not cur
+        if not next_ref.get("include_text", True) and not next_ref.get("take_media", True):
+            await qm.answer("Нужно оставить включённым хотя бы текст или медиа.", show_alert=True)
+            await screen_references(qm, context, handle)
+            return
         refs[idx][flag] = not cur
         _save_channel(ch)
     await screen_references(qm, context, handle)
@@ -4361,6 +4388,7 @@ async def handle_settings_text_input(update: Update, context: ContextTypes.DEFAU
             return True
         # Дефолтный пресет: медиа как есть, перефраз вкл, фильтр рекламы вкл
         refs.append({"handle": donor, "rephrase": True, "take_media": True,
+                     "include_text": True, "generate_text_from_media": False,
                      "skip_ads": True, "last_id": 0})
         ch["reference_channels"] = refs
         _save_channel(ch)
