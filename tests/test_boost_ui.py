@@ -236,6 +236,34 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertIn("ui:queue_publish_all", callbacks)
 
+    async def test_queue_screen_filters_channels_by_selected_folder(self):
+        captured = {}
+        channels = [
+            {"channel_id": "@one", "name": "One", "folder": "РСЯ"},
+            {"channel_id": "@two", "name": "Two", "folder": "Anime"},
+            {"channel_id": "@three", "name": "Three"},
+        ]
+        context = SimpleNamespace(user_data={"queuefolder": "Anime"})
+
+        async def fake_answer_or_send(qm, text, kb):
+            captured["text"] = text
+            captured["kb"] = kb
+
+        with patch.object(ui, "_load_channels", return_value=channels), \
+                patch.object(ui.buffer, "get_level", return_value=2), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
+            await ui.screen_queue(FakeQuery(100), context)
+
+        callbacks = [
+            button.callback_data
+            for row in captured["kb"].inline_keyboard
+            for button in row
+        ]
+        self.assertIn("ui:ch_review:@two", callbacks)
+        self.assertNotIn("ui:ch_review:@one", callbacks)
+        self.assertNotIn("ui:ch_review:@three", callbacks)
+        self.assertIn("Anime", captured["text"])
+
     async def test_ensure_one_ready_post_keeps_existing_ready_post(self):
         with patch.object(ui.buffer, "get_ready_count", return_value=1), \
                 patch.object(ui.generator, "run_for_channel", new=AsyncMock()) as gen_mock:
@@ -270,6 +298,26 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
         post_now_mock.assert_any_await("@two")
         self.assertNotIn("queue_publish_all_running", context.user_data)
         self.assertIn("Опубликовано: <b>2</b>", query.edits[-1][0])
+
+    async def test_queue_publish_all_uses_selected_folder_scope(self):
+        query = FakeQuery(100)
+        context = SimpleNamespace(user_data={"queuefolder": "Anime"})
+        channels = [
+            {"channel_id": "@one", "name": "One", "folder": "РСЯ"},
+            {"channel_id": "@two", "name": "Two", "folder": "Anime"},
+        ]
+
+        async def fake_answer_or_send(qm, text, kb):
+            query.edits.append((text, None, kb))
+
+        with patch.object(ui, "_load_channels", return_value=channels), \
+                patch.object(ui, "_ensure_one_ready_post_for_channel", new=AsyncMock(return_value=("буфер", None))), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send), \
+                patch.object(ui.poster, "post_now", new=AsyncMock(return_value={"success": True})) as post_now_mock:
+            await ui.action_queue_publish_all_run(query, context)
+
+        post_now_mock.assert_awaited_once_with("@two")
+        self.assertIn("Anime", query.edits[-1][0])
 
 
 if __name__ == "__main__":

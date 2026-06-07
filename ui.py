@@ -318,6 +318,22 @@ def _folders(owner_id: int | None) -> list[str]:
     return sorted(seen)
 
 
+def _folder_filtered_channels(channels: list[dict], folder: str | None) -> list[dict]:
+    if folder in (None, "__all__"):
+        return channels
+    if folder == "__none__":
+        return [c for c in channels if not (c.get("folder") or "").strip()]
+    return [c for c in channels if (c.get("folder") or "").strip() == folder]
+
+
+def _folder_scope_title(folder: str | None) -> str:
+    if folder == "__none__":
+        return "без папки"
+    if folder and folder != "__all__":
+        return f"папка {folder}"
+    return "все каналы"
+
+
 def _safe_slug(channel_id: str) -> str:
     """Безопасное имя файла из handle (защита от path traversal)."""
     cleaned = re.sub(r"[^A-Za-z0-9_-]", "", channel_id.lstrip("@"))
@@ -571,12 +587,7 @@ async def screen_channels(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0)
     # Фильтр по папке (из user_data): None/"__none__"=без папки, "__all__"=все, иначе имя папки.
     # Так каналы, разложенные по папкам, не захламляют главный экран «Мои каналы».
     folder = context.user_data.get("chfolder")
-    if folder in (None, "__none__"):
-        channels = [c for c in channels if not (c.get("folder") or "").strip()]
-    elif folder == "__all__":
-        pass
-    elif folder:
-        channels = [c for c in channels if (c.get("folder") or "").strip() == folder]
+    channels = _folder_filtered_channels(channels, "__none__" if folder is None else folder)
 
     # Верхние кнопки-действия
     top = [
@@ -1255,11 +1266,49 @@ async def screen_status(qm, context: ContextTypes.DEFAULT_TYPE):
     await _answer_or_send(qm, "\n".join(lines), kb)
 
 
+def _queue_folder(context: ContextTypes.DEFAULT_TYPE) -> str:
+    return context.user_data.get("queuefolder") or "__all__"
+
+
+def _queue_scope_channels(qm, context: ContextTypes.DEFAULT_TYPE, folder: str | None = None) -> list[dict]:
+    all_channels = _load_channels(owner_id=_acting_uid(qm), scope="mine")
+    return _folder_filtered_channels(all_channels, folder if folder is not None else _queue_folder(context))
+
+
+async def screen_queue_folders(qm, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор папки для экрана очереди постов."""
+    uid = _acting_uid(qm)
+    allch = _load_channels(owner_id=uid, scope="mine")
+    folders = _folders(uid)
+    nofolder = sum(1 for c in allch if not (c.get("folder") or "").strip())
+
+    rows = [[InlineKeyboardButton(f"📋 Все каналы ({len(allch)})", callback_data="ui:queuefold:all")]]
+    for i, folder in enumerate(folders):
+        cnt = sum(1 for c in allch if (c.get("folder") or "").strip() == folder)
+        rows.append([InlineKeyboardButton(f"📁 {folder} ({cnt})", callback_data=f"ui:queuefold:{i}")])
+    if nofolder:
+        rows.append([InlineKeyboardButton(f"📂 Без папки ({nofolder})", callback_data="ui:queuefold:none")])
+    rows.append([InlineKeyboardButton("◀️ Очередь постов", callback_data="ui:queue")])
+
+    await _answer_or_send(
+        qm,
+        "📁 <b>Папки очереди</b>\n\nВыбери, какие каналы показывать и где выполнять массовые действия.",
+        InlineKeyboardMarkup(rows),
+    )
+
+
 async def screen_queue(qm, context: ContextTypes.DEFAULT_TYPE):
     """Выбор канала для просмотра очереди постов."""
-    channels = _load_channels(owner_id=_acting_uid(qm), scope="mine")
+    folder = _queue_folder(context)
+    channels = _queue_scope_channels(qm, context, folder)
     buttons = []
     total = 0
+
+    folder_row = [InlineKeyboardButton("📁 Папки", callback_data="ui:queue_folders")]
+    if folder != "__all__":
+        folder_row.append(InlineKeyboardButton("📋 Все каналы", callback_data="ui:queuefold:all"))
+    buttons.append(folder_row)
+
     for ch in channels:
         lvl  = buffer.get_level(ch["channel_id"])
         total += lvl
@@ -1270,18 +1319,19 @@ async def screen_queue(qm, context: ContextTypes.DEFAULT_TYPE):
         )])
     if channels:
         buttons.append([InlineKeyboardButton(
-            "📤 Опубликовать по 1 посту во всех каналах", callback_data="ui:queue_publish_all"
+            f"📤 Опубликовать по 1 посту: {_folder_scope_title(folder)}", callback_data="ui:queue_publish_all"
         )])
-    # Очистка буфера сразу по всем каналам
+    # Очистка буфера в текущем scope очереди
     if total > 0:
         buttons.append([InlineKeyboardButton(
-            f"🧹 Очистить весь буфер ({total})", callback_data="ui:queue_clear_all"
+            f"🧹 Очистить буфер: {_folder_scope_title(folder)} ({total})", callback_data="ui:queue_clear_all"
         )])
     buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="ui:main")])
 
+    scope = _folder_scope_title(folder)
     await _answer_or_send(
         qm,
-        "📝 <b>Очередь постов</b>\n\nВыбери канал:",
+        f"📝 <b>Очередь постов</b> · {html.escape(scope)}\n\nВыбери канал:",
         InlineKeyboardMarkup(buttons),
     )
 
@@ -1289,7 +1339,9 @@ async def screen_queue(qm, context: ContextTypes.DEFAULT_TYPE):
 async def action_clear_all_confirm(qm, context: ContextTypes.DEFAULT_TYPE):
     """Запрашивает подтверждение очистки буфера каналов текущего пользователя."""
     from database import db
-    channel_ids = [ch["channel_id"] for ch in _load_channels(owner_id=_acting_uid(qm), scope="mine")]
+    folder = _queue_folder(context)
+    channel_ids = [ch["channel_id"] for ch in _queue_scope_channels(qm, context, folder)]
+    scope = _folder_scope_title(folder)
     if channel_ids:
         placeholders = ",".join("?" for _ in channel_ids)
         with db.connect() as conn:
@@ -1303,20 +1355,20 @@ async def action_clear_all_confirm(qm, context: ContextTypes.DEFAULT_TYPE):
     if count == 0:
         await _answer_or_send(
             qm,
-            "📭 Буфер ваших каналов уже пуст.",
+            f"📭 Буфер пуст: <b>{html.escape(scope)}</b>.",
             InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="ui:queue")]]),
         )
         return
 
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"✅ Да, очистить всё ({count})", callback_data="ui:queue_clear_all_ok")],
+        [InlineKeyboardButton(f"✅ Да, очистить ({count})", callback_data="ui:queue_clear_all_ok")],
         [InlineKeyboardButton("◀️ Отмена", callback_data="ui:queue")],
     ])
     await _answer_or_send(
         qm,
-        f"🧹 <b>Очистить буфер ваших каналов?</b>\n\n"
+        f"🧹 <b>Очистить буфер: {html.escape(scope)}?</b>\n\n"
         f"Будет удалено <b>{count} постов</b> со статусом «готов» и «на проверке» "
-        f"по вашим каналам разом.\nОпубликованные посты не затрагиваются.",
+        f"в выбранных каналах.\nОпубликованные посты не затрагиваются.",
         kb,
     )
 
@@ -1324,7 +1376,9 @@ async def action_clear_all_confirm(qm, context: ContextTypes.DEFAULT_TYPE):
 async def action_clear_all_ok(qm, context: ContextTypes.DEFAULT_TYPE):
     """Очищает буфер каналов текущего пользователя: ready/pending_review -> skipped."""
     from database import db
-    channel_ids = [ch["channel_id"] for ch in _load_channels(owner_id=_acting_uid(qm), scope="mine")]
+    folder = _queue_folder(context)
+    channel_ids = [ch["channel_id"] for ch in _queue_scope_channels(qm, context, folder)]
+    scope = _folder_scope_title(folder)
     if channel_ids:
         placeholders = ",".join("?" for _ in channel_ids)
         with db.connect() as conn:
@@ -1336,10 +1390,10 @@ async def action_clear_all_ok(qm, context: ContextTypes.DEFAULT_TYPE):
     else:
         count = 0
 
-    logger.info(f"Буфер очищен по каналам пользователя, удалено {count} постов")
+    logger.info(f"Буфер очищен по scope очереди [{scope}], удалено {count} постов")
     await _answer_or_send(
         qm,
-        f"🧹 Буфер очищен по вашим каналам — удалено <b>{count} постов</b>.",
+        f"🧹 Буфер очищен: <b>{html.escape(scope)}</b> — удалено <b>{count} постов</b>.",
         InlineKeyboardMarkup([
             [InlineKeyboardButton("◀️ Назад", callback_data="ui:main")],
         ]),
@@ -1350,15 +1404,18 @@ async def action_clear_all_ok(qm, context: ContextTypes.DEFAULT_TYPE):
 
 async def action_queue_publish_all_confirm(qm, context: ContextTypes.DEFAULT_TYPE):
     """Запрашивает подтверждение срочной публикации по одному посту во все каналы."""
-    channels = _load_channels(owner_id=_acting_uid(qm), scope="mine")
+    folder = _queue_folder(context)
+    channels = _queue_scope_channels(qm, context, folder)
+    scope = _folder_scope_title(folder)
     if not channels:
         await _answer_or_send(
             qm,
-            "📭 Активных каналов нет.",
+            f"📭 В выбранной области нет активных каналов: <b>{html.escape(scope)}</b>.",
             InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="ui:queue")]]),
         )
         return
 
+    context.user_data["queue_publish_folder"] = folder
     ready_now = sum(1 for ch in channels if buffer.get_ready_count(ch["channel_id"]) > 0)
     empty_now = len(channels) - ready_now
     kb = InlineKeyboardMarkup([
@@ -1367,7 +1424,7 @@ async def action_queue_publish_all_confirm(qm, context: ContextTypes.DEFAULT_TYP
     ])
     await _answer_or_send(
         qm,
-        "📤 <b>Срочная публикация во все каналы</b>\n\n"
+        f"📤 <b>Срочная публикация: {html.escape(scope)}</b>\n\n"
         f"Каналов: <b>{len(channels)}</b>\n"
         f"С готовым постом в очереди: <b>{ready_now}</b>\n"
         f"Без готового поста прямо сейчас: <b>{empty_now}</b>\n\n"
@@ -1412,11 +1469,13 @@ async def action_queue_publish_all_run(qm, context: ContextTypes.DEFAULT_TYPE):
             await qm.answer("Публикация уже идет.", show_alert=True)
         return
 
-    channels = _load_channels(owner_id=_acting_uid(qm), scope="mine")
+    folder = context.user_data.get("queue_publish_folder") or _queue_folder(context)
+    channels = _queue_scope_channels(qm, context, folder)
+    scope = _folder_scope_title(folder)
     if not channels:
         await _answer_or_send(
             qm,
-            "📭 Активных каналов нет.",
+            f"📭 В выбранной области нет активных каналов: <b>{html.escape(scope)}</b>.",
             InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="ui:queue")]]),
         )
         return
@@ -1426,7 +1485,7 @@ async def action_queue_publish_all_run(qm, context: ContextTypes.DEFAULT_TYPE):
         await qm.answer("Запускаю срочную публикацию...")
         try:
             await qm.edit_message_text(
-                f"⏳ <b>Публикую по одному посту во все каналы...</b>\n\nКаналов: <b>{len(channels)}</b>",
+                f"⏳ <b>Публикую по одному посту: {html.escape(scope)}...</b>\n\nКаналов: <b>{len(channels)}</b>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏳ Идет публикация...", callback_data="ui:noop")]]),
             )
@@ -1453,6 +1512,7 @@ async def action_queue_publish_all_run(qm, context: ContextTypes.DEFAULT_TYPE):
                 fail_lines.append(f"❌ {html.escape(cid)} — {html.escape(result.get('error') or 'ошибка публикации')}")
     finally:
         context.user_data.pop("queue_publish_all_running", None)
+        context.user_data.pop("queue_publish_folder", None)
 
     def _clip(lines: list[str], limit: int = 25) -> list[str]:
         if len(lines) <= limit:
@@ -1462,6 +1522,7 @@ async def action_queue_publish_all_run(qm, context: ContextTypes.DEFAULT_TYPE):
     parts = [
         "📤 <b>Срочная публикация завершена</b>",
         "",
+        f"Область: <b>{html.escape(scope)}</b>",
         f"Опубликовано: <b>{len(ok_lines)}</b>",
         f"Ошибок: <b>{len(fail_lines)}</b>",
         f"Источники: буфер {source_counts.get('буфер', 0)}, референсы {source_counts.get('референс', 0)}, генерация {source_counts.get('генерация', 0)}",
@@ -5194,6 +5255,23 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await screen_status(query, context)
 
     elif action == "queue":
+        await screen_queue(query, context)
+
+    elif action == "queue_folders":
+        await screen_queue_folders(query, context)
+
+    elif action == "queuefold" and len(parts) >= 3:
+        uid = _acting_uid(query)
+        target = parts[2]
+        if target == "all":
+            context.user_data["queuefolder"] = "__all__"
+        elif target == "none":
+            context.user_data["queuefolder"] = "__none__"
+        elif target.isdigit():
+            folders = _folders(uid)
+            idx = int(target)
+            if 0 <= idx < len(folders):
+                context.user_data["queuefolder"] = folders[idx]
         await screen_queue(query, context)
 
     elif action == "queue_publish_all":
