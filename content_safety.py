@@ -578,6 +578,18 @@ def _html_links(content: str) -> list[str]:
     return re.findall(r'<a\s+href=["\'](https?://[^"\']+)["\']', content or "", re.IGNORECASE)
 
 
+def _is_marketplace_product_url(url: str) -> bool:
+    low = (url or "").lower()
+    return any(marker in low for marker in MARKETPLACE_PRODUCT_LINK_MARKERS)
+
+
+def _is_forbidden_marketplace_reference_link(url: str) -> bool:
+    low = (url or "").lower()
+    if _is_marketplace_product_url(low):
+        return False
+    return True
+
+
 def _plain_from_html(content: str) -> str:
     text = re.sub(r"<a\b[^>]*>(.*?)</a>", r"\1", content or "", flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"<[^>]+>", " ", text)
@@ -593,11 +605,12 @@ def _has_marketplace_product_link(content: str) -> bool:
     links = _html_links(content)
     if not links:
         return False
-    return any(
-        marker in url.lower()
-        for url in links
-        for marker in MARKETPLACE_PRODUCT_LINK_MARKERS
-    )
+    return any(_is_marketplace_product_url(url) for url in links)
+
+
+def _has_forbidden_marketplace_reference_link(content: str) -> bool:
+    links = _html_links(content)
+    return any(_is_forbidden_marketplace_reference_link(url) for url in links)
 
 
 def _looks_like_marketplace_offtopic(content: str) -> bool:
@@ -669,6 +682,15 @@ def validate_imported_post(channel: dict, post: dict) -> dict:
         })
         return result
 
+    if _requires_marketplace_link(channel, post) and _has_forbidden_marketplace_reference_link(content):
+        result.update({
+            "allowed": False,
+            "decision": "review",
+            "reason_code": "forbidden_marketplace_reference_link",
+            "notes": "marketplace imported post contains non-product/ad/donor link",
+        })
+        return result
+
     if channel.get("channel_type") == "marketplace" and content and _looks_like_marketplace_offtopic(content):
         result.update({
             "allowed": False,
@@ -717,6 +739,15 @@ def validate_generated_post(channel: dict, post: dict, safety: dict, brief: dict
             "decision": "review",
             "reason_code": "missing_marketplace_product_link",
             "notes": "marketplace post has links, but no recognized product/marketplace link",
+        })
+        return result
+
+    if _requires_marketplace_link(channel, post) and _has_forbidden_marketplace_reference_link(content):
+        result.update({
+            "allowed": False,
+            "decision": "review",
+            "reason_code": "forbidden_marketplace_reference_link",
+            "notes": "marketplace/reference post contains non-product/ad/donor link",
         })
         return result
 

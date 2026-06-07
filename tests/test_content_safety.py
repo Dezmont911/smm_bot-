@@ -758,6 +758,54 @@ class ContentSafetyTest(unittest.TestCase):
         )
         self.assertTrue(validation["allowed"])
 
+    def test_marketplace_reference_rejects_product_plus_telegram_invite(self):
+        validation = validate_generated_post(
+            MARKETPLACE_CHANNEL,
+            {
+                "format": "reference",
+                "content": (
+                    'Органайзер для дома\n'
+                    '<a href="https://ozon.ru/product/525022324">OZON</a>\n'
+                    '<a href="https://t.me/+abc123">закрытый канал</a>'
+                ),
+            },
+            {"decision": "allowed", "safe_topic": "товар"},
+            {},
+        )
+        self.assertFalse(validation["allowed"])
+        self.assertEqual(validation["reason_code"], "forbidden_marketplace_reference_link")
+
+    def test_marketplace_reference_rejects_product_plus_unknown_link(self):
+        validation = validate_generated_post(
+            MARKETPLACE_CHANNEL,
+            {
+                "format": "reference",
+                "content": (
+                    'Органайзер для дома\n'
+                    '<a href="https://www.wildberries.ru/catalog/123/detail.aspx">WB</a>\n'
+                    '<a href="https://random-blog.example/deal">обзор</a>'
+                ),
+            },
+            {"decision": "allowed", "safe_topic": "товар"},
+            {},
+        )
+        self.assertFalse(validation["allowed"])
+        self.assertEqual(validation["reason_code"], "forbidden_marketplace_reference_link")
+
+    def test_import_guard_allows_multiple_product_links_for_marketplace(self):
+        validation = validate_imported_post(
+            MARKETPLACE_CHANNEL,
+            {
+                "format": "reference",
+                "content": (
+                    'Подборка товаров\n'
+                    '<a href="https://www.wildberries.ru/catalog/123/detail.aspx">WB</a>\n'
+                    '<a href="https://ozon.ru/product/525022324">OZON</a>'
+                ),
+            },
+        )
+        self.assertTrue(validation["allowed"])
+
     def test_marketplace_manual_placeholder_link_is_rejected(self):
         validation = validate_generated_post(
             MARKETPLACE_CHANNEL,

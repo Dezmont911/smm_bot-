@@ -23,6 +23,8 @@ reference_importer.py — импорт постов из каналов-доно
 import json
 import re
 import asyncio
+import html as html_lib
+from urllib.parse import urlparse
 from pathlib import Path
 
 from loguru import logger
@@ -31,6 +33,7 @@ from buffer_manager import buffer
 from content_safety import (
     build_content_brief,
     evaluate_topic_candidate,
+    MARKETPLACE_PRODUCT_LINK_MARKERS,
     validate_generated_post,
     validate_imported_post,
 )
@@ -80,6 +83,9 @@ def _strip_filtered_sentences(text: str) -> str:
         return text
     out_lines = []
     for line in text.split("\n"):
+        if "<a " in line.lower() or "href=" in line.lower() or re.search(r"https?://", line, re.IGNORECASE):
+            out_lines.append(line.strip())
+            continue
         sentences = re.split(r"(?<=[.!?…])\s+", line)
         kept = [s for s in sentences if not _FILTER_RE.search(s)]
         out_lines.append(" ".join(kept).strip())
@@ -87,7 +93,25 @@ def _strip_filtered_sentences(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", result).strip()
 
 
-_LINK_RE = re.compile(r'<a\s+href="([^"]+)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+_LINK_RE = re.compile(r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+_URL_RE = re.compile(r'https?://[^\s<>"\]\)]+', re.IGNORECASE)
+_MARKDOWN_LINK_RE = re.compile(r'\[([^\]]{1,120})\]\((https?://[^)\s]+)\)', re.IGNORECASE)
+_LABEL_URL_RE = re.compile(r'\b([^\n()]{1,80}?)\s*\((https?://[^)\s]+)\)', re.IGNORECASE)
+_GENERIC_LINK_LABEL_RE = re.compile(
+    r"^\s*(?:🔗\s*)?(?:ссылка(?:\s+на\s+товар)?|тут|здесь|подробнее|читать|смотреть(?:\s+на\s+\w+)?)\s*$",
+    re.IGNORECASE,
+)
+_TRAILING_LINK_PHRASE_RE = re.compile(
+    r"\s+(?:по|по этой|по товарной)\s+ссылке(?:\s+ниже)?\s*$",
+    re.IGNORECASE,
+)
+_FOOTER_LINE_MARKERS = (
+    "подпишись", "подписывайся", "наш канал", "больше тут", "больше здесь",
+    "больше новостей", "читать в канале", "по вопросам рекламы", "реклама",
+    "рекламодател", "прайс", "промокод", "партнерский материал",
+    "партнёрский материал", "erid", "ерид",
+)
+_TELEGRAM_HOSTS = {"t.me", "telegram.me", "www.t.me", "www.telegram.me"}
 
 
 def _source_handle_variants(handle: str | None) -> set[str]:
@@ -105,6 +129,56 @@ def _source_handle_variants(handle: str | None) -> set[str]:
     }
 
 
+def _is_marketplace_channel(channel: dict | None) -> bool:
+    return bool(channel and channel.get("channel_type") == "marketplace")
+
+
+def _clean_url(url: str) -> str:
+    url = html_lib.unescape((url or "").strip())
+    return url.rstrip(".,;:!?)»”'")
+
+
+def _url_host(url: str) -> str:
+    try:
+        return (urlparse(_clean_url(url)).netloc or "").lower()
+    except Exception:
+        return ""
+
+
+def _is_telegram_url(url: str) -> bool:
+    host = _url_host(url)
+    return host in _TELEGRAM_HOSTS
+
+
+def _is_telegram_invite(url: str) -> bool:
+    if not _is_telegram_url(url):
+        return False
+    path = (urlparse(_clean_url(url)).path or "").lower()
+    return path.startswith("/+") or "/joinchat/" in path
+
+
+def _is_marketplace_product_url(url: str) -> bool:
+    low = _clean_url(url).lower()
+    return any(marker in low for marker in MARKETPLACE_PRODUCT_LINK_MARKERS)
+
+
+def _reference_link_label(url: str, label: str | None = None) -> str:
+    label = re.sub(r"<[^>]+>", "", label or "").strip()
+    label = html_lib.unescape(label)
+    low = _clean_url(url).lower()
+    if label and not _GENERIC_LINK_LABEL_RE.fullmatch(label) and not label.lower().startswith("http"):
+        return label
+    if "wildberries." in low or "wb.ru" in low:
+        return "Смотреть на Wildberries"
+    if "ozon." in low or "ozon.onelink" in low:
+        return "Смотреть на Ozon"
+    if "aliexpress" in low or "ali.click" in low:
+        return "Смотреть на Aliexpress"
+    if "market.yandex" in low or "yandex.ru/cc" in low:
+        return "Смотреть на Яндекс Маркете"
+    return label or "Смотреть товар"
+
+
 def _looks_like_source_footer_line(line: str, handle: str | None) -> bool:
     if not line or not handle:
         return False
@@ -112,6 +186,33 @@ def _looks_like_source_footer_line(line: str, handle: str | None) -> bool:
     plain = re.sub(r"&[a-zA-Z0-9#]+;", " ", plain)
     low = re.sub(r"\s+", " ", plain).strip().lower()
     return any(marker in low for marker in _source_handle_variants(handle))
+
+
+def _looks_like_reference_footer_line(line: str, handle: str | None, channel: dict | None = None) -> bool:
+    if not line:
+        return False
+    plain = re.sub(r"<[^>]+>", " ", line)
+    plain = html_lib.unescape(plain)
+    low = re.sub(r"\s+", " ", plain).strip().lower()
+    if not low:
+        return False
+    if _looks_like_source_footer_line(line, handle):
+        return True
+    if _is_telegram_invite_in_text(line):
+        return True
+    if any(marker in low for marker in _FOOTER_LINE_MARKERS):
+        if _is_marketplace_channel(channel) and _is_marketplace_product_url(line):
+            return False
+        return True
+    only_mentions = re.sub(r"[@\w./:+-]+", "", low).strip(" .,:;!—–|()[]«»")
+    if not only_mentions and (re.search(r"@\w{4,}", low) or "t.me/" in low or "telegram.me/" in low):
+        return True
+    return False
+
+
+def _is_telegram_invite_in_text(text: str) -> bool:
+    low = (text or "").lower()
+    return bool(re.search(r"(?:https?://)?(?:t\.me|telegram\.me)/(?:\+|joinchat/)", low))
 
 
 def _strip_source_footer(text: str, handle: str | None) -> str:
@@ -138,7 +239,75 @@ def _is_source_channel_link(url: str, label: str, source_handle: str | None) -> 
     return any(marker in low for marker in _source_handle_variants(source_handle))
 
 
-def _extract_links(text_html: str, source_handle: str | None = None) -> list[tuple[str, str]]:
+def _link_allowed(url: str, label: str, source_handle: str | None, channel: dict | None = None) -> bool:
+    url = _clean_url(url)
+    if not url.lower().startswith(("http://", "https://")):
+        return False
+    if _is_source_channel_link(url, label, source_handle):
+        return False
+    if _is_telegram_url(url):
+        return False
+    if _is_marketplace_channel(channel):
+        return _is_marketplace_product_url(url)
+    return True
+
+
+def _sanitize_reference_html_links(text: str, source_handle: str | None, channel: dict | None = None) -> str:
+    def repl(match: re.Match) -> str:
+        url = _clean_url(match.group(1))
+        label = re.sub(r"<[^>]+>", "", match.group(2) or "").strip()
+        if not _link_allowed(url, label, source_handle, channel):
+            return ""
+        safe_url = html_lib.escape(url, quote=True)
+        safe_label = html_lib.escape(label or _reference_link_label(url))
+        return f'<a href="{safe_url}">{safe_label}</a>'
+
+    return _LINK_RE.sub(repl, text or "")
+
+
+def cleanup_reference_text_before_rephrase(text: str, source_handle: str | None, channel: dict | None = None) -> str:
+    """Remove donor/ad footer noise while preserving the body and allowed HTML links."""
+    if not text:
+        return ""
+    cleaned = _sanitize_reference_html_links(str(text), source_handle, channel)
+    lines = []
+    for line in cleaned.splitlines():
+        if _looks_like_reference_footer_line(line, source_handle, channel):
+            continue
+        lines.append(line.rstrip())
+    result = "\n".join(lines)
+    result = re.sub(r"\n{3,}", "\n\n", result).strip()
+    return result
+
+
+def cleanup_reference_text_after_rephrase(text: str, source_handle: str | None, channel: dict | None = None) -> str:
+    """Post-LLM cleanup: remove meta, donor links, generated Markdown/plain links and footer noise."""
+    if not text:
+        return ""
+    try:
+        from ai_client import _clean_post_output
+        text = _clean_post_output(text)
+    except Exception:
+        text = (text or "").strip()
+    text = _MARKDOWN_LINK_RE.sub(r"\1", text)
+    text = _LABEL_URL_RE.sub(r"\1", text)
+    text = cleanup_reference_text_before_rephrase(text, source_handle, channel)
+    text = _URL_RE.sub("", text)
+    lines = []
+    for line in text.splitlines():
+        clean = re.sub(r"\s{2,}", " ", line).strip()
+        if not clean:
+            continue
+        if _GENERIC_LINK_LABEL_RE.fullmatch(clean):
+            continue
+        line = _TRAILING_LINK_PHRASE_RE.sub("", line.rstrip())
+        if line.strip():
+            lines.append(line)
+    text = "\n".join(lines)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _extract_links(text_html: str, source_handle: str | None = None, channel: dict | None = None) -> list[tuple[str, str]]:
     """
     Достаёт гиперссылки (url, видимый_текст) из HTML-текста донора. Только http(s),
     дедуп по url, без t.me-упоминаний самого донора (служебные ссылки). Нужно, чтобы
@@ -148,17 +317,68 @@ def _extract_links(text_html: str, source_handle: str | None = None) -> list[tup
         return []
     out, seen = [], set()
     for url, label in _LINK_RE.findall(text_html):
-        url = url.strip()
-        if not url.lower().startswith(("http://", "https://")):
-            continue
+        url = _clean_url(url)
         label = re.sub(r"<[^>]+>", "", label or "").strip()
-        if _is_source_channel_link(url, label, source_handle):
+        if not _link_allowed(url, label, source_handle, channel):
             continue
         if url in seen:
             continue
         seen.add(url)
         out.append((url, label))
     return out
+
+
+def _extract_reference_links(text_html: str, raw_text: str, source_handle: str | None, channel: dict | None = None) -> list[tuple[str, str]]:
+    out, seen = [], set()
+    for url, label in _extract_links(text_html or "", source_handle=source_handle, channel=channel):
+        if url not in seen:
+            seen.add(url)
+            out.append((url, label))
+    for url in _URL_RE.findall(raw_text or ""):
+        url = _clean_url(url)
+        if url in seen:
+            continue
+        if not _link_allowed(url, "", source_handle, channel):
+            continue
+        seen.add(url)
+        out.append((url, _reference_link_label(url)))
+    return out
+
+
+def _restore_allowed_links(content: str, links: list[tuple[str, str]], channel: dict | None = None) -> tuple[str, str | None]:
+    if not links:
+        return (content or "").strip(), None
+    allowed = []
+    seen = set()
+    for url, label in links:
+        url = _clean_url(url)
+        if url in seen:
+            continue
+        if _is_marketplace_channel(channel) and not _is_marketplace_product_url(url):
+            continue
+        seen.add(url)
+        allowed.append((url, _reference_link_label(url, label)))
+    if not allowed:
+        return (content or "").strip(), None
+
+    body = _sanitize_reference_html_links(content or "", None, channel)
+    body = _MARKDOWN_LINK_RE.sub(r"\1", body)
+    body = _LABEL_URL_RE.sub(r"\1", body)
+    for url, _label in allowed:
+        body = body.replace(url, "")
+    body = _URL_RE.sub("", body)
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+    if "<" not in body and ">" not in body:
+        body = html_lib.escape(body)
+    existing = set(_clean_url(u) for u, _ in _LINK_RE.findall(body))
+    cta = "\n".join(
+        f'<a href="{html_lib.escape(url, quote=True)}">{html_lib.escape(label)}</a>'
+        for url, label in allowed
+        if url not in existing
+    )
+    if not cta:
+        return body, "HTML"
+    return (body + ("\n\n" if body else "") + cta).strip(), "HTML"
 
 
 def ref_topic(handle: str, msg_id: int) -> str:
@@ -211,16 +431,20 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
     # репостит из другого канала, это оригинальный канал+id. Иначе — сам донор+id.
     topic = ref_topic(p.get("match_user") or handle, p.get("match_id") or p["id"])
     raw = p.get("text", "")
-    raw_clean = _strip_source_footer(raw, handle)
-    html_clean = _strip_source_footer(p.get("text_html") or "", handle)
+    raw_clean = cleanup_reference_text_before_rephrase(raw, handle, channel)
+    html_clean = cleanup_reference_text_before_rephrase(p.get("text_html") or "", handle, channel)
     raw_for_safety = raw_clean or re.sub(r"<[^>]+>", " ", html_clean or "")
     kind = p.get("media_kind")
+    allowed_links = _extract_reference_links(html_clean or "", raw_clean or "", handle, channel)
+    import_content = html_clean or raw_clean
+    if _is_marketplace_channel(channel) and allowed_links:
+        import_content, _ = _restore_allowed_links(import_content, allowed_links, channel)
 
     import_validation = validate_imported_post(
         channel,
         {
             "channel_id": channel_id,
-            "content": html_clean or raw_clean,
+            "content": import_content,
             "format": "reference",
             "topic": topic,
             "media_type": "album" if p.get("group_id") else kind,
@@ -255,25 +479,17 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
         except Exception as e:
             logger.warning(f"Перефраз {handle}/{p['id']} не удался: {e} — беру оригинал")
             content = raw_clean
-        content = _strip_source_footer(content, handle)
+        content = cleanup_reference_text_after_rephrase(content, handle, channel)
         parse_mode = None
-        # Перефраз отдаёт plain-текст и теряет гиперссылки (<a href>). Если в оригинале
-        # были ссылки (например партнёрская/на товар) — сохраняем их: экранируем
-        # перефраз под HTML и переклеиваем ссылки CTA-строкой в конце (баг #13).
-        links = _extract_links(html_clean or "", source_handle=handle)
-        if links:
-            import html as _html
-            body = _html.escape(content or "")
-            cta = "\n".join(
-                f'<a href="{url}">{(label or url).strip()}</a>' for url, label in links
-            )
-            content = (body + ("\n\n" if body else "") + cta).strip()
-            parse_mode = "HTML"
+        content, restored_parse_mode = _restore_allowed_links(content, allowed_links, channel)
+        parse_mode = restored_parse_mode or parse_mode
     else:
         content = html_clean or raw_clean
         parse_mode = "HTML"
 
-    content = _strip_source_footer(content, handle)
+    content = cleanup_reference_text_after_rephrase(content, handle, channel)
+    content, restored_parse_mode = _restore_allowed_links(content, allowed_links, channel)
+    parse_mode = restored_parse_mode or parse_mode
     content = _strip_filtered_sentences(content)  # вырезаем «MAX» и пр.
 
     if not content and not kind:

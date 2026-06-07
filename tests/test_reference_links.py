@@ -62,6 +62,30 @@ class ExtractLinksTest(unittest.TestCase):
             [("https://store.steampowered.com/app/1", "Steam")],
         )
 
+    def test_telegram_invites_are_not_restored(self):
+        html = (
+            'Пост\n'
+            '<a href="https://t.me/+abc123">закрытый канал</a>\n'
+            '<a href="https://telegram.me/joinchat/abc123">invite</a>\n'
+            '<a href="https://store.steampowered.com/app/1">Steam</a>'
+        )
+        self.assertEqual(
+            _extract_links(html, source_handle="@prepodsteam"),
+            [("https://store.steampowered.com/app/1", "Steam")],
+        )
+
+    def test_marketplace_extract_keeps_only_product_links(self):
+        channel = {"channel_type": "marketplace"}
+        html = (
+            '<a href="https://www.wildberries.ru/catalog/1/detail.aspx">WB</a>\n'
+            '<a href="https://random-blog.example/deal">обзор</a>\n'
+            '<a href="https://t.me/+abc123">донор</a>'
+        )
+        self.assertEqual(
+            _extract_links(html, source_handle="@donor", channel=channel),
+            [("https://www.wildberries.ru/catalog/1/detail.aspx", "WB")],
+        )
+
 
 class MetaLeakTest(unittest.TestCase):
     """Мета-хвост и отказы не должны попадать в пост."""
@@ -159,6 +183,84 @@ class ReattachLinkInStoreTest(unittest.TestCase):
         self.assertIn("content", captured)
         self.assertNotIn("@prepodsteam", captured["content"])
         self.assertNotIn("t.me/prepodsteam", captured["content"])
+
+    def test_rephrased_marketplace_keeps_product_but_drops_donor_invite(self):
+        channel = {
+            "channel_id": "@shop",
+            "name": "Shop",
+            "topic": "товары",
+            "post_length": "100 слов",
+            "channel_type": "marketplace",
+        }
+        p = {
+            "id": 10,
+            "text": "Удобный органайзер для ванной\n\nБольше тут: https://t.me/+abc123",
+            "text_html": (
+                'Удобный органайзер для ванной\n'
+                '<a href="https://www.wildberries.ru/catalog/1/detail.aspx">ссылка на товар</a>\n'
+                '<a href="https://t.me/+abc123">закрытый канал</a>'
+            ),
+            "media_kind": None,
+            "match_user": "donor",
+            "match_id": 10,
+        }
+        captured = {}
+
+        async def fake_rephrase(text, ch):
+            return "Органайзер помогает держать мелочи под рукой. Смотреть товар по ссылке ниже."
+
+        def fake_add(record):
+            captured.update(record)
+
+        with mock.patch("ai_client.rephrase_text", new=fake_rephrase), \
+             mock.patch.object(ri, "evaluate_topic_candidate",
+                               return_value={"decision": "ok", "safe_topic": "товар", "reason_code": None}), \
+             mock.patch.object(ri, "build_content_brief", return_value={}), \
+             mock.patch.object(ri, "validate_generated_post", return_value={"allowed": True}), \
+             mock.patch.object(ri.buffer, "add", side_effect=fake_add):
+            asyncio.run(ri._store_reference_post(channel, "@shop", "@donor", p, do_rephrase=True))
+
+        self.assertIn('href="https://www.wildberries.ru/catalog/1/detail.aspx"', captured["content"])
+        self.assertNotIn("t.me/+", captured["content"])
+        self.assertNotIn("закрытый канал", captured["content"])
+        self.assertEqual(captured.get("parse_mode"), "HTML")
+
+    def test_reference_cleanup_works_when_rephrase_disabled(self):
+        channel = {
+            "channel_id": "@game",
+            "name": "Game",
+            "topic": "игры",
+            "post_length": "100 слов",
+            "channel_type": "content",
+            "archetype": "gaming_casual",
+        }
+        p = {
+            "id": 11,
+            "text": "Вышел патч для игры\n\n@prepodsteam\nhttps://t.me/+abc123",
+            "text_html": (
+                'Вышел патч для игры\n'
+                '<a href="https://store.steampowered.com/app/1">Steam</a>\n'
+                '<a href="https://t.me/+abc123">закрытый канал</a>'
+            ),
+            "media_kind": None,
+            "match_user": "prepodsteam",
+            "match_id": 11,
+        }
+        captured = {}
+
+        def fake_add(record):
+            captured.update(record)
+
+        with mock.patch.object(ri, "evaluate_topic_candidate",
+                               return_value={"decision": "ok", "safe_topic": "игра", "reason_code": None}), \
+             mock.patch.object(ri, "build_content_brief", return_value={}), \
+             mock.patch.object(ri, "validate_generated_post", return_value={"allowed": True}), \
+             mock.patch.object(ri.buffer, "add", side_effect=fake_add):
+            asyncio.run(ri._store_reference_post(channel, "@game", "@prepodsteam", p, do_rephrase=False))
+
+        self.assertIn('href="https://store.steampowered.com/app/1"', captured["content"])
+        self.assertNotIn("@prepodsteam", captured["content"])
+        self.assertNotIn("t.me/+", captured["content"])
 
 
 if __name__ == "__main__":
