@@ -133,9 +133,24 @@ def _save_admin_settings(data: dict):
         logger.error(f"Не удалось сохранить admin_settings.json: {e}")
 
 
-def admin_default_rsy_enabled() -> bool:
-    """Включать ли РСЯ-перекрытие по умолчанию для новых каналов superadmin."""
-    return bool(_load_admin_settings().get("default_rsy_override", False))
+def admin_default_rsy_enabled(user_id: int | None = None) -> bool:
+    """Включать ли РСЯ-перекрытие по умолчанию для новых каналов конкретного админа."""
+    data = _load_admin_settings()
+    if user_id is None or accounts.is_superadmin(user_id):
+        return bool(data.get("default_rsy_override", False))
+    per_admin = data.get("default_rsy_override_by_admin") or {}
+    return bool(per_admin.get(str(user_id), False))
+
+
+def _set_admin_default_rsy_enabled(user_id: int, enabled: bool):
+    data = _load_admin_settings()
+    if accounts.is_superadmin(user_id):
+        data["default_rsy_override"] = bool(enabled)
+    else:
+        per_admin = data.get("default_rsy_override_by_admin") or {}
+        per_admin[str(user_id)] = bool(enabled)
+        data["default_rsy_override_by_admin"] = per_admin
+    _save_admin_settings(data)
 
 
 def _boost_mode_label() -> str:
@@ -355,6 +370,20 @@ def _folder_scope_title(folder: str | None) -> str:
     return "все каналы"
 
 
+def _admin_owned_channels(uid: int | None, include_inactive: bool = False) -> list[dict]:
+    """Каналы текущего админа для массовых админ-действий, без чужих админских каналов."""
+    if uid is None:
+        return []
+    channels = _load_channels(include_inactive=include_inactive, owner_id=uid, scope="mine")
+    if accounts.is_superadmin(uid):
+        return [c for c in channels if c.get("owner_id") in (None, uid)]
+    return [c for c in channels if c.get("owner_id") == uid]
+
+
+def _admin_owned_active_channels(uid: int | None) -> list[dict]:
+    return [c for c in _admin_owned_channels(uid, include_inactive=True) if c.get("active", True)]
+
+
 def _safe_slug(channel_id: str) -> str:
     """Безопасное имя файла из handle (защита от path traversal)."""
     cleaned = re.sub(r"[^A-Za-z0-9_-]", "", channel_id.lstrip("@"))
@@ -571,8 +600,8 @@ async def screen_main(qm, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("➕ Добавить канал",  callback_data="add_start")],
         [InlineKeyboardButton("❓ Помощь",          callback_data="ui:help")],
     ]
-    # Админ-панель — только для главного владельца (superadmin)
-    if accounts.is_superadmin(_acting_uid(qm)):
+    # Админ-панель: superadmin видит полную, остальные admin — облегчённую.
+    if accounts.is_admin(_acting_uid(qm)):
         rows.append([InlineKeyboardButton("👑 Админ-панель", callback_data="ui:admin")])
     await _answer_or_send(qm, text, InlineKeyboardMarkup(rows))
 
@@ -4976,11 +5005,28 @@ async def handle_boost_text_input(update: Update, context: ContextTypes.DEFAULT_
 async def screen_admin(qm, context: ContextTypes.DEFAULT_TYPE):
     """Меню админа: создать инвайт, список тестеров, каналы пользователей."""
     uid = _acting_uid(qm)
+    my_chans = _admin_owned_active_channels(uid)
+    rsy_state = "вкл ✅" if admin_default_rsy_enabled(uid) else "выкл ⬜️"
+
+    if not accounts.is_superadmin(uid):
+        text = (
+            "👑 <b>Админ-панель</b>\n\n"
+            f"Моих активных каналов: <b>{len(my_chans)}</b>\n"
+            f"РСЯ по умолчанию для новых моих каналов: <b>{rsy_state}</b>\n\n"
+            "Доступны только рабочие функции для своих каналов."
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"📢 РСЯ по умолчанию: {rsy_state}", callback_data="ui:adm_rsy_default")],
+            [InlineKeyboardButton(f"🗑 Удалить мои каналы ({len(my_chans)})", callback_data="ui:adm_del_my_chans")],
+            [InlineKeyboardButton("📊 Мониторинг охватов", callback_data="ui:adm_views")],
+            [InlineKeyboardButton("⚡ Генерить для всех", callback_data="ui:generate_all")],
+            [InlineKeyboardButton("◀️ В меню", callback_data="ui:main")],
+        ])
+        await _answer_or_send(qm, text, kb)
+        return
+
     users = accounts.list_users()
     tester_chans = _load_channels(include_inactive=True, owner_id=uid, scope="testers")
-    my_chans = [c for c in _load_channels(include_inactive=True, owner_id=uid, scope="mine")
-                if c.get("active", True) and c.get("owner_id") in (None, uid)]
-    rsy_state = "вкл ✅" if admin_default_rsy_enabled() else "выкл ⬜️"
     text = (
         "👑 <b>Админ-панель</b>\n\n"
         f"Зарегистрировано тестеров: <b>{len(users)}</b>\n"
@@ -5028,20 +5074,19 @@ async def action_admin_invite(qm, context, uses: int, days: int):
 
 
 async def action_admin_rsy_default_toggle(qm, context):
-    """Переключает РСЯ-перекрытие по умолчанию для новых каналов superadmin."""
-    data = _load_admin_settings()
-    data["default_rsy_override"] = not bool(data.get("default_rsy_override", False))
-    _save_admin_settings(data)
-    state = "включено ✅" if data["default_rsy_override"] else "выключено ⬜️"
+    """Переключает РСЯ-перекрытие по умолчанию для новых каналов текущего админа."""
+    uid = _acting_uid(qm)
+    new_state = not admin_default_rsy_enabled(uid)
+    _set_admin_default_rsy_enabled(uid, new_state)
+    state = "включено ✅" if new_state else "выключено ⬜️"
     await qm.answer(f"РСЯ по умолчанию {state}")
     await screen_admin(qm, context)
 
 
 async def action_admin_delete_my_channels_confirm(qm, context):
-    """Подтверждение массовой деактивации только админских каналов superadmin."""
+    """Подтверждение массовой деактивации только своих каналов текущего админа."""
     uid = _acting_uid(qm)
-    chans = [c for c in _load_channels(include_inactive=True, owner_id=uid, scope="mine")
-             if c.get("active", True) and c.get("owner_id") in (None, uid)]
+    chans = _admin_owned_active_channels(uid)
     if not chans:
         await _answer_or_send(
             qm,
@@ -5056,23 +5101,22 @@ async def action_admin_delete_my_channels_confirm(qm, context):
     await _answer_or_send(
         qm,
         f"🗑 <b>Удалить мои каналы?</b>\n\n"
-        f"Будет деактивировано <b>{len(chans)}</b> каналов superadmin. "
+        f"Будет деактивировано <b>{len(chans)}</b> твоих активных каналов. "
         f"Каналы тестеров не затрагиваются. Посты в БД не удаляются.",
         kb,
     )
 
 
 async def action_admin_delete_my_channels_ok(qm, context):
-    """Деактивирует все активные каналы superadmin, не трогая каналы тестеров."""
+    """Деактивирует все активные каналы текущего админа, не трогая чужие каналы."""
     uid = _acting_uid(qm)
-    chans = [c for c in _load_channels(include_inactive=True, owner_id=uid, scope="mine")
-             if c.get("active", True) and c.get("owner_id") in (None, uid)]
+    chans = _admin_owned_active_channels(uid)
     count = 0
     for ch in chans:
         ch["active"] = False
         _save_channel(ch)
         count += 1
-    logger.info(f"Админские каналы superadmin деактивированы: {count}")
+    logger.info(f"Админские каналы owner_id={uid} деактивированы: {count}")
     await _answer_or_send(
         qm,
         f"🗑 Деактивировано моих каналов: <b>{count}</b>.",
@@ -5084,10 +5128,7 @@ VIEWS_MONITOR_PAGE_SIZE = 10
 
 
 def _admin_monitor_channels(uid: int | None) -> list[dict]:
-    return [
-        ch for ch in _load_channels(include_inactive=True, owner_id=uid, scope="mine")
-        if ch.get("active", True)
-    ]
+    return _admin_owned_active_channels(uid)
 
 
 def _views_monitor_folders(uid: int | None) -> list[str]:
@@ -5241,6 +5282,88 @@ async def action_admin_views_check(qm, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("◀️ Админ-панель", callback_data="ui:admin")],
     ])
     await _answer_or_send(qm, text, kb)
+
+
+async def action_admin_generate_all(qm, context: ContextTypes.DEFAULT_TYPE):
+    """Добирает буфер по своим каналам до BUFFER_TARGET: рефы -> fallback-генерация."""
+    from telegram import CallbackQuery
+    from reference_importer import import_for_channel
+
+    uid = _acting_uid(qm)
+    channels = _admin_owned_active_channels(uid)
+    target = getattr(cfg, "BUFFER_TARGET", cfg.BUFFER_MIN)
+    if not channels:
+        await _answer_or_send(
+            qm,
+            "⚡ <b>Генерация для всех</b>\n\nАктивных моих каналов нет.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Админ-панель", callback_data="ui:admin")]]),
+        )
+        return
+
+    if isinstance(qm, CallbackQuery):
+        await qm.answer("⚡ Добираю буфер по моим каналам...")
+        try:
+            await qm.edit_message_text(
+                f"⏳ <b>Добираю буфер до {target} постов на канал...</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏳ Генерация...", callback_data="ui:noop")]]),
+            )
+        except Exception:
+            pass
+
+    total_ref = 0
+    total_generated = 0
+    skipped_full = 0
+    touched = 0
+    errors = []
+
+    channels.sort(key=lambda ch: buffer.get_level(ch.get("channel_id")))
+    for ch in channels:
+        cid = ch.get("channel_id")
+        try:
+            level = buffer.get_level(cid)
+            need = max(0, target - level)
+            if need <= 0:
+                skipped_full += 1
+                continue
+
+            ref_added = 0
+            gen_added = 0
+            if ch.get("reference_channels"):
+                res = await import_for_channel(ch, count=need)
+                ref_added = int(res.get("added", 0) or 0)
+                total_ref += ref_added
+                need = max(0, target - buffer.get_level(cid))
+
+            if need > 0:
+                res = await generator.run_for_channel(ch, target_count=need)
+                gen_added = int(res.get("generated", 0) or 0)
+                total_generated += gen_added
+
+            if ref_added or gen_added:
+                touched += 1
+        except Exception as e:
+            logger.exception(f"Массовая генерация [{cid}] не удалась: {e}")
+            errors.append(cid or "?")
+
+    total_added = total_ref + total_generated
+    text = (
+        f"✅ <b>Генерация для всех завершена</b>\n\n"
+        f"Цель буфера: <b>{target}</b> постов на канал\n"
+        f"Каналов проверено: <b>{len(channels)}</b>\n"
+        f"Каналов уже было заполнено: <b>{skipped_full}</b>\n"
+        f"Каналов пополнено: <b>{touched}</b>\n\n"
+        f"Из референсов добавлено: <b>{total_ref}</b>\n"
+        f"Сгенерировано: <b>{total_generated}</b>\n"
+        f"Всего добавлено: <b>{total_added}</b>"
+    )
+    if errors:
+        text += f"\n\nОшибки: <b>{len(errors)}</b> каналов: <code>{html.escape(', '.join(errors[:10]))}</code>"
+    await _answer_or_send(
+        qm,
+        text,
+        InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Админ-панель", callback_data="ui:admin")]]),
+    )
 
 
 async def _user_label(context, uid: int) -> str | None:
@@ -5439,15 +5562,26 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if any(key.startswith("boost_") for key in context.user_data):
         _clear_boost_pending(context)
 
-    # 👑 Админ-действия — только для главного владельца (superadmin)
-    if action in ("admin", "adm_inv", "adm_users", "adm_revoke", "adm_pro", "adm_chans", "adm_cost",
-                  "adm_views", "adm_views_check", "adm_views_tgl", "adm_views_folders", "adm_viewsfold",
-                  "boost", "boost_toggle", "boost_add", "boost_add_mine", "boost_add_ext", "boost_pick",
-                  "boost_channels", "boost_events", "boost_ch", "boost_ch_events", "boost_ch_tgl", "boost_ch_qty",
-                  "boost_ch_del", "boost_ch_del_ok",
-                  "adm_rsy_default", "adm_del_my_chans", "adm_del_my_chans_ok"):
-        if not accounts.is_superadmin(uid):
-            await query.answer("Только для владельца.", show_alert=True)
+    # 👑 Админ-действия: часть доступна всем admin из env, опасные/глобальные — только superadmin.
+    _ADMIN_ACTIONS = {
+        "admin", "adm_inv", "adm_users", "adm_revoke", "adm_pro", "adm_chans", "adm_cost",
+        "adm_views", "adm_views_check", "adm_views_tgl", "adm_views_folders", "adm_viewsfold",
+        "boost", "boost_toggle", "boost_add", "boost_add_mine", "boost_add_ext", "boost_pick",
+        "boost_channels", "boost_events", "boost_ch", "boost_ch_events", "boost_ch_tgl", "boost_ch_qty",
+        "boost_ch_del", "boost_ch_del_ok",
+        "adm_rsy_default", "adm_del_my_chans", "adm_del_my_chans_ok",
+    }
+    _LIMITED_ADMIN_ACTIONS = {
+        "admin",
+        "adm_views", "adm_views_check", "adm_views_tgl", "adm_views_folders", "adm_viewsfold",
+        "adm_rsy_default", "adm_del_my_chans", "adm_del_my_chans_ok",
+    }
+    if action in _ADMIN_ACTIONS:
+        if not accounts.is_admin(uid):
+            await query.answer("Только для админа.", show_alert=True)
+            return
+        if action not in _LIMITED_ADMIN_ACTIONS and not accounts.is_superadmin(uid):
+            await query.answer("Эта кнопка доступна только владельцу.", show_alert=True)
             return
         if action == "admin":
             await screen_admin(query, context)
@@ -5819,19 +5953,10 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await action_clear_all_ok(query, context)
 
     elif action == "generate_all":
-        if not accounts.is_superadmin(uid):
-            await query.answer("Только для владельца.", show_alert=True)
+        if not accounts.is_admin(uid):
+            await query.answer("Только для админа.", show_alert=True)
             return
-        await query.answer("⚡ Запускаю генерацию для всех каналов...")
-        try:
-            from content_generator import generator as gen
-            result = await gen.run_for_all_channels()
-            total = sum(r.get("generated", 0) for r in result.values()) if isinstance(result, dict) else 0
-            text = f"✅ Генерация завершена!\nДобавлено постов: <b>{total}</b>"
-        except Exception as e:
-            text = f"❌ Ошибка генерации: {e}"
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="ui:main")]])
-        await query.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        await action_admin_generate_all(query, context)
 
     elif action == "ch" and len(parts) >= 3:
         handle = parts[2]

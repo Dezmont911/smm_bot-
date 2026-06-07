@@ -271,9 +271,9 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
     async def test_views_monitor_screen_filters_channels_by_selected_folder(self):
         captured = {}
         channels = [
-            {"channel_id": "@one", "name": "One", "folder": ui.VIEWS_MONITOR_DEFAULT_FOLDER, "active": True},
-            {"channel_id": "@two", "name": "Two", "folder": "Anime", "views_monitor_enabled": True, "active": True},
-            {"channel_id": "@three", "name": "Three", "active": True},
+            {"channel_id": "@one", "name": "One", "folder": ui.VIEWS_MONITOR_DEFAULT_FOLDER, "owner_id": 100, "active": True},
+            {"channel_id": "@two", "name": "Two", "folder": "Anime", "owner_id": 100, "views_monitor_enabled": True, "active": True},
+            {"channel_id": "@three", "name": "Three", "owner_id": 100, "active": True},
         ]
         context = SimpleNamespace(user_data={"viewsfolder": "Anime"})
 
@@ -437,6 +437,69 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ui:ch_restore:@gone", callbacks)
         self.assertIn("ui:ch_purge:@gone", callbacks)
         self.assertIn("Удалённый канал", captured["text"])
+
+    async def test_limited_admin_panel_exposes_only_requested_actions(self):
+        captured = {}
+
+        async def fake_answer_or_send(qm, text, kb):
+            captured["text"] = text
+            captured["kb"] = kb
+
+        with patch.object(ui.accounts, "is_superadmin", return_value=False), \
+                patch.object(ui.accounts, "is_admin", return_value=True), \
+                patch.object(ui, "_admin_owned_active_channels", return_value=[{"channel_id": "@mine"}]), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
+            await ui.screen_admin(FakeQuery(200), SimpleNamespace(user_data={}))
+
+        callbacks = [
+            button.callback_data
+            for row in captured["kb"].inline_keyboard
+            for button in row
+        ]
+        self.assertIn("ui:adm_rsy_default", callbacks)
+        self.assertIn("ui:adm_del_my_chans", callbacks)
+        self.assertIn("ui:adm_views", callbacks)
+        self.assertIn("ui:generate_all", callbacks)
+        self.assertNotIn("ui:adm_inv:1:30", callbacks)
+        self.assertNotIn("ui:adm_users", callbacks)
+        self.assertNotIn("ui:boost", callbacks)
+        self.assertNotIn("ui:adm_cost:today", callbacks)
+
+    async def test_admin_generate_all_prefers_references_then_generation_to_target(self):
+        captured = {}
+        levels = {"@ref": 1, "@plain": 3, "@full": 5}
+        channels = [
+            {"channel_id": "@ref", "owner_id": 200, "active": True, "reference_channels": [{"handle": "@donor"}]},
+            {"channel_id": "@plain", "owner_id": 200, "active": True},
+            {"channel_id": "@full", "owner_id": 200, "active": True},
+        ]
+
+        async def fake_answer_or_send(qm, text, kb):
+            captured["text"] = text
+            captured["kb"] = kb
+
+        async def fake_import(ch, count):
+            self.assertEqual(ch["channel_id"], "@ref")
+            self.assertEqual(count, 4)
+            levels["@ref"] += 2
+            return {"added": 2}
+
+        async def fake_generate(ch, target_count=None, force=False):
+            levels[ch["channel_id"]] += target_count or 0
+            return {"channel_id": ch["channel_id"], "generated": target_count or 0, "skipped": 0}
+
+        with patch.object(ui, "_admin_owned_active_channels", return_value=channels), \
+                patch.object(ui.buffer, "get_level", side_effect=lambda cid: levels[cid]), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send), \
+                patch("reference_importer.import_for_channel", side_effect=fake_import) as import_mock, \
+                patch.object(ui.generator, "run_for_channel", side_effect=fake_generate) as generate_mock:
+            await ui.action_admin_generate_all(FakeQuery(200), SimpleNamespace(user_data={}))
+
+        import_mock.assert_awaited_once()
+        gen_calls = [(call.args[0]["channel_id"], call.kwargs.get("target_count")) for call in generate_mock.await_args_list]
+        self.assertEqual(gen_calls, [("@ref", 2), ("@plain", 2)])
+        self.assertIn("Из референсов добавлено: <b>2</b>", captured["text"])
+        self.assertIn("Сгенерировано: <b>4</b>", captured["text"])
 
     def test_permanent_delete_channel_removes_database_rows_and_json(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:

@@ -109,8 +109,8 @@ def is_admin(user_id: int) -> bool:
 
 
 def _default_rsy_for_owner(owner_id: int | None) -> bool:
-    """Для новых каналов superadmin можно включать РСЯ-перекрытие по умолчанию."""
-    return bool(owner_id and is_superadmin(owner_id) and admin_default_rsy_enabled())
+    """Для новых каналов админа можно включать РСЯ-перекрытие по умолчанию."""
+    return bool(owner_id and is_admin(owner_id) and admin_default_rsy_enabled(owner_id))
 
 
 def assert_owns(user_id: int, channel) -> bool:
