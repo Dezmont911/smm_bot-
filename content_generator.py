@@ -1041,7 +1041,7 @@ class ContentGenerator:
             rows = conn.execute(
                 """SELECT topic FROM posts
                    WHERE channel_id = ?
-                     AND status IN ('published', 'ready', 'skipped')
+                     AND status IN ('published', 'ready', 'pending_review', 'awaiting_media', 'draft', 'skipped')
                      AND topic != ''
                    ORDER BY generated_at DESC
                    LIMIT ?""",
@@ -1052,7 +1052,16 @@ class ContentGenerator:
     @staticmethod
     def _normalize_topic(topic: str) -> str:
         """Приводит тему к каноничному виду для сравнения (lower, схлопывание пробелов)."""
-        return re.sub(r"\s+", " ", (topic or "").lower()).strip()
+        text = (topic or "").lower()
+        text = re.sub(r"https?://\S+", " ", text)
+        text = re.sub(r"[^\wа-яё]+", " ", text, flags=re.IGNORECASE)
+        text = re.sub(
+            r"\b(тема|инфоповод|разбор|совет|вопрос|новость|пост|часть|части)\b",
+            " ",
+            text,
+            flags=re.IGNORECASE,
+        )
+        return re.sub(r"\s+", " ", text).strip()
 
     def _topic_already_used(self, topic: str, used_topics: list[str]) -> bool:
         """

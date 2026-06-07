@@ -187,6 +187,23 @@ def _known_directions(known: dict) -> list[str]:
     return result[:20]
 
 
+PROGRAM_FACT_INTENT_MARKERS = (
+    "возраст", "с какого", "с каких", "когда начинать", "куда отдать",
+    "выбрать", "выбор", "подобрать", "подбор", "подойдет", "подойдёт",
+    "направлен", "группа", "уровень", "стартовать", "что выбрать",
+    "lego", "wedo", "scratch", "ev3", "mindstorms",
+)
+
+
+def _should_include_program_facts(safety: dict, format_name: str | None = None) -> bool:
+    text = _low(" ".join([
+        safety.get("safe_topic") or "",
+        safety.get("safe_angle") or "",
+        format_name or "",
+    ]))
+    return any(marker in text for marker in PROGRAM_FACT_INTENT_MARKERS)
+
+
 SPECIFIC_DIRECTION_MARKERS = (
     "lego wedo",
     "wedo",
@@ -395,6 +412,8 @@ def build_content_brief(channel: dict, safety: dict, format_name: str | None = N
     known_facts = _known_facts(channel)
     known_age_groups = _known_age_groups_text(known_facts)
     known_directions = _known_directions(known_facts)
+    include_program_facts = _should_include_program_facts(safety, format_name)
+    program_fact_labels = []
 
     must_include = []
     if offer:
@@ -404,11 +423,23 @@ def build_content_brief(channel: dict, safety: dict, format_name: str | None = N
     if is_kids_education_channel(channel):
         must_include.append("показать пользу для ребенка или ответить на вопрос родителя")
     if known_age_groups:
-        must_include.append("подтвержденные возрастные группы: " + known_age_groups)
+        if include_program_facts:
+            must_include.append("подтвержденные возрастные группы: " + known_age_groups)
+        else:
+            program_fact_labels.append("возрастные группы")
     if known_directions:
-        must_include.append("подтвержденные направления: " + ", ".join(known_directions))
+        if include_program_facts:
+            must_include.append("подтвержденные направления: " + ", ".join(known_directions))
+        else:
+            program_fact_labels.append("направления")
 
     must_avoid = list(forbidden_angles)
+    if program_fact_labels:
+        must_avoid.append(
+            "не перечислять " + " и ".join(program_fact_labels) +
+            " из анкеты без прямой необходимости; использовать их только если пост прямо про возраст, "
+            "выбор направления или подбор программы"
+        )
     if dna:
         must_avoid.append(
             "не указывать цены, бесплатность, скидки, адреса, даты, расписание, сроки и "

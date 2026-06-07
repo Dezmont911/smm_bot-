@@ -1,6 +1,7 @@
 import unittest
 
 from channel_dna import attach_channel_dna, build_channel_dna
+from content_generator import ContentGenerator
 from content_safety import (
     build_content_brief,
     build_safe_channel_profile,
@@ -505,6 +506,39 @@ class ContentSafetyTest(unittest.TestCase):
         self.assertIn("4–6", include)
         self.assertIn("Lego Mindstorms EV3", include)
         self.assertNotIn("age_range", avoid)
+
+    def test_content_brief_does_not_force_program_facts_for_generic_topic(self):
+        channel = {
+            **ROBO_CHANNEL,
+            "channel_dna": {
+                **ROBO_CHANNEL["channel_dna"],
+                "unknown_facts": ["free_trial", "price"],
+                "known_facts": {
+                    "age_groups": [
+                        {"age": "4–6", "directions": ["Lego WeDo", "Lego WeDo 2.0"]},
+                        {"age": "с 7", "directions": ["Lego Mindstorms EV3", "разработка игр"]},
+                    ],
+                    "directions": ["Lego WeDo", "Lego WeDo 2.0", "Lego Mindstorms EV3", "разработка игр"],
+                },
+            },
+        }
+        safety = dry_run_topic(channel, "Почему детям полезны проектные занятия")["safety"]
+        brief = build_content_brief(channel, safety)
+        include = "\n".join(brief["must_include"])
+        avoid = "\n".join(brief["must_avoid"])
+        self.assertNotIn("4–6", include)
+        self.assertNotIn("Lego Mindstorms EV3", include)
+        self.assertIn("не перечислять возрастные группы и направления", avoid)
+
+    def test_generator_topic_dedup_normalizes_service_words_and_punctuation(self):
+        gen = ContentGenerator()
+        used = ["Инфоповод: образовательные программы для детей: летний городской лагерь"]
+        self.assertTrue(
+            gen._topic_already_used(
+                "Образовательные программы для детей — летний городской лагерь",
+                used,
+            )
+        )
 
     def test_output_validator_allows_known_age_groups(self):
         channel = {
