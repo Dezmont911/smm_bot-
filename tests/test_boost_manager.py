@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from database import Database
 from boost_manager import (
@@ -700,6 +701,37 @@ class TwiBoostClientDryRunTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["error"], "twiboost_not_configured")
         self.assertFalse(result["configured"])
+
+    async def test_real_order_http_path_uses_stdlib_urlopen(self):
+        captured = {}
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"order": 321}'
+
+        def fake_urlopen(url, timeout):
+            captured["url"] = url
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        client = TwiBoostClientWrapper(api_key="secret", api_url="https://example.test/api", service_id=123, timeout=7)
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            result = await client.create_views_order("https://t.me/example/1", quantity=500, dry_run=False)
+
+        self.assertEqual(result["order"], 321)
+        self.assertEqual(captured["timeout"], 7)
+        self.assertIn("action=add", captured["url"])
+        self.assertIn("service=123", captured["url"])
+        self.assertIn("quantity=500", captured["url"])
 
 
 if __name__ == "__main__":

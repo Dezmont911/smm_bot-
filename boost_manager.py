@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
+import json
 import random
 import re
 import sqlite3
@@ -1204,17 +1205,27 @@ class TwiBoostClientWrapper:
         if not self.api_key or not self.api_url:
             return {"error": "twiboost_not_configured", "configured": False}
         try:
-            import requests
+            from urllib.error import HTTPError
+            from urllib.parse import urlencode
+            from urllib.request import urlopen
 
             payload = dict(params)
             payload["key"] = self.api_key
-            response = requests.get(self.api_url, params=payload, timeout=self.timeout)
+            separator = "&" if "?" in self.api_url else "?"
+            url = f"{self.api_url}{separator}{urlencode(payload)}"
             try:
-                data = response.json()
+                with urlopen(url, timeout=self.timeout) as response:
+                    status = getattr(response, "status", 200)
+                    text = response.read().decode("utf-8", "replace")
+            except HTTPError as exc:
+                status = exc.code
+                text = exc.read().decode("utf-8", "replace")
+            try:
+                data = json.loads(text)
             except Exception:
-                return {"error": f"invalid_json_response: {response.text[:200]}"}
-            if not response.ok and isinstance(data, dict) and "error" not in data:
-                data["error"] = f"HTTP {response.status_code}: {data}"
+                return {"error": f"invalid_json_response: {text[:200]}"}
+            if status >= 400 and isinstance(data, dict) and "error" not in data:
+                data["error"] = f"HTTP {status}: {data}"
             return data if isinstance(data, dict) else {"error": "invalid_response", "response": data}
         except Exception as exc:
             return {"error": str(exc)}
