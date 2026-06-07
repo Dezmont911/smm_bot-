@@ -675,10 +675,7 @@ async def screen_channels_deleted(qm, context: ContextTypes.DEFAULT_TYPE, page: 
     for ch in chunk:
         name = ch.get("name") or ch["channel_id"]
         buttons.append([
-            InlineKeyboardButton(f"♻️ Восстановить «{name}»", callback_data=f"ui:ch_restore:{ch['channel_id']}"),
-        ])
-        buttons.append([
-            InlineKeyboardButton("🧨 Удалить навсегда", callback_data=f"ui:ch_purge:{ch['channel_id']}"),
+            InlineKeyboardButton(f"🗑 {name}", callback_data=f"ui:ch_deleted_card:{ch['channel_id']}"),
         ])
 
     if pages > 1:
@@ -695,9 +692,45 @@ async def screen_channels_deleted(qm, context: ContextTypes.DEFAULT_TYPE, page: 
         header += f" · стр. {page + 1}/{pages}"
     await _answer_or_send(
         qm,
-        f"{header}\n\nМожно восстановить канал или удалить его навсегда вместе с данными из базы.",
+        f"{header}\n\nВыбери канал, потом реши: восстановить его или удалить навсегда вместе с данными из базы.",
         InlineKeyboardMarkup(buttons),
     )
+
+
+async def screen_deleted_channel_actions(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
+    """Карточка удалённого канала с выбором: восстановить или удалить навсегда."""
+    ch = _load_channel(handle)
+    if not ch:
+        await _answer_or_send(
+            qm,
+            f"❌ Канал {html.escape(handle)} не найден.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К удалённым", callback_data="ui:ch_deleted:0")]]),
+        )
+        return
+
+    if ch.get("active", True):
+        await _answer_or_send(
+            qm,
+            f"ℹ️ Канал {html.escape(ch.get('channel_id', handle))} уже активен.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К каналам", callback_data="ui:channels")]]),
+        )
+        return
+
+    channel_id = ch.get("channel_id", handle)
+    name = html.escape(ch.get("name") or channel_id)
+    text = (
+        f"🗑 <b>Удалённый канал</b>\n\n"
+        f"<b>{name}</b>\n"
+        f"{html.escape(channel_id)}\n\n"
+        "Восстановить — канал снова появится в списке.\n"
+        "Удалить навсегда — стереть карточку и связанные данные из базы."
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("♻️ Восстановить", callback_data=f"ui:ch_restore:{channel_id}")],
+        [InlineKeyboardButton("🧨 Удалить навсегда", callback_data=f"ui:ch_purge:{channel_id}")],
+        [InlineKeyboardButton("◀️ К удалённым", callback_data="ui:ch_deleted:0")],
+    ])
+    await _answer_or_send(qm, text, kb)
 
 
 async def action_channel_restore(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
@@ -789,7 +822,7 @@ async def action_channel_purge_confirm(qm, context: ContextTypes.DEFAULT_TYPE, h
     name = html.escape(ch.get("name") or channel_id)
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🧨 Да, удалить навсегда", callback_data=f"ui:ch_purge_ok:{channel_id}")],
-        [InlineKeyboardButton("◀️ Отмена", callback_data="ui:ch_deleted:0")],
+        [InlineKeyboardButton("◀️ Отмена", callback_data=f"ui:ch_deleted_card:{channel_id}")],
     ])
     await _answer_or_send(
         qm,
@@ -5534,7 +5567,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ch_sched_custom", "ch_sched_copy", "ch_sched_copy_ok", "ch_images_toggle",
         "ch_history", "ch_set", "ch_set_img", "ch_folder", "ch_setfold",
         "ch_diag", "ch_data", "ch_data_edit",
-        "ch_newfold", "ch_restore", "ch_purge", "ch_purge_ok", "ch_draft", "draft_new", "draft_qlast",
+        "ch_newfold", "ch_deleted_card", "ch_restore", "ch_purge", "ch_purge_ok", "ch_draft", "draft_new", "draft_qlast",
         "draft_qall", "draft_qbatch", "draft_preview_batch", "draft_clear", "draft_clearok", "rsy_toggle",
         "ch_archetype", "ch_set_arche", "ch_source_toggle", "ch_src_mode",
         "ch_refs", "ref_tgl", "ref_del", "ref_add", "ref_take", "ref_go",
@@ -5694,6 +5727,9 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "ch_deleted":
         page = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 0
         await screen_channels_deleted(query, context, page)
+
+    elif action == "ch_deleted_card" and len(parts) >= 3:
+        await screen_deleted_channel_actions(query, context, parts[2])
 
     elif action == "ch_restore" and len(parts) >= 3:
         await action_channel_restore(query, context, parts[2])

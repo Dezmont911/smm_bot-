@@ -393,7 +393,7 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Диагностика канала", captured["text"])
         self.assertIn("4–6", captured["text"])
 
-    async def test_deleted_channels_screen_offers_restore_and_purge(self):
+    async def test_deleted_channels_screen_lists_channels_only(self):
         captured = {}
         channels = [
             {"channel_id": "@gone", "name": "Gone", "owner_id": 100, "active": False},
@@ -412,9 +412,31 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
             for row in captured["kb"].inline_keyboard
             for button in row
         ]
+        self.assertIn("ui:ch_deleted_card:@gone", callbacks)
+        self.assertNotIn("ui:ch_restore:@gone", callbacks)
+        self.assertNotIn("ui:ch_purge:@gone", callbacks)
+        self.assertIn("Выбери канал", captured["text"])
+
+    async def test_deleted_channel_card_offers_restore_and_purge(self):
+        captured = {}
+        channel = {"channel_id": "@gone", "name": "Gone", "owner_id": 100, "active": False}
+
+        async def fake_answer_or_send(qm, text, kb):
+            captured["text"] = text
+            captured["kb"] = kb
+
+        with patch.object(ui, "_load_channel", return_value=channel), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
+            await ui.screen_deleted_channel_actions(FakeQuery(100), SimpleNamespace(user_data={}), "@gone")
+
+        callbacks = [
+            button.callback_data
+            for row in captured["kb"].inline_keyboard
+            for button in row
+        ]
         self.assertIn("ui:ch_restore:@gone", callbacks)
         self.assertIn("ui:ch_purge:@gone", callbacks)
-        self.assertIn("удалить его навсегда", captured["text"])
+        self.assertIn("Удалённый канал", captured["text"])
 
     def test_permanent_delete_channel_removes_database_rows_and_json(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
