@@ -48,6 +48,27 @@ ADULT_TECH_NEWS_MARKERS = (
 
 KIDS_EDU_ARCHETYPES = {"kids_education", "local_service", "parent_marketing", "hobby_school", "edtech"}
 
+EXPLICIT_NON_KIDS_ARCHETYPES = {
+    "gaming_casual",
+    "gaming_esports",
+    "news",
+    "auto",
+    "finance",
+    "celeb_drama",
+    "anime",
+}
+
+KIDS_DNA_POISON_MARKERS = (
+    "родители детей",
+    "запись на пробное",
+    "пробное занятие",
+    "подберем направление",
+    "подберём направление",
+    "ребенок много сидит",
+    "ребёнок много сидит",
+    "робототех",
+)
+
 KIDS_EDU_PROFILE_MARKERS = (
     "робототех", "программирован", "дет", "ребен", "ребён", "школь",
     "занят", "круж", "секци", "лагер", "логик", "самостоятельн",
@@ -141,7 +162,22 @@ def _as_list(value: Any, limit: int = 12) -> list[str]:
 
 def _channel_dna(channel: dict) -> dict:
     dna = channel.get("channel_dna") or {}
-    return dna if isinstance(dna, dict) else {}
+    if not isinstance(dna, dict):
+        return {}
+    archetype = _clean_text(channel.get("archetype"), 80)
+    if archetype in EXPLICIT_NON_KIDS_ARCHETYPES:
+        dna_text = _low(" ".join([
+            dna.get("audience", ""),
+            dna.get("goal", ""),
+            dna.get("offer", ""),
+            dna.get("cta", ""),
+            " ".join(_as_list(dna.get("pain_points"))),
+            " ".join(_as_list(dna.get("allowed_topic_types"))),
+            " ".join(_as_list(dna.get("forbidden_angles"))),
+        ]))
+        if any(marker in dna_text for marker in KIDS_DNA_POISON_MARKERS):
+            return {}
+    return dna
 
 
 def _unknown_facts(channel: dict) -> set[str]:
@@ -250,6 +286,8 @@ def _is_marketplace_channel(channel: dict) -> bool:
 
 def is_kids_education_channel(channel: dict) -> bool:
     if _is_marketplace_channel(channel):
+        return False
+    if _clean_text(channel.get("archetype"), 80) in EXPLICIT_NON_KIDS_ARCHETYPES:
         return False
     dna = _channel_dna(channel)
     if channel.get("archetype") in KIDS_EDU_ARCHETYPES:

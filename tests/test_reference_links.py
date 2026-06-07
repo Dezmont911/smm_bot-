@@ -51,6 +51,17 @@ class ExtractLinksTest(unittest.TestCase):
         self.assertEqual(_extract_links("просто текст"), [])
         self.assertEqual(_extract_links(""), [])
 
+    def test_source_channel_link_skipped_when_handle_known(self):
+        html = (
+            'Новость\n'
+            '<a href="https://t.me/prepodsteam">Pradow</a>\n'
+            '<a href="https://store.steampowered.com/app/1">Steam</a>'
+        )
+        self.assertEqual(
+            _extract_links(html, source_handle="@prepodsteam"),
+            [("https://store.steampowered.com/app/1", "Steam")],
+        )
+
 
 class MetaLeakTest(unittest.TestCase):
     """Мета-хвост и отказы не должны попадать в пост."""
@@ -111,6 +122,43 @@ class ReattachLinkInStoreTest(unittest.TestCase):
         self.assertIn('<a href="https://ali.click/', captured["content"],
                       "партнёрская ссылка потеряна при рефразе — переклейка сломана")
         self.assertEqual(captured.get("parse_mode"), "HTML")
+
+    def test_rephrased_reference_strips_source_channel_footer(self):
+        channel = {
+            "channel_id": "@pradowsteam",
+            "name": "Pradow Steam",
+            "topic": "игровые новости, релизы Steam и обзоры игр",
+            "post_length": "10-50",
+            "archetype": "gaming_casual",
+            "channel_type": "content",
+        }
+        p = {
+            "id": 10604,
+            "text": "Похоже, Baldur's Gate 2 может получить ремейк\n\nБольше новостей: @prepodsteam",
+            "text_html": (
+                "Похоже, Baldur&#x27;s Gate 2 может получить ремейк\n\n"
+                'Больше новостей: <a href="https://t.me/prepodsteam">@prepodsteam</a>'
+            ),
+            "media_kind": None,
+            "match_user": "prepodsteam",
+            "match_id": 10604,
+        }
+        captured = {}
+
+        async def fake_rephrase(text, ch):
+            self.assertNotIn("@prepodsteam", text)
+            return "Baldur's Gate 2, похоже, может получить ремейк. Подробности пока звучат осторожно."
+
+        def fake_add(record):
+            captured.update(record)
+
+        with mock.patch("ai_client.rephrase_text", new=fake_rephrase), \
+             mock.patch.object(ri.buffer, "add", side_effect=fake_add):
+            asyncio.run(ri._store_reference_post(channel, "@pradowsteam", "@prepodsteam", p, do_rephrase=True))
+
+        self.assertIn("content", captured)
+        self.assertNotIn("@prepodsteam", captured["content"])
+        self.assertNotIn("t.me/prepodsteam", captured["content"])
 
 
 if __name__ == "__main__":

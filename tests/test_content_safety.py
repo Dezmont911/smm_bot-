@@ -78,6 +78,26 @@ class ContentSafetyTest(unittest.TestCase):
         }
         self.assertFalse(is_kids_education_channel(channel))
 
+    def test_gaming_channel_ignores_contaminated_kids_dna(self):
+        channel = {
+            "channel_id": "@pradowsteam",
+            "channel_type": "content",
+            "archetype": "gaming_casual",
+            "topic": "Канал о видеоиграх: новости Steam, релизы, обзоры и забавные случаи из игровой жизни.",
+            "channel_dna": {
+                **ROBO_CHANNEL["channel_dna"],
+                "audience": "родители детей",
+                "goal": "запись на пробное занятие / консультацию / подбор направления",
+                "forbidden_angles": ["игровые новости", "релизы Nintendo/Steam/консолей"],
+            },
+        }
+        self.assertFalse(is_kids_education_channel(channel))
+        result = dry_run_topic(channel, "Новый трейлер Hollow Knight Silksong вышел в Steam")
+        self.assertIn(result["safety"]["decision"], {"allowed", "allowed_safe"})
+        brief = result["content_brief"]
+        self.assertNotIn("пробное занятие", "\n".join(brief["must_include"]).lower())
+        self.assertEqual(brief["cta"], "")
+
     def test_marketplace_wb_topic_uses_marketplace_fit(self):
         channel = {
             "channel_id": "@shop",

@@ -90,7 +90,55 @@ def _strip_filtered_sentences(text: str) -> str:
 _LINK_RE = re.compile(r'<a\s+href="([^"]+)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
 
 
-def _extract_links(text_html: str) -> list[tuple[str, str]]:
+def _source_handle_variants(handle: str | None) -> set[str]:
+    h = normalize_handle(handle or "").lstrip("@").lower()
+    if not h:
+        return set()
+    return {
+        f"@{h}",
+        f"t.me/{h}",
+        f"telegram.me/{h}",
+        f"https://t.me/{h}",
+        f"http://t.me/{h}",
+        f"https://telegram.me/{h}",
+        f"http://telegram.me/{h}",
+    }
+
+
+def _looks_like_source_footer_line(line: str, handle: str | None) -> bool:
+    if not line or not handle:
+        return False
+    plain = re.sub(r"<[^>]+>", " ", line)
+    plain = re.sub(r"&[a-zA-Z0-9#]+;", " ", plain)
+    low = re.sub(r"\s+", " ", plain).strip().lower()
+    return any(marker in low for marker in _source_handle_variants(handle))
+
+
+def _strip_source_footer(text: str, handle: str | None) -> str:
+    """Remove donor self-promo/footer lines near the end of a reference post."""
+    if not text or not handle:
+        return text
+    lines = str(text).splitlines()
+    if not lines:
+        return text
+    cutoff = max(0, len(lines) - 7)
+    kept = []
+    for idx, line in enumerate(lines):
+        if idx >= cutoff and _looks_like_source_footer_line(line, handle):
+            continue
+        kept.append(line)
+    result = "\n".join(kept)
+    return re.sub(r"\n{3,}", "\n\n", result).strip()
+
+
+def _is_source_channel_link(url: str, label: str, source_handle: str | None) -> bool:
+    if not source_handle:
+        return False
+    low = f"{url} {label}".lower()
+    return any(marker in low for marker in _source_handle_variants(source_handle))
+
+
+def _extract_links(text_html: str, source_handle: str | None = None) -> list[tuple[str, str]]:
     """
     Достаёт гиперссылки (url, видимый_текст) из HTML-текста донора. Только http(s),
     дедуп по url, без t.me-упоминаний самого донора (служебные ссылки). Нужно, чтобы
@@ -103,10 +151,12 @@ def _extract_links(text_html: str) -> list[tuple[str, str]]:
         url = url.strip()
         if not url.lower().startswith(("http://", "https://")):
             continue
+        label = re.sub(r"<[^>]+>", "", label or "").strip()
+        if _is_source_channel_link(url, label, source_handle):
+            continue
         if url in seen:
             continue
         seen.add(url)
-        label = re.sub(r"<[^>]+>", "", label or "").strip()
         out.append((url, label))
     return out
 
@@ -161,14 +211,16 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
     # репостит из другого канала, это оригинальный канал+id. Иначе — сам донор+id.
     topic = ref_topic(p.get("match_user") or handle, p.get("match_id") or p["id"])
     raw = p.get("text", "")
-    raw_for_safety = raw or re.sub(r"<[^>]+>", " ", p.get("text_html") or "")
+    raw_clean = _strip_source_footer(raw, handle)
+    html_clean = _strip_source_footer(p.get("text_html") or "", handle)
+    raw_for_safety = raw_clean or re.sub(r"<[^>]+>", " ", html_clean or "")
     kind = p.get("media_kind")
 
     import_validation = validate_imported_post(
         channel,
         {
             "channel_id": channel_id,
-            "content": p.get("text_html") or raw,
+            "content": html_clean or raw_clean,
             "format": "reference",
             "topic": topic,
             "media_type": "album" if p.get("group_id") else kind,
@@ -196,18 +248,19 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
         brief = build_content_brief(channel, safety, "reference")
 
     # «Как есть» — HTML (со ссылками); перефраз — простой текст без формата
-    if do_rephrase and raw:
+    if do_rephrase and raw_clean:
         from ai_client import rephrase_text  # ленивый импорт (тяжёлая зависимость)
         try:
-            content = await rephrase_text(raw, channel)
+            content = await rephrase_text(raw_clean, channel)
         except Exception as e:
             logger.warning(f"Перефраз {handle}/{p['id']} не удался: {e} — беру оригинал")
-            content = raw
+            content = raw_clean
+        content = _strip_source_footer(content, handle)
         parse_mode = None
         # Перефраз отдаёт plain-текст и теряет гиперссылки (<a href>). Если в оригинале
         # были ссылки (например партнёрская/на товар) — сохраняем их: экранируем
         # перефраз под HTML и переклеиваем ссылки CTA-строкой в конце (баг #13).
-        links = _extract_links(p.get("text_html") or "")
+        links = _extract_links(html_clean or "", source_handle=handle)
         if links:
             import html as _html
             body = _html.escape(content or "")
@@ -217,9 +270,10 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
             content = (body + ("\n\n" if body else "") + cta).strip()
             parse_mode = "HTML"
     else:
-        content = p.get("text_html") or raw
+        content = html_clean or raw_clean
         parse_mode = "HTML"
 
+    content = _strip_source_footer(content, handle)
     content = _strip_filtered_sentences(content)  # вырезаем «MAX» и пр.
 
     if not content and not kind:
