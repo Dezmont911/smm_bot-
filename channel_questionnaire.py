@@ -10,7 +10,7 @@ import copy
 import re
 from typing import Any
 
-from content_safety import _blocked_content, _clean_text, _looks_like_refusal
+from content_safety import _blocked_content, _clean_text, _looks_like_refusal, is_kids_education_channel
 
 
 SUPPORTED_QUESTIONNAIRE_ARCHETYPES = {
@@ -70,7 +70,9 @@ _SPECIFIC_DIRECTION_MARKERS = (
 def questionnaire_supported(channel: dict) -> bool:
     if (channel or {}).get("channel_type") == "marketplace":
         return False
-    return (channel or {}).get("archetype") in SUPPORTED_QUESTIONNAIRE_ARCHETYPES
+    if (channel or {}).get("archetype") in SUPPORTED_QUESTIONNAIRE_ARCHETYPES:
+        return True
+    return is_kids_education_channel(channel or {})
 
 
 def validate_questionnaire_input(field: str, value: Any, channel: dict | None = None) -> dict:

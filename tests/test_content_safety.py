@@ -556,6 +556,18 @@ class ContentSafetyTest(unittest.TestCase):
         self.assertFalse(questionnaire_supported({"channel_id": "@news", "archetype": "news"}))
         self.assertFalse(questionnaire_supported({**MARKETPLACE_CHANNEL, "archetype": "kids_education"}))
 
+    def test_questionnaire_available_for_detected_robo_channel_with_default_archetype(self):
+        channel = {
+            "channel_id": "@robotop",
+            "archetype": "default",
+            "topic": "робототехника и программирование для детей",
+            "channel_dna": {
+                "audience": "родители детей 4-15 лет",
+                "offer": "школа робототехники и программирования для детей",
+            },
+        }
+        self.assertTrue(questionnaire_supported(channel))
+
     def test_marketplace_reference_requires_product_link(self):
         validation = validate_generated_post(
             MARKETPLACE_CHANNEL,

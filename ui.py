@@ -1326,7 +1326,10 @@ async def screen_channel_data(qm, context: ContextTypes.DEFAULT_TYPE, handle: st
 
     channel_id = ch.get("channel_id", handle)
     if not questionnaire_supported(ch):
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К настройкам", callback_data=f"ui:ch_settings:{channel_id}")]])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎭 Выбрать стиль канала", callback_data=f"ui:ch_archetype:{channel_id}")],
+            [InlineKeyboardButton("◀️ К настройкам", callback_data=f"ui:ch_settings:{channel_id}")],
+        ])
         await _answer_or_send(
             qm,
             "🧬 <b>Данные канала</b>\n\nАнкета v1 включена только для детских, локальных и образовательных каналов. Для новостей, маркетплейса и общих каналов она не применяется, чтобы не тащить чужие факты в промпт.",
