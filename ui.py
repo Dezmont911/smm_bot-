@@ -56,6 +56,7 @@ from channel_questionnaire import (
     questionnaire_supported,
     validate_questionnaire_input,
 )
+from channel_dna import channel_dna_compatibility
 from boost_manager import (
     add_tracked_channel,
     add_tracked_channel_from_smm_channel,
@@ -1269,6 +1270,7 @@ async def screen_channel_diagnostics(qm, context: ContextTypes.DEFAULT_TYPE, han
     channel_id = ch.get("channel_id", handle)
     data = diagnostics_for_channel(ch)
     dna = data["dna"]
+    dna_status = channel_dna_compatibility(ch)
     safe_profile = ch.get("safe_profile") if isinstance(ch.get("safe_profile"), dict) else {}
     known_lines = format_known_facts(data["known_facts"])
     warnings = data["warnings"] or ["критичных предупреждений нет"]
@@ -1283,6 +1285,8 @@ async def screen_channel_diagnostics(qm, context: ContextTypes.DEFAULT_TYPE, han
         f"Safe profile: {'есть' if safe_profile else 'нет'}",
         "",
         "🧬 <b>Channel DNA</b>",
+        f"Статус: {html.escape(str(dna_status.get('status')))}",
+        f"Причина: {html.escape(str(dna_status.get('reason')))}",
         f"Аудитория: {html.escape(str(dna.get('audience') or 'нет'))}",
         f"Цель: {html.escape(str(dna.get('goal') or 'нет'))}",
         f"Оффер: {html.escape(str(dna.get('offer') or 'нет'))}",
@@ -1339,10 +1343,13 @@ async def screen_channel_data(qm, context: ContextTypes.DEFAULT_TYPE, handle: st
         return
 
     data = diagnostics_for_channel(ch)
+    dna_status = channel_dna_compatibility(ch)
     known_lines = format_known_facts(data["known_facts"])
     warnings = data.get("warnings") or []
     text = (
         "🧬 <b>Данные канала</b>\n\n"
+        f"Статус DNA: <b>{html.escape(str(dna_status.get('status')))}</b>\n"
+        f"Причина: {html.escape(str(dna_status.get('reason')))}\n\n"
         "Эти факты попадают в Content Brief после нормализации. Сырой текст анкеты в промпт не идет.\n\n"
         "<b>Сейчас известно:</b>\n"
         + "\n".join(html.escape(x) for x in (known_lines or ["нет подтвержденных фактов"]))

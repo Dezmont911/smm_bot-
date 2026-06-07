@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from loguru import logger
+
 from content_safety import KIDS_EDU_ARCHETYPES
 
 
@@ -56,6 +58,55 @@ MARKETPLACE_MARKERS = (
     "цена", "₽", "руб",
 )
 
+NON_DNA_ARCHETYPES = {
+    "gaming",
+    "gaming_casual",
+    "gaming_esports",
+    "news",
+    "tech_news",
+    "auto",
+    "music",
+    "anime",
+    "memes",
+    "cats",
+    "pets",
+    "marketplace",
+    "wb_product",
+    "finance",
+    "celeb_drama",
+}
+
+DNA_ENABLED_ARCHETYPES = {
+    "kids_education",
+    "local_service",
+    "parent_marketing",
+    "edtech",
+    "hobby_school",
+}
+
+KIDS_LOCAL_DNA_MARKERS = (
+    "родители",
+    "родитель",
+    "дети",
+    "ребен",
+    "ребён",
+    "пробное",
+    "занятие",
+    "запись",
+    "лагерь",
+    "whatsapp",
+    "ватсап",
+    "подберем направление",
+    "подберём направление",
+    "игровые новости",
+    "релизы steam",
+    "nintendo",
+    "консоли",
+    "lego wedo",
+    "mindstorms",
+    "робототех",
+)
+
 
 def _clean_text(value: Any, limit: int = 500) -> str:
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", str(value or ""))
@@ -75,6 +126,115 @@ def _as_list(value: Any, limit: int = 12) -> list[str]:
     if not isinstance(value, (list, tuple)):
         return []
     return [_clean_text(v, 180) for v in value[:limit] if _clean_text(v, 180)]
+
+
+def _dna_text(dna: dict) -> str:
+    known = dna.get("known_facts") if isinstance(dna.get("known_facts"), dict) else {}
+    parts = [
+        dna.get("audience", ""),
+        dna.get("goal", ""),
+        dna.get("offer", ""),
+        dna.get("cta", ""),
+        dna.get("tone", ""),
+        " ".join(_as_list(dna.get("pain_points"), 20)),
+        " ".join(_as_list(dna.get("allowed_topic_types"), 20)),
+        " ".join(_as_list(dna.get("forbidden_angles"), 20)),
+        " ".join(_as_list(known.get("directions"), 20)),
+        " ".join(_as_list(known.get("age_groups"), 20)),
+    ]
+    if known:
+        parts.append(jsonish_known_facts(known))
+    return _low(" ".join(str(p) for p in parts if p))
+
+
+def jsonish_known_facts(known: dict) -> str:
+    chunks = []
+    for key, value in known.items():
+        if isinstance(value, list):
+            chunks.append(f"{key} " + " ".join(str(v) for v in value[:8]))
+        elif isinstance(value, dict):
+            chunks.append(f"{key} " + " ".join(f"{k}:{v}" for k, v in list(value.items())[:8]))
+        else:
+            chunks.append(f"{key} {value}")
+    return " ".join(chunks)
+
+
+def channel_dna_compatibility(channel: dict) -> dict:
+    """Return runtime compatibility status for raw channel_dna."""
+    raw = channel.get("channel_dna") if isinstance(channel, dict) else None
+    if not isinstance(raw, dict) or not raw:
+        return {"status": "missing", "active": False, "reason": "no_channel_dna", "suspicious_fields": []}
+
+    channel_type = _clean_text(channel.get("channel_type"), 80)
+    archetype = _clean_text(channel.get("archetype"), 80) or "default"
+    topic = _low(channel.get("topic", ""))
+    dna_text = _dna_text(raw)
+    suspicious = [marker for marker in KIDS_LOCAL_DNA_MARKERS if marker in dna_text]
+
+    if channel_type == "marketplace" or archetype in {"marketplace", "wb_product"}:
+        if suspicious:
+            return {
+                "status": "ignored_incompatible",
+                "active": False,
+                "reason": "marketplace_channel_with_kids_local_dna",
+                "suspicious_fields": suspicious[:12],
+            }
+        return {"status": "active", "active": True, "reason": "marketplace_dna_allowed", "suspicious_fields": []}
+
+    if archetype in DNA_ENABLED_ARCHETYPES:
+        return {"status": "active", "active": True, "reason": "dna_enabled_archetype", "suspicious_fields": suspicious[:12]}
+
+    if archetype in NON_DNA_ARCHETYPES and suspicious:
+        return {
+            "status": "ignored_incompatible",
+            "active": False,
+            "reason": f"{archetype}_channel_with_kids_local_dna",
+            "suspicious_fields": suspicious[:12],
+        }
+
+    if archetype in NON_DNA_ARCHETYPES:
+        return {"status": "ignored_unknown", "active": False, "reason": f"{archetype}_does_not_use_channel_dna", "suspicious_fields": []}
+
+    if suspicious and not any(marker in topic for marker in KIDS_EDU_MARKERS):
+        return {
+            "status": "ignored_incompatible",
+            "active": False,
+            "reason": "unknown_archetype_with_kids_local_dna",
+            "suspicious_fields": suspicious[:12],
+        }
+
+    if archetype == "default":
+        return {"status": "ignored_unknown", "active": False, "reason": "default_archetype_requires_explicit_dna_support", "suspicious_fields": suspicious[:12]}
+
+    return {"status": "active", "active": True, "reason": "dna_compatible", "suspicious_fields": suspicious[:12]}
+
+
+_WARNED_DNA_KEYS: set[tuple[str, str]] = set()
+
+
+def get_effective_channel_dna(channel: dict) -> dict | None:
+    """Runtime-safe channel_dna accessor.
+
+    Generation, briefs, validators and relevance gates must use this helper
+    instead of raw channel["channel_dna"]. Incompatible DNA is ignored.
+    """
+    info = channel_dna_compatibility(channel)
+    raw = channel.get("channel_dna") if isinstance(channel, dict) else None
+    if info.get("active"):
+        return raw if isinstance(raw, dict) else None
+    if info.get("status") == "ignored_incompatible":
+        key = (str(channel.get("channel_id") or channel.get("username") or "?"), str(info.get("reason")))
+        if key not in _WARNED_DNA_KEYS:
+            _WARNED_DNA_KEYS.add(key)
+            logger.warning(
+                "channel_dna ignored [{}]: reason={} archetype={} channel_type={} suspicious={}",
+                key[0],
+                info.get("reason"),
+                channel.get("archetype"),
+                channel.get("channel_type"),
+                ", ".join(info.get("suspicious_fields") or []),
+            )
+    return None
 
 
 def _joined_text(analysis: dict, posts_sample: list[str] | None, about: str) -> str:

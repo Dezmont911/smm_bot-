@@ -411,7 +411,11 @@ def _build_system_prompt(
     # Санитизируем и обрезаем все поля канала (защита от раздувания/инъекций)
     name = sanitize_field(channel.get("name", ""), FIELD_LIMITS["name"])
     topic = sanitize_field(channel.get("topic", ""), FIELD_LIMITS["topic"])
-    channel_dna = channel.get("channel_dna") if isinstance(channel.get("channel_dna"), dict) else {}
+    try:
+        from channel_dna import get_effective_channel_dna
+        channel_dna = get_effective_channel_dna(channel) or {}
+    except Exception:
+        channel_dna = {}
     audience = sanitize_field(
         channel_dna.get("audience") or channel.get("audience", ""),
         FIELD_LIMITS["audience"],

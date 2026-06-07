@@ -1,6 +1,6 @@
 import unittest
 
-from channel_dna import attach_channel_dna, build_channel_dna
+from channel_dna import attach_channel_dna, build_channel_dna, channel_dna_compatibility, get_effective_channel_dna
 from content_generator import ContentGenerator
 from content_safety import (
     build_content_brief,
@@ -91,12 +91,83 @@ class ContentSafetyTest(unittest.TestCase):
                 "forbidden_angles": ["игровые новости", "релизы Nintendo/Steam/консолей"],
             },
         }
+        self.assertIsNone(get_effective_channel_dna(channel))
+        self.assertEqual(channel_dna_compatibility(channel)["status"], "ignored_incompatible")
         self.assertFalse(is_kids_education_channel(channel))
         result = dry_run_topic(channel, "Новый трейлер Hollow Knight Silksong вышел в Steam")
         self.assertIn(result["safety"]["decision"], {"allowed", "allowed_safe"})
         brief = result["content_brief"]
         self.assertNotIn("пробное занятие", "\n".join(brief["must_include"]).lower())
         self.assertEqual(brief["cta"], "")
+
+    def test_non_dna_archetypes_ignore_kids_dna(self):
+        for archetype in ("news", "tech_news", "auto", "music", "anime", "memes"):
+            channel = {
+                "channel_id": f"@{archetype}",
+                "channel_type": "content",
+                "archetype": archetype,
+                "topic": "обычный тематический канал",
+                "channel_dna": {
+                    **ROBO_CHANNEL["channel_dna"],
+                    "audience": "родители детей",
+                    "goal": "запись на пробное занятие",
+                    "cta": "напишите в WhatsApp, подберем направление",
+                },
+            }
+            self.assertIsNone(get_effective_channel_dna(channel), archetype)
+
+    def test_gaming_channel_with_native_dna_is_not_used_by_runtime(self):
+        channel = {
+            "channel_id": "@games",
+            "channel_type": "content",
+            "archetype": "gaming_casual",
+            "topic": "игровые новости Steam",
+            "channel_dna": {
+                "audience": "игроки и подписчики, которые следят за релизами",
+                "goal": "дать короткую игровую новость",
+                "tone": "живой игровой тон",
+            },
+        }
+        info = channel_dna_compatibility(channel)
+        self.assertEqual(info["status"], "ignored_unknown")
+        self.assertIsNone(get_effective_channel_dna(channel))
+
+    def test_marketplace_ignores_kids_dna_even_for_child_products(self):
+        channel = {
+            **MARKETPLACE_CHANNEL,
+            "topic": "детские товары и игрушки на Wildberries",
+            "wb_categories": ["игрушки для детей"],
+            "channel_dna": {
+                **ROBO_CHANNEL["channel_dna"],
+                "audience": "родители детей",
+                "goal": "запись на пробное занятие",
+            },
+        }
+        self.assertIsNone(get_effective_channel_dna(channel))
+        self.assertFalse(is_kids_education_channel(channel))
+
+    def test_kids_and_local_service_dna_stays_active(self):
+        kids = {
+            **ROBO_CHANNEL,
+            "channel_dna": {
+                **ROBO_CHANNEL["channel_dna"],
+                "known_facts": {"age_groups": [{"age": "4–6", "directions": ["Lego WeDo"]}]},
+            },
+        }
+        local = {
+            "channel_id": "@dent",
+            "channel_type": "content",
+            "archetype": "local_service",
+            "topic": "локальная стоматология",
+            "channel_dna": {
+                "audience": "жители района",
+                "goal": "запись на консультацию",
+                "cta": "позвонить",
+                "known_facts": {"address": "ул. Ленина, 1"},
+            },
+        }
+        self.assertIsNotNone(get_effective_channel_dna(kids))
+        self.assertIsNotNone(get_effective_channel_dna(local))
 
     def test_marketplace_wb_topic_uses_marketplace_fit(self):
         channel = {
@@ -605,6 +676,56 @@ class ContentSafetyTest(unittest.TestCase):
         )
         self.assertFalse(validation["allowed"])
         self.assertEqual(validation["reason_code"], "unsupported_claim_or_unknown_fact")
+
+    def test_validator_ignores_unknown_facts_from_incompatible_dna(self):
+        channel = {
+            "channel_id": "@games",
+            "channel_type": "content",
+            "archetype": "gaming_casual",
+            "topic": "игровые новости Steam",
+            "channel_dna": {
+                **ROBO_CHANNEL["channel_dna"],
+                "unknown_facts": ["free_trial", "age_range"],
+                "known_facts": {"directions": ["Lego WeDo"]},
+            },
+        }
+        safety_and_brief = dry_run_topic(channel, "Новый трейлер игры появился в Steam")
+        validation = validate_generated_post(
+            channel,
+            {"content": "В Steam появился новый трейлер игры. Выглядит бодро: разработчики показали боевую систему и дату релиза."},
+            safety_and_brief["safety"],
+            safety_and_brief["content_brief"],
+        )
+        self.assertTrue(validation["allowed"])
+        self.assertEqual(safety_and_brief["content_brief"]["cta"], "")
+
+    def test_reference_pipeline_uses_no_kids_constraints_for_gaming_channel(self):
+        channel = {
+            "channel_id": "@games",
+            "channel_type": "content",
+            "archetype": "gaming_casual",
+            "topic": "игровые новости Steam",
+            "channel_dna": {
+                **ROBO_CHANNEL["channel_dna"],
+                "audience": "родители детей",
+                "goal": "запись на пробное занятие",
+                "cta": "напишите, подберем направление по возрасту",
+            },
+        }
+        safety = evaluate_topic_candidate(
+            channel,
+            {"topic": "Baldur's Gate 2 может получить ремейк", "source": "reference_import"},
+        )
+        brief = build_content_brief(channel, safety, "reference")
+        validation = validate_generated_post(
+            channel,
+            {"content": "Baldur's Gate 2 может получить ремейк. Если слух подтвердится, фанаты классики точно оживятся.", "format": "reference"},
+            safety,
+            brief,
+        )
+        self.assertTrue(validation["allowed"])
+        self.assertEqual(brief["cta"], "")
+        self.assertNotIn("родител", brief["target_reader"].lower())
 
     def test_questionnaire_not_forced_for_generic_and_marketplace(self):
         self.assertFalse(questionnaire_supported({"channel_id": "@news", "archetype": "news"}))

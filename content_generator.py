@@ -832,7 +832,11 @@ class ContentGenerator:
             return topics  # без эмбеддингов гейт не работает — пропускаем как есть
 
         channel_id = channel["channel_id"]
-        dna = channel.get("channel_dna") if isinstance(channel.get("channel_dna"), dict) else {}
+        try:
+            from channel_dna import get_effective_channel_dna
+            dna = get_effective_channel_dna(channel) or {}
+        except Exception:
+            dna = {}
         profile = " ".join(p for p in [
             channel.get("topic", ""),
             channel.get("audience", ""),
