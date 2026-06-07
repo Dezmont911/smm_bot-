@@ -1,10 +1,14 @@
 import unittest
+import tempfile
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import bot as bot_module
+import buffer_manager as buffer_module
 import views_monitor
+from database import Database
 
 
 class ViewsMonitorTests(unittest.IsolatedAsyncioTestCase):
@@ -115,6 +119,46 @@ class ViewsMonitorTests(unittest.IsolatedAsyncioTestCase):
         json_save.assert_called_once_with(channel)
         db_save.assert_not_called()
         self.assertIn(views_monitor.SUBS_ALERT_LAST_FIELD, channel)
+
+    def test_manual_post_covers_pending_rsy_overlay(self):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        original_db = buffer_module.db
+        try:
+            buffer_module.db = Database(Path(tmp.name) / "rsy.db")
+            buffer_module.db.init()
+            self.assertTrue(buffer_module.buffer.record_pending_ad("@wb_bomb", 1001, "2026-06-07T03:15:00+00:00"))
+            self.assertTrue(buffer_module.buffer.has_pending_overlay("@wb_bomb"))
+
+            covered = buffer_module.buffer.cover_pending_overlay("@wb_bomb", "covered_manual")
+
+            self.assertEqual(covered, 1)
+            self.assertFalse(buffer_module.buffer.has_pending_overlay("@wb_bomb"))
+            with buffer_module.db.connect() as conn:
+                row = conn.execute("SELECT status FROM processed_ads WHERE channel_id = ?", ("@wb_bomb",)).fetchone()
+            self.assertEqual(row["status"], "covered_manual")
+        finally:
+            buffer_module.db = original_db
+            tmp.cleanup()
+
+    async def test_due_rsy_overlay_skips_when_recent_post_exists(self):
+        fake_buffer = SimpleNamespace(
+            get_due_ads=lambda now_iso: [{"id": "ad-1", "channel_id": "@wb_bomb", "due_at": now_iso}],
+            mark_ad_failed=Mock(),
+            get_ready_count=Mock(side_effect=AssertionError("should not publish")),
+        )
+        fake_poster = SimpleNamespace(
+            minutes_since_published=lambda channel_id: 3,
+            post_now=AsyncMock(),
+        )
+        fake_bot = SimpleNamespace(send_message=AsyncMock())
+
+        with patch.object(bot_module, "buffer", fake_buffer), \
+                patch.object(bot_module, "poster", fake_poster):
+            await bot_module.process_due_ads(fake_bot)
+
+        fake_buffer.mark_ad_failed.assert_called_once_with("ad-1", "covered_recent_post")
+        fake_poster.post_now.assert_not_awaited()
+        fake_bot.send_message.assert_not_awaited()
 
 
 if __name__ == "__main__":

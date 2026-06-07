@@ -201,6 +201,17 @@ class BufferManager:
             ).fetchone()
         return row is not None
 
+    def cover_pending_overlay(self, channel_id: str, status: str = "covered_manual") -> int:
+        """Закрывает ожидающие РСЯ-перекрытия, если рекламу уже перекрыл обычный пост."""
+        now = datetime.now(timezone.utc).isoformat()
+        with db.connect() as conn:
+            cur = conn.execute(
+                "UPDATE processed_ads SET status = ?, published_at = ? "
+                "WHERE channel_id = ? AND status = 'detected'",
+                (status, now, channel_id),
+            )
+            return cur.rowcount
+
     def get_due_ads(self, now_iso: str) -> list[dict]:
         """Перекрытия, которым пора публиковаться (status='detected', due_at <= now)."""
         with db.connect() as conn:

@@ -56,7 +56,7 @@ from config import cfg
 from database import db
 from buffer_manager import buffer
 from content_generator import generator
-from poster import poster
+from poster import MIN_PUBLISH_GAP_MIN, poster
 from ui import (
     ui_router,
     screen_main,
@@ -3485,6 +3485,11 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         # как апдейт НЕ получает, значит это ручной пост → фиксируем время, чтобы
         # ближайший плановый слот (в пределах MIN_GAP) не выдал дубль.
         poster.record_published(channel_id)
+        covered = buffer.cover_pending_overlay(channel_id, "covered_manual")
+        if covered:
+            logger.info(
+                f"Ручной пост в {channel_id} перекрыл РСЯ — отменил pending overlay: {covered}"
+            )
         logger.info(f"Ручной пост в {channel_id} — обновил last_published (слот рядом пропустится)")
         return
 
@@ -3572,8 +3577,16 @@ async def process_due_ads(bot):
         except Exception:
             pass
 
-        # Перекрытие публикуем ВСЕГДА, когда дозрело (реклама важнее; у неё свои
-        # окна и она не выходит два раза подряд). MIN_GAP к перекрытию не применяем.
+        # Если после рекламы уже был обычный/ручной пост, не публикуем второе
+        # перекрытие рядом. Реклама уже ушла вниз, а дубль будет выглядеть мусором.
+        mins = poster.minutes_since_published(cid)
+        if mins is not None and mins < MIN_PUBLISH_GAP_MIN:
+            buffer.mark_ad_failed(ad_id, "covered_recent_post")
+            logger.info(
+                f"РСЯ-перекрытие {cid} отменено: пост уже был {mins:.0f} мин назад "
+                f"(< {MIN_PUBLISH_GAP_MIN} мин)"
+            )
+            continue
 
         try:
             # Буфер пуст — экстренно генерируем 1 пост
