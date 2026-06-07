@@ -67,6 +67,18 @@ from boost_manager import (
     set_tracked_channel_enabled,
     set_tracked_channel_quantity,
 )
+from views_monitor import (
+    DEFAULT_FOLDER as VIEWS_MONITOR_DEFAULT_FOLDER,
+    POST_LIMIT as VIEWS_MONITOR_POST_LIMIT,
+    SUBS_MIN as VIEWS_MONITOR_SUBS_MIN,
+    VIEWS_MIN as VIEWS_MONITOR_VIEWS_MIN,
+    WATCH_MAX_H as VIEWS_MONITOR_WATCH_MAX_H,
+    WATCH_MIN_H as VIEWS_MONITOR_WATCH_MIN_H,
+    collect_monitor_report,
+    digest_text as views_monitor_digest_text,
+    monitor_enabled,
+    select_monitored_channels,
+)
 
 
 def _acting_uid(qm) -> int | None:
@@ -4667,6 +4679,7 @@ async def screen_admin(qm, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(f"📡 Каналы пользователей ({len(tester_chans)})", callback_data="ui:adm_chans:0")],
         [InlineKeyboardButton(f"📢 РСЯ по умолчанию: {rsy_state}", callback_data="ui:adm_rsy_default")],
         [InlineKeyboardButton(f"🗑 Удалить мои каналы ({len(my_chans)})", callback_data="ui:adm_del_my_chans")],
+        [InlineKeyboardButton("📊 Мониторинг охватов", callback_data="ui:adm_views")],
         [InlineKeyboardButton("🚀 Boost", callback_data="ui:boost")],
         [InlineKeyboardButton("💰 Расходы", callback_data="ui:adm_cost:today")],
         [InlineKeyboardButton("⚡ Генерить для всех", callback_data="ui:generate_all")],
@@ -4747,6 +4760,114 @@ async def action_admin_delete_my_channels_ok(qm, context):
         f"🗑 Деактивировано моих каналов: <b>{count}</b>.",
         InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Админ-панель", callback_data="ui:admin")]]),
     )
+
+
+VIEWS_MONITOR_PAGE_SIZE = 10
+
+
+def _admin_monitor_channels(uid: int | None) -> list[dict]:
+    return [
+        ch for ch in _load_channels(include_inactive=True, owner_id=uid, scope="mine")
+        if ch.get("active", True)
+    ]
+
+
+def _views_monitor_button_label(ch: dict) -> str:
+    enabled = monitor_enabled(ch)
+    folder = (ch.get("folder") or "без папки").strip()
+    name = ch.get("name") or ch.get("channel_id")
+    if ch.get("views_monitor_enabled") is True:
+        state = "✅ вручную"
+    elif ch.get("views_monitor_enabled") is False:
+        state = "⬜ выкл"
+    elif enabled:
+        state = f"✅ папка {VIEWS_MONITOR_DEFAULT_FOLDER}"
+    else:
+        state = "⬜ выкл"
+    return f"{state} · {name} · {folder}"
+
+
+def _toggle_views_monitor_channel(ch: dict) -> bool:
+    new_state = not monitor_enabled(ch)
+    ch["views_monitor_enabled"] = new_state
+    _save_channel(ch)
+    return new_state
+
+
+async def screen_admin_views_monitor(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+    uid = _acting_uid(qm)
+    channels = _admin_monitor_channels(uid)
+    monitored = select_monitored_channels(channels)
+    total = len(channels)
+    pages = max(1, (total + VIEWS_MONITOR_PAGE_SIZE - 1) // VIEWS_MONITOR_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    chunk = channels[page * VIEWS_MONITOR_PAGE_SIZE:(page + 1) * VIEWS_MONITOR_PAGE_SIZE]
+
+    rows = [[InlineKeyboardButton("🔄 Проверить сейчас", callback_data="ui:adm_views_check")]]
+    for i, ch in enumerate(chunk):
+        rows.append([InlineKeyboardButton(
+            _views_monitor_button_label(ch),
+            callback_data=f"ui:adm_views_tgl:{page}:{i}",
+        )])
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀️", callback_data=f"ui:adm_views:{page - 1}"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"ui:adm_views:{page + 1}"))
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("◀️ Админ-панель", callback_data="ui:admin")])
+
+    text = (
+        "📊 <b>Мониторинг охватов</b>\n\n"
+        "Автопроверка: <b>каждый час</b>\n"
+        f"Пост считается проблемным: <b>{VIEWS_MONITOR_WATCH_MIN_H}-{VIEWS_MONITOR_WATCH_MAX_H}ч</b> "
+        f"и меньше <b>{VIEWS_MONITOR_VIEWS_MIN}</b> просмотров\n"
+        f"Подписчики: меньше <b>{VIEWS_MONITOR_SUBS_MIN}</b>\n"
+        f"Просматривается последних постов: <b>{VIEWS_MONITOR_POST_LIMIT}</b>\n"
+        f"По умолчанию включена папка: <b>{VIEWS_MONITOR_DEFAULT_FOLDER}</b>\n\n"
+        f"Отслеживается каналов: <b>{len(monitored)}</b> из <b>{total}</b>"
+    )
+    if pages > 1:
+        text += f"\nСтраница: <b>{page + 1}/{pages}</b>"
+    await _answer_or_send(qm, text, InlineKeyboardMarkup(rows))
+
+
+async def action_admin_views_toggle(qm, context: ContextTypes.DEFAULT_TYPE, page: int, index: int):
+    channels = _admin_monitor_channels(_acting_uid(qm))
+    offset = page * VIEWS_MONITOR_PAGE_SIZE + index
+    if 0 <= offset < len(channels):
+        state = _toggle_views_monitor_channel(channels[offset])
+        await qm.answer("Мониторинг включен." if state else "Мониторинг выключен.")
+    else:
+        await qm.answer("Канал не найден.", show_alert=True)
+    await screen_admin_views_monitor(qm, context, page)
+
+
+async def action_admin_views_check(qm, context: ContextTypes.DEFAULT_TYPE):
+    from telegram import CallbackQuery
+
+    if isinstance(qm, CallbackQuery):
+        await qm.answer("Проверяю последние посты...")
+        try:
+            await qm.edit_message_text(
+                "⏳ <b>Проверяю охваты отслеживаемых каналов...</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏳ Проверка...", callback_data="ui:noop")]]),
+            )
+        except Exception:
+            pass
+
+    report = await collect_monitor_report(context.bot, _admin_monitor_channels(_acting_uid(qm)))
+    text = views_monitor_digest_text(report, manual=True)
+    if len(text) > 3900:
+        text = text[:3800].rsplit("\n", 1)[0] + "\n\n…отчёт обрезан, слишком много строк."
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Проверить ещё раз", callback_data="ui:adm_views_check")],
+        [InlineKeyboardButton("⚙️ Настройки мониторинга", callback_data="ui:adm_views")],
+        [InlineKeyboardButton("◀️ Админ-панель", callback_data="ui:admin")],
+    ])
+    await _answer_or_send(qm, text, kb)
 
 
 async def _user_label(context, uid: int) -> str | None:
@@ -4947,6 +5068,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 👑 Админ-действия — только для главного владельца (superadmin)
     if action in ("admin", "adm_inv", "adm_users", "adm_revoke", "adm_pro", "adm_chans", "adm_cost",
+                  "adm_views", "adm_views_check", "adm_views_tgl",
                   "boost", "boost_toggle", "boost_add", "boost_add_mine", "boost_add_ext", "boost_pick",
                   "boost_channels", "boost_events", "boost_ch", "boost_ch_events", "boost_ch_tgl", "boost_ch_qty",
                   "boost_ch_del", "boost_ch_del_ok",
@@ -4966,6 +5088,13 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action == "adm_cost":
             period = parts[2] if len(parts) >= 3 and parts[2] else "today"
             await screen_admin_costs(query, context, period)
+        elif action == "adm_views":
+            page = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 0
+            await screen_admin_views_monitor(query, context, page)
+        elif action == "adm_views_check":
+            await action_admin_views_check(query, context)
+        elif action == "adm_views_tgl" and len(parts) >= 4 and parts[2].isdigit() and parts[3].isdigit():
+            await action_admin_views_toggle(query, context, int(parts[2]), int(parts[3]))
         elif action == "boost":
             await screen_boost_admin(query, context)
         elif action == "boost_toggle":

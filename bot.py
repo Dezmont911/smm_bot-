@@ -68,6 +68,7 @@ from ui import (
     admin_default_rsy_enabled,
 )
 from boost_manager import handle_boost_channel_post_dry_run
+from views_monitor import collect_monitor_report, digest_text as views_digest_text
 import accounts
 from accounts import (
     has_access, is_registered, is_superadmin,
@@ -3901,126 +3902,15 @@ async def send_alert(bot, message: str):
         logger.error(f"Не удалось отправить алерт: {e}")
 
 
-# ── Мониторинг охватов админских каналов ────────────────────────────────────
-# Раз в 36ч смотрим посты, которым исполнилось ~48ч, и подписчиков. Пингуем по
-# правилу ИЛИ: пост с <VIEWS_MIN показов ИЛИ канал с <SUBS_MIN подписчиков.
-# Только МОИ (админские) каналы — тестерские не трогаем.
-VIEWS_MIN = 300
-SUBS_MIN = 1550
-MATURE_MIN_H = 48     # пост уже «дозрел» (было ≥48ч на набор показов)
-MATURE_MAX_H = 96     # но не слишком старый (чтобы не дёргать одно и то же неделями)
-
-
-def _is_tester_channel(ch: dict) -> bool:
-    """Канал тестера: есть owner_id и это не админ (см. ui._is_tester_channel)."""
-    oid = ch.get("owner_id")
-    return oid is not None and not is_admin(oid)
-
-
-def _channel_username(ch: dict) -> str | None:
-    """Текущий @username канала (для t.me-ссылок), без @. None — если только числовой id."""
-    u = (ch.get("username") or "").strip().lstrip("@")
-    if not u:
-        cid = (ch.get("channel_id") or "").strip().lstrip("@")
-        u = cid if cid and not cid.lstrip("-").isdigit() else ""
-    return u or None
-
-
-def _channel_link(ch: dict) -> str | None:
-    """Ссылка на канал: t.me/<username> или t.me/c/<internal> (приватный)."""
-    u = _channel_username(ch)
-    if u:
-        return f"https://t.me/{u}"
-    num = str(ch.get("chat_id_num") or "")
-    if num.startswith("-100"):
-        return f"https://t.me/c/{num[4:]}"
-    return None
-
-
-def _post_link(ch: dict, msg_id: int) -> str | None:
-    """Прямая ссылка на пост: t.me/<username>/<id> или t.me/c/<internal>/<id>."""
-    u = _channel_username(ch)
-    if u:
-        return f"https://t.me/{u}/{msg_id}"
-    num = str(ch.get("chat_id_num") or "")
-    if num.startswith("-100"):
-        return f"https://t.me/c/{num[4:]}/{msg_id}"
-    return None
-
-
 async def monitor_channel_views(bot):
-    """Сводный дайджест по охватам моих каналов (раз в 36ч)."""
-    import userbot_reader
-    from datetime import datetime, timezone
-
-    channels = [c for c in load_all_channels() if not _is_tester_channel(c)]
-    now = datetime.now(timezone.utc)
-    flagged = []  # [(ch, subs, low_posts)]
-
-    for ch in channels:
-        handle = ch.get("channel_id")
-        if not handle:
-            continue
-        target = ch.get("chat_id_num") or handle
-
-        # Подписчики через Bot API (бот — админ канала)
-        subs = None
-        try:
-            subs = await bot.get_chat_member_count(target)
-        except Exception as e:
-            logger.debug(f"views-monitor: нет числа подписчиков {handle}: {e}")
-
-        # Просмотры через юзербот (Bot API их не отдаёт)
-        low_posts = []
-        try:
-            data = await userbot_reader.read_post_views(handle, limit=25)
-            for p in data.get("posts", []):
-                views = p.get("views")
-                ds = p.get("date")
-                if views is None or not ds:
-                    continue
-                try:
-                    pdt = datetime.strptime(ds, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
-                except Exception:
-                    continue
-                age_h = (now - pdt).total_seconds() / 3600
-                if MATURE_MIN_H <= age_h <= MATURE_MAX_H and views < VIEWS_MIN:
-                    low_posts.append({"id": p["id"], "views": views})
-        except Exception as e:
-            logger.debug(f"views-monitor: нет просмотров {handle}: {e}")
-
-        subs_low = subs is not None and subs < SUBS_MIN
-        if subs_low or low_posts:   # правило ИЛИ
-            flagged.append((ch, subs, low_posts))
-
-    if not flagged:
+    """Сводный дайджест по охватам отслеживаемых каналов (раз в час)."""
+    report = await collect_monitor_report(bot, load_all_channels())
+    if not report.get("flagged"):
         logger.info("views-monitor: всё в норме, алерт не нужен")
         return
 
-    await send_alert(bot, _views_digest_text(flagged))
-    logger.info(f"views-monitor: алерт отправлен, каналов в списке {len(flagged)}")
-
-
-def _views_digest_text(flagged: list) -> str:
-    """Собирает HTML-дайджест со ссылками на канал и недобравшие посты.
-    flagged: [(ch, subs|None, [{'id','views'}, ...]), ...]."""
-    import html as _html
-    lines = [f"📊 <b>Мониторинг охватов</b> (посты ~48ч, порог {VIEWS_MIN} показов / {SUBS_MIN} подписчиков)\n"]
-    for ch, subs, low_posts in flagged[:20]:
-        name = _html.escape(ch.get("name") or ch.get("channel_id") or "?")
-        clink = _channel_link(ch)
-        title = f'<a href="{clink}">{name}</a>' if clink else f"<b>{name}</b>"
-        subs_s = f"{subs} подписчиков" if subs is not None else "подписчики ?"
-        mark = " ⚠️ &lt;1550" if (subs is not None and subs < SUBS_MIN) else ""
-        lines.append(f"• {title} — {subs_s}{mark}")
-        for p in low_posts[:5]:
-            plink = _post_link(ch, p["id"])
-            label = f"пост #{p['id']}"
-            link = f'<a href="{plink}">{label}</a>' if plink else label
-            lines.append(f"   📉 {link} — {p['views']} показов")
-    if len(flagged) > 20:
-        lines.append(f"\n…и ещё {len(flagged) - 20} каналов")
-    return "\n".join(lines)
+    await send_alert(bot, views_digest_text(report))
+    logger.info(f"views-monitor: алерт отправлен, каналов в списке {len(report.get('flagged') or [])}")
 
 
 # ============================================================
@@ -4433,14 +4323,14 @@ def main():
             misfire_grace_time=3600,
         )
 
-        # Мониторинг охватов моих каналов — раз в 36ч. Первый запуск через 36ч
-        # после старта (IntervalTrigger), чтобы рестарты не спамили алертами.
+        # Мониторинг охватов отслеживаемых каналов — раз в час. Первый запуск через
+        # час после старта, чтобы рестарты не спамили алертами.
         async def _monitor_views():
             await monitor_channel_views(application.bot)
 
         scheduler.add_job(
             _monitor_views,
-            IntervalTrigger(hours=36),
+            IntervalTrigger(hours=1),
             id="views_monitor",
             name="Мониторинг охватов каналов",
             misfire_grace_time=3600,
@@ -4473,7 +4363,7 @@ def main():
             "  • Чистка awaiting_media: каждый час (:15)\n"
             "  • РСЯ-перекрытия: каждую минуту (персистентно)\n"
             "  • Обновление chat_id/username: раз в день (+ на старте)\n"
-            "  • Мониторинг охватов моих каналов: раз в 36ч"
+            "  • Мониторинг охватов отслеживаемых каналов: раз в час"
         )
 
     async def on_shutdown(application):

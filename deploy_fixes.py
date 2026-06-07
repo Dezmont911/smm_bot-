@@ -44,6 +44,7 @@ FILES = [
     "content_safety.py",  # НОВЫЙ модуль — safe-v1 пайплайн генерации (импортится в content_generator)
     "channel_dna.py",     # НОВЫЙ модуль — ДНК канала (импортится в channel_analyzer/content_safety)
     "boost_manager.py",   # НОВЫЙ модуль — безопасные настройки и dry-run клиент TwiBoost
+    "views_monitor.py",   # НОВЫЙ модуль — мониторинг просмотров/подписчиков каналов
 ]
 
 # (локальный путь относительно LOCAL_BASE, удалённый путь относительно REMOTE_BASE, метка)
