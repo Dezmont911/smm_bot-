@@ -3576,6 +3576,36 @@ async def refresh_channel_identities(bot):
         logger.info(f"Идентичность каналов обновлена: {updated}")
 
 
+def _parse_utc_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _last_published_after_ad(channel_id: str, ad: dict, now: datetime) -> float | None:
+    """Return minutes since last post only when that post happened after the ad."""
+    detected_at = _parse_utc_datetime(ad.get("detected_at"))
+    if detected_at is None:
+        return poster.minutes_since_published(channel_id)
+
+    last_dt = None
+    try:
+        ch = poster._load_channel_by_id(channel_id)
+        last_dt = _parse_utc_datetime(ch.get("last_published_utc") if ch else None)
+    except Exception:
+        last_dt = None
+
+    if last_dt is None or last_dt <= detected_at:
+        return None
+    return (now - last_dt).total_seconds() / 60
+
+
 async def process_due_ads(bot):
     """
     Публикует «дозревшие» РСЯ-перекрытия (вызывается планировщиком раз в минуту).
@@ -3604,7 +3634,7 @@ async def process_due_ads(bot):
 
         # Если после рекламы уже был обычный/ручной пост, не публикуем второе
         # перекрытие рядом. Реклама уже ушла вниз, а дубль будет выглядеть мусором.
-        mins = poster.minutes_since_published(cid)
+        mins = _last_published_after_ad(cid, ad, now)
         if mins is not None and mins < MIN_PUBLISH_GAP_MIN:
             buffer.mark_ad_failed(ad_id, "covered_recent_post")
             logger.info(

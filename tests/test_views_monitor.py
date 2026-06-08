@@ -141,13 +141,22 @@ class ViewsMonitorTests(unittest.IsolatedAsyncioTestCase):
             tmp.cleanup()
 
     async def test_due_rsy_overlay_skips_when_recent_post_exists(self):
+        now = datetime.now(timezone.utc)
         fake_buffer = SimpleNamespace(
-            get_due_ads=lambda now_iso: [{"id": "ad-1", "channel_id": "@wb_bomb", "due_at": now_iso}],
+            get_due_ads=lambda now_iso: [{
+                "id": "ad-1",
+                "channel_id": "@wb_bomb",
+                "detected_at": (now - timedelta(minutes=10)).isoformat(),
+                "due_at": now_iso,
+            }],
             mark_ad_failed=Mock(),
             get_ready_count=Mock(side_effect=AssertionError("should not publish")),
         )
         fake_poster = SimpleNamespace(
-            minutes_since_published=lambda channel_id: 3,
+            _load_channel_by_id=lambda channel_id: {
+                "last_published_utc": (now - timedelta(minutes=3)).isoformat(),
+            },
+            minutes_since_published=Mock(side_effect=AssertionError("should use detected_at guard")),
             post_now=AsyncMock(),
         )
         fake_bot = SimpleNamespace(send_message=AsyncMock())
@@ -159,6 +168,37 @@ class ViewsMonitorTests(unittest.IsolatedAsyncioTestCase):
         fake_buffer.mark_ad_failed.assert_called_once_with("ad-1", "covered_recent_post")
         fake_poster.post_now.assert_not_awaited()
         fake_bot.send_message.assert_not_awaited()
+
+    async def test_due_rsy_overlay_does_not_skip_when_recent_post_was_before_ad(self):
+        now = datetime.now(timezone.utc)
+        fake_buffer = SimpleNamespace(
+            get_due_ads=lambda now_iso: [{
+                "id": "ad-1",
+                "channel_id": "@protivotg",
+                "detected_at": (now - timedelta(minutes=12)).isoformat(),
+                "due_at": now_iso,
+            }],
+            mark_ad_failed=Mock(),
+            get_ready_count=Mock(return_value=1),
+            mark_ad_published=Mock(),
+        )
+        fake_poster = SimpleNamespace(
+            _load_channel_by_id=lambda channel_id: {
+                "last_published_utc": (now - timedelta(minutes=27)).isoformat(),
+            },
+            minutes_since_published=Mock(side_effect=AssertionError("should use detected_at guard")),
+            post_now=AsyncMock(return_value={"success": True, "post": {"id": "post-1", "format": "совет"}}),
+        )
+        fake_bot = SimpleNamespace(send_message=AsyncMock())
+
+        with patch.object(bot_module, "buffer", fake_buffer), \
+                patch.object(bot_module, "poster", fake_poster):
+            await bot_module.process_due_ads(fake_bot)
+
+        fake_buffer.mark_ad_failed.assert_not_called()
+        fake_buffer.mark_ad_published.assert_called_once_with("ad-1", "post-1")
+        fake_poster.post_now.assert_awaited_once_with("@protivotg")
+        fake_bot.send_message.assert_awaited_once()
 
     async def test_rsy_channel_post_matches_by_chat_id_num(self):
         channel = {
