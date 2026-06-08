@@ -1232,8 +1232,6 @@ async def screen_channel_settings(qm, context: ContextTypes.DEFAULT_TYPE, handle
         [InlineKeyboardButton(f"🖼 Картинки: {img_str}",        callback_data=f"ui:ch_images_toggle:{channel_id}")],
         [InlineKeyboardButton(f"📰 Источники тем: {src_mode_short}", callback_data=f"ui:ch_set:{channel_id}:rss")],
         [InlineKeyboardButton(f"🚫 Запрещённые темы: {forb_str}", callback_data=f"ui:ch_set:{channel_id}:forbidden")],
-        [InlineKeyboardButton("🔍 Диагностика канала", callback_data=f"ui:ch_diag:{channel_id}")],
-        [InlineKeyboardButton("🧬 Данные канала", callback_data=f"ui:ch_data:{channel_id}")],
         [InlineKeyboardButton(f"{rsy_icon} Перекрытие рекламы РСЯ", callback_data=f"ui:rsy_toggle:{channel_id}")],
     ]
 
@@ -1243,6 +1241,9 @@ async def screen_channel_settings(qm, context: ContextTypes.DEFAULT_TYPE, handle
         # Стиль (архетип) — только для контент-каналов. Источник тем — единая кнопка
         # «📰 Источники тем» (там же тумблер Авто/Ленты), отдельного дубля больше нет.
         rows.insert(2, [InlineKeyboardButton(f"🎭 Стиль: {arch_label}", callback_data=f"ui:ch_archetype:{channel_id}")])
+
+    if accounts.is_superadmin(_acting_uid(qm)):
+        rows.append([InlineKeyboardButton("🔧 Дополнительно", callback_data=f"ui:ch_debug:{channel_id}")])
 
     rows.append([InlineKeyboardButton("◀️ Назад к каналу", callback_data=f"ui:ch:{channel_id}")])
 
@@ -1254,7 +1255,35 @@ async def screen_channel_settings(qm, context: ContextTypes.DEFAULT_TYPE, handle
 
 
 def _can_view_channel_dna(user_id: int | None, ch: dict) -> bool:
-    return bool(user_id is not None and ch and (accounts.is_superadmin(user_id) or ch.get("owner_id") == user_id))
+    return bool(user_id is not None and ch and accounts.is_superadmin(user_id))
+
+
+def _channel_dna_edit_disabled_text() -> str:
+    return "Редактирование AI-профиля временно отключено. Диагностика доступна только в режиме просмотра."
+
+
+async def screen_channel_debug(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
+    ch = _load_channel(handle)
+    uid = _acting_uid(qm)
+    if not ch:
+        await _answer_or_send(qm, f"❌ Канал {html.escape(handle)} не найден.", None)
+        return
+    if not _can_view_channel_dna(uid, ch):
+        await _answer_or_send(qm, "⛔ Нет доступа к debug-настройкам этого канала.", None)
+        return
+
+    channel_id = ch.get("channel_id", handle)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 Диагностика канала", callback_data=f"ui:ch_diag:{channel_id}")],
+        [InlineKeyboardButton("🧬 AI-профиль / DNA", callback_data=f"ui:ch_data:{channel_id}")],
+        [InlineKeyboardButton("◀️ К настройкам", callback_data=f"ui:ch_settings:{channel_id}")],
+    ])
+    await _answer_or_send(
+        qm,
+        f"🔧 <b>Дополнительно</b>  <code>{html.escape(channel_id)}</code>\n\n"
+        "Debug-пункты доступны только superadmin. Редактирование AI-профиля временно отключено.",
+        kb,
+    )
 
 
 async def screen_channel_diagnostics(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
@@ -1313,7 +1342,7 @@ async def screen_channel_diagnostics(qm, context: ContextTypes.DEFAULT_TYPE, han
     ])
 
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧬 Данные канала", callback_data=f"ui:ch_data:{channel_id}")],
+        [InlineKeyboardButton("🔧 Дополнительно", callback_data=f"ui:ch_debug:{channel_id}")],
         [InlineKeyboardButton("◀️ К настройкам", callback_data=f"ui:ch_settings:{channel_id}")],
     ])
     await _answer_or_send(qm, "\n".join(lines), kb)
@@ -1332,7 +1361,7 @@ async def screen_channel_data(qm, context: ContextTypes.DEFAULT_TYPE, handle: st
     channel_id = ch.get("channel_id", handle)
     if not questionnaire_supported(ch):
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎭 Выбрать стиль канала", callback_data=f"ui:ch_archetype:{channel_id}")],
+            [InlineKeyboardButton("🔧 Дополнительно", callback_data=f"ui:ch_debug:{channel_id}")],
             [InlineKeyboardButton("◀️ К настройкам", callback_data=f"ui:ch_settings:{channel_id}")],
         ])
         await _answer_or_send(
@@ -1357,8 +1386,8 @@ async def screen_channel_data(qm, context: ContextTypes.DEFAULT_TYPE, handle: st
     if warnings:
         text += "\n\n<b>Что стоит уточнить:</b>\n" + "\n".join(f"• {html.escape(str(x))}" for x in warnings[:6])
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Заполнить / исправить факты", callback_data=f"ui:ch_data_edit:{channel_id}")],
         [InlineKeyboardButton("🔍 Диагностика канала", callback_data=f"ui:ch_diag:{channel_id}")],
+        [InlineKeyboardButton("🔧 Дополнительно", callback_data=f"ui:ch_debug:{channel_id}")],
         [InlineKeyboardButton("◀️ К настройкам", callback_data=f"ui:ch_settings:{channel_id}")],
     ])
     await _answer_or_send(qm, text, kb)
@@ -1373,13 +1402,13 @@ async def screen_channel_data_edit(qm, context: ContextTypes.DEFAULT_TYPE, handl
     if not _can_view_channel_dna(uid, ch):
         await _answer_or_send(qm, "⛔ Нет доступа к данным этого канала.", None)
         return
-    if not questionnaire_supported(ch):
-        await screen_channel_data(qm, context, handle)
-        return
-
     channel_id = ch.get("channel_id", handle)
     context.user_data.pop("editing", None)
-    await screen_channel_fact_menu(qm, context, channel_id)
+    await _answer_or_send(
+        qm,
+        f"🧬 <b>AI-профиль / DNA</b>\n\n{html.escape(_channel_dna_edit_disabled_text())}",
+        InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К просмотру", callback_data=f"ui:ch_data:{channel_id}")]]),
+    )
 
 
 _FACT_FIELDS = [
@@ -1427,6 +1456,7 @@ def _fact_current_value(ch: dict, field: str) -> str | None:
 
 
 def _apply_channel_fact(ch: dict, field: str, raw_value: str) -> dict:
+    return {"ok": False, "message": _channel_dna_edit_disabled_text()}
     result = validate_questionnaire_input(field, raw_value, ch)
     if not result["ok"]:
         return result
@@ -1447,6 +1477,14 @@ async def screen_channel_fact_menu(qm, context: ContextTypes.DEFAULT_TYPE, handl
     if not _can_view_channel_dna(uid, ch):
         await _answer_or_send(qm, "⛔ Нет доступа к данным этого канала.", None)
         return
+    channel_id = ch.get("channel_id", handle)
+    context.user_data.pop("editing", None)
+    await _answer_or_send(
+        qm,
+        f"🧬 <b>AI-профиль / DNA</b>\n\n{html.escape(_channel_dna_edit_disabled_text())}",
+        InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К просмотру", callback_data=f"ui:ch_data:{channel_id}")]]),
+    )
+    return
     if not questionnaire_supported(ch):
         await screen_channel_data(qm, context, handle)
         return
@@ -1478,6 +1516,14 @@ async def screen_channel_fact_question(qm, context: ContextTypes.DEFAULT_TYPE, h
     if not _can_view_channel_dna(uid, ch):
         await _answer_or_send(qm, "⛔ Нет доступа к данным этого канала.", None)
         return
+    channel_id = ch.get("channel_id", handle)
+    context.user_data.pop("editing", None)
+    await _answer_or_send(
+        qm,
+        f"🧬 <b>AI-профиль / DNA</b>\n\n{html.escape(_channel_dna_edit_disabled_text())}",
+        InlineKeyboardMarkup([[InlineKeyboardButton("◀️ К просмотру", callback_data=f"ui:ch_data:{channel_id}")]]),
+    )
+    return
     field = _FACT_CODE_TO_FIELD.get(code)
     if not field:
         await screen_channel_fact_menu(qm, context, handle)
@@ -1527,6 +1573,10 @@ async def action_channel_fact_set(qm, context: ContextTypes.DEFAULT_TYPE, handle
     if not _can_view_channel_dna(_acting_uid(qm), ch):
         await _answer_or_send(qm, "⛔ Нет доступа к данным этого канала.", None)
         return
+    context.user_data.pop("editing", None)
+    await qm.answer(_channel_dna_edit_disabled_text(), show_alert=True)
+    await screen_channel_data(qm, context, ch.get("channel_id", handle))
+    return
     field = _FACT_CODE_TO_FIELD.get(code)
     raw = dict(_FACT_ENUM_VALUES.get(code, [])).get(value_code)
     if not field or raw is None:
@@ -4188,6 +4238,11 @@ async def handle_settings_text_input(update: Update, context: ContextTypes.DEFAU
         context.user_data.pop("editing", None)
         return False
 
+    if field.startswith("channel_fact:") or field == "channel_facts":
+        context.user_data.pop("editing", None)
+        await update.message.reply_text(_channel_dna_edit_disabled_text())
+        return True
+
     success_msg = None
 
     if field.startswith("channel_fact:"):
@@ -6191,6 +6246,10 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "ch_settings" and len(parts) >= 3:
         handle = parts[2]
         await screen_channel_settings(query, context, handle)
+
+    elif action == "ch_debug" and len(parts) >= 3:
+        handle = parts[2]
+        await screen_channel_debug(query, context, handle)
 
     elif action == "ch_diag" and len(parts) >= 3:
         handle = parts[2]

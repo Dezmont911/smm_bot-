@@ -350,9 +350,75 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
         post_now_mock.assert_awaited_once_with("@two")
         self.assertIn("Anime", query.edits[-1][0])
 
+    async def test_channel_settings_hides_dna_buttons_for_regular_owner(self):
+        captured = {}
+        channel = {
+            "channel_id": "@kids",
+            "owner_id": 100,
+            "topic": "kids",
+            "archetype": "kids_education",
+        }
+
+        async def fake_answer_or_send(qm, text, kb):
+            captured["kb"] = kb
+
+        with patch.object(ui, "_load_channel", return_value=channel), \
+                patch.object(ui.accounts, "is_superadmin", return_value=False), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
+            await ui.screen_channel_settings(FakeQuery(100), SimpleNamespace(user_data={}), "@kids")
+
+        callbacks = [
+            button.callback_data
+            for row in captured["kb"].inline_keyboard
+            for button in row
+        ]
+        self.assertNotIn("ui:ch_diag:@kids", callbacks)
+        self.assertNotIn("ui:ch_data:@kids", callbacks)
+        self.assertNotIn("ui:ch_debug:@kids", callbacks)
+
+    async def test_channel_settings_shows_debug_only_for_superadmin(self):
+        captured = {}
+        channel = {
+            "channel_id": "@kids",
+            "owner_id": 200,
+            "topic": "kids",
+            "archetype": "kids_education",
+        }
+
+        async def fake_answer_or_send(qm, text, kb):
+            captured["kb"] = kb
+
+        with patch.object(ui, "_load_channel", return_value=channel), \
+                patch.object(ui.accounts, "is_superadmin", return_value=True), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
+            await ui.screen_channel_settings(FakeQuery(100), SimpleNamespace(user_data={}), "@kids")
+
+        callbacks = [
+            button.callback_data
+            for row in captured["kb"].inline_keyboard
+            for button in row
+        ]
+        self.assertIn("ui:ch_debug:@kids", callbacks)
+        self.assertNotIn("ui:ch_diag:@kids", callbacks)
+        self.assertNotIn("ui:ch_data:@kids", callbacks)
+
     async def test_channel_diagnostics_rejects_foreign_owner(self):
         captured = {}
         channel = {"channel_id": "@kids", "owner_id": 200, "archetype": "kids_education"}
+
+        async def fake_answer_or_send(qm, text, kb):
+            captured["text"] = text
+
+        with patch.object(ui, "_load_channel", return_value=channel), \
+                patch.object(ui.accounts, "is_superadmin", return_value=False), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
+            await ui.screen_channel_diagnostics(FakeQuery(100), SimpleNamespace(user_data={}), "@kids")
+
+        self.assertIn("Нет доступа", captured["text"])
+
+    async def test_channel_diagnostics_rejects_owner_when_not_superadmin(self):
+        captured = {}
+        channel = {"channel_id": "@kids", "owner_id": 100, "archetype": "kids_education"}
 
         async def fake_answer_or_send(qm, text, kb):
             captured["text"] = text
@@ -392,8 +458,34 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Диагностика канала", captured["text"])
         self.assertIn("4–6", captured["text"])
+        callbacks = [
+            button.callback_data
+            for row in captured["kb"].inline_keyboard
+            for button in row
+        ]
+        self.assertNotIn("ui:ch_data:@kids", callbacks)
+        self.assertFalse(any(cb.startswith("ui:ch_data_edit:") or cb.startswith("ui:cf") for cb in callbacks))
 
-    async def test_channel_data_screen_shows_guided_fact_entry_not_bulk_template(self):
+    async def test_channel_data_rejects_regular_owner(self):
+        captured = {}
+        channel = {
+            "channel_id": "@kids",
+            "owner_id": 100,
+            "archetype": "kids_education",
+            "channel_dna": {"known_facts": {"contact": "+7 965 671-67-71"}},
+        }
+
+        async def fake_answer_or_send(qm, text, kb):
+            captured["text"] = text
+
+        with patch.object(ui, "_load_channel", return_value=channel), \
+                patch.object(ui.accounts, "is_superadmin", return_value=False), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
+            await ui.screen_channel_data(FakeQuery(100), SimpleNamespace(user_data={}), "@kids")
+
+        self.assertIn("Нет доступа", captured["text"])
+
+    async def test_channel_data_superadmin_is_read_only(self):
         captured = {}
         channel = {
             "channel_id": "@kids",
@@ -407,6 +499,7 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
             captured["kb"] = kb
 
         with patch.object(ui, "_load_channel", return_value=channel), \
+                patch.object(ui.accounts, "is_superadmin", return_value=True), \
                 patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
             await ui.screen_channel_data(FakeQuery(100), SimpleNamespace(user_data={}), "@kids")
 
@@ -415,11 +508,12 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
             for row in captured["kb"].inline_keyboard
             for button in row
         ]
-        self.assertIn("ui:ch_data_edit:@kids", callbacks)
+        self.assertNotIn("ui:ch_data_edit:@kids", callbacks)
+        self.assertFalse(any(cb.startswith("ui:cf") for cb in callbacks))
         self.assertIn("Контакт", captured["text"])
         self.assertNotIn("Шаблон для уточнения", captured["text"])
 
-    async def test_channel_fact_menu_lists_short_questions(self):
+    async def test_channel_fact_menu_is_disabled(self):
         captured = {}
         channel = {
             "channel_id": "@kids",
@@ -433,19 +527,13 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
             captured["kb"] = kb
 
         with patch.object(ui, "_load_channel", return_value=channel), \
+                patch.object(ui.accounts, "is_superadmin", return_value=True), \
                 patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
             await ui.screen_channel_fact_menu(FakeQuery(100), SimpleNamespace(user_data={}), "@kids")
 
-        callbacks = [
-            button.callback_data
-            for row in captured["kb"].inline_keyboard
-            for button in row
-        ]
-        self.assertIn("ui:cfask:@kids:age", callbacks)
-        self.assertIn("ui:cfask:@kids:free", callbacks)
-        self.assertIn("✅ Контакт", captured["text"])
+        self.assertIn("Редактирование AI-профиля временно отключено", captured["text"])
 
-    async def test_channel_fact_button_saves_enum_fact(self):
+    async def test_channel_fact_button_does_not_save(self):
         captured = {}
         saved = {}
         channel = {"channel_id": "@kids", "owner_id": 100, "archetype": "kids_education", "channel_dna": {}}
@@ -458,14 +546,42 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
             saved["channel"] = json.loads(json.dumps(ch, ensure_ascii=False))
 
         with patch.object(ui, "_load_channel", return_value=channel), \
+                patch.object(ui.accounts, "is_superadmin", return_value=True), \
                 patch.object(ui, "_save_channel", side_effect=fake_save), \
                 patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
             query = FakeQuery(100)
             await ui.action_channel_fact_set(query, SimpleNamespace(user_data={}), "@kids", "free", "yes")
 
-        self.assertEqual(saved["channel"]["channel_dna"]["known_facts"]["free_trial"], True)
-        self.assertEqual(query.answers[-1][0], "Сохранено.")
-        self.assertIn("Бесплатное пробное", captured["text"])
+        self.assertEqual(saved, {})
+        self.assertIn("Редактирование AI-профиля временно отключено", query.answers[-1][0])
+        self.assertIn("Данные канала", captured["text"])
+
+    async def test_stale_channel_dna_text_input_does_not_save(self):
+        channel = {"channel_id": "@kids", "owner_id": 100, "archetype": "kids_education", "channel_dna": {}}
+
+        class FakeMessage:
+            text = "4-6: Lego WeDo"
+
+            def __init__(self):
+                self.replies = []
+
+            async def reply_text(self, text, **kwargs):
+                self.replies.append(text)
+
+        for field in ("channel_fact:age", "channel_facts"):
+            context = SimpleNamespace(user_data={"editing": {"handle": "@kids", "field": field}})
+            message = FakeMessage()
+            update = SimpleNamespace(message=message, effective_user=SimpleNamespace(id=100))
+
+            with self.subTest(field=field), \
+                    patch.object(ui, "_load_channel", return_value=json.loads(json.dumps(channel))), \
+                    patch.object(ui, "_save_channel") as save_mock:
+                handled = await ui.handle_settings_text_input(update, context)
+
+            self.assertTrue(handled)
+            self.assertNotIn("editing", context.user_data)
+            save_mock.assert_not_called()
+            self.assertIn("Редактирование AI-профиля временно отключено", message.replies[-1])
 
     async def test_deleted_channels_screen_lists_channels_only(self):
         captured = {}
