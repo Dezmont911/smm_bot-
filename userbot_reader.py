@@ -87,6 +87,29 @@ def _msg_html(msg) -> str:
         return raw
 
 
+def _msg_links(msg) -> list[dict]:
+    """Extract explicit URL entities even if HTML unparse misses them."""
+    text = msg.message or ""
+    links = []
+    seen = set()
+    for ent in getattr(msg, "entities", None) or []:
+        offset = getattr(ent, "offset", None)
+        length = getattr(ent, "length", None)
+        label = ""
+        if isinstance(offset, int) and isinstance(length, int):
+            label = text[offset:offset + length]
+        url = getattr(ent, "url", None) or ""
+        if not url and label.lower().startswith(("http://", "https://")):
+            url = label
+        if not url or not str(url).lower().startswith(("http://", "https://")):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        links.append({"url": url, "label": label})
+    return links
+
+
 def _match_key(msg, donor_user: str):
     """
     Ключ, под которым БОТ увидит это сообщение в forward_from_chat/_message_id.
@@ -228,12 +251,13 @@ async def read_candidates(
 
             # Подпись — из первого сообщения, где есть текст (обычно первый кадр).
             # text — сырой (для перефраза/фильтров), text_html — с ссылками (для «как есть»).
-            text, text_html = "", ""
+            text, text_html, text_links = "", "", []
             for m in msgs:
                 t = (m.message or "").strip()
                 if t:
                     text = t
                     text_html = _msg_html(m)
+                    text_links = _msg_links(m)
                     break
 
             if is_album:
@@ -254,13 +278,14 @@ async def read_candidates(
                     continue  # весь альбом не прошёл лимиты
                 if len(members) == 1:
                     mm = members[0]
-                    posts.append({"id": mm["id"], "text": text, "text_html": text_html,
+                    posts.append({"id": mm["id"], "text": text, "text_html": text_html, "links": text_links,
                                   "media_kind": mm["kind"], "match_user": mm["match_user"], "match_id": mm["match_id"]})
                 else:
                     posts.append({
                         "id": members[0]["id"],     # якорь = первый годный кадр
                         "text": text,
                         "text_html": text_html,
+                        "links": text_links,
                         "media_kind": "album",
                         "members": members,
                         "match_user": members[0]["match_user"],
@@ -276,7 +301,7 @@ async def read_candidates(
                 if not text and not kind:
                     continue
                 mu, mid = _match_key(m, real_username)
-                posts.append({"id": m.id, "text": text, "text_html": text_html,
+                posts.append({"id": m.id, "text": text, "text_html": text_html, "links": text_links,
                               "media_kind": kind, "match_user": mu, "match_id": mid})
 
         posts.reverse()  # от старых к новым

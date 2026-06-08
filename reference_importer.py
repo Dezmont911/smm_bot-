@@ -397,12 +397,33 @@ def _extract_links(text_html: str, source_handle: str | None = None, channel: di
     return out
 
 
-def _extract_reference_links(text_html: str, raw_text: str, source_handle: str | None, channel: dict | None = None) -> list[tuple[str, str]]:
+def _extract_reference_links(
+    text_html: str,
+    raw_text: str,
+    source_handle: str | None,
+    channel: dict | None = None,
+    explicit_links: list | None = None,
+) -> list[tuple[str, str]]:
     out, seen = [], set()
     for url, label in _extract_links(text_html or "", source_handle=source_handle, channel=channel):
         if url not in seen:
             seen.add(url)
             out.append((url, label))
+    for item in explicit_links or []:
+        if isinstance(item, dict):
+            url = _clean_url(str(item.get("url") or ""))
+            label = str(item.get("label") or "")
+        elif isinstance(item, (list, tuple)) and item:
+            url = _clean_url(str(item[0] or ""))
+            label = str(item[1] if len(item) > 1 else "")
+        else:
+            continue
+        if url in seen:
+            continue
+        if not _link_allowed(url, label, source_handle, channel):
+            continue
+        seen.add(url)
+        out.append((url, label or _reference_link_label(url)))
     for url in _URL_RE.findall(raw_text or ""):
         url = _clean_url(url)
         if url in seen:
@@ -523,8 +544,8 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
     source_kind = p.get("media_kind")
     kind = source_kind if take_media else None
     source_has_media = bool(source_kind)
-    allowed_links = _extract_reference_links(html_clean or "", raw_clean or "", handle, channel)
-    restore_links_allowed = include_text or _is_marketplace_channel(channel)
+    allowed_links = _extract_reference_links(html_clean or "", raw_clean or "", handle, channel, p.get("links"))
+    restore_links_allowed = include_text or bool(allowed_links)
     import_content = (html_clean or raw_clean) if include_text else ""
     if _is_marketplace_channel(channel) and allowed_links:
         import_content, _ = _restore_allowed_links(import_content, allowed_links, channel)

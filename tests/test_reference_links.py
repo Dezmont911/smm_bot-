@@ -387,6 +387,51 @@ class ReferenceTextMediaModesTest(unittest.TestCase):
         self.assertEqual(captured["content"], "")
         self.assertEqual(captured["media_type"], "photo")
 
+    def test_include_text_false_preserves_external_reference_link(self):
+        captured, fake_add = self._capture_add()
+        p = {
+            "id": 20,
+            "text": "Caption must be ignored https://www.twitch.tv/directory/category/minecraft",
+            "text_html": '<a href="https://www.twitch.tv/directory/category/minecraft">Twitch</a>',
+            "media_kind": "photo",
+        }
+        patches = self._allow_safety()
+        with patches[0], patches[1], patches[2], mock.patch.object(ri.buffer, "add", side_effect=fake_add):
+            result = asyncio.run(ri._store_reference_post(
+                self.channel, "@plain", "@donor", p, do_rephrase=True,
+                ref_config={"include_text": False, "take_media": True},
+            ))
+        self.assertEqual(result, [20])
+        self.assertIn('href="https://www.twitch.tv/directory/category/minecraft"', captured["content"])
+        self.assertEqual(captured.get("parse_mode"), "HTML")
+
+    def test_explicit_entity_links_are_restored_when_html_is_empty(self):
+        captured, fake_add = self._capture_add()
+        p = {
+            "id": 21,
+            "text": "Minecraft links: ссылка",
+            "text_html": "Minecraft links: ссылка",
+            "links": [
+                {"url": "https://www.minecraft.net/ru-ru/redeem", "label": "ссылка"},
+            ],
+            "media_kind": "photo",
+        }
+
+        async def fake_rephrase(_text, _channel):
+            return "Activate the cape here: ссылка"
+
+        patches = self._allow_safety()
+        with mock.patch("ai_client.rephrase_text", new=fake_rephrase), \
+             patches[0], patches[1], patches[2], \
+             mock.patch.object(ri.buffer, "add", side_effect=fake_add):
+            result = asyncio.run(ri._store_reference_post(
+                self.channel, "@plain", "@donor", p, do_rephrase=True,
+                ref_config={"include_text": True, "take_media": True},
+            ))
+        self.assertEqual(result, [21])
+        self.assertIn('href="https://www.minecraft.net/ru-ru/redeem"', captured["content"])
+        self.assertNotRegex(captured["content"], r"(?m)^ссылка$")
+
     def test_include_text_true_media_false_saves_text_only(self):
         captured, fake_add = self._capture_add()
         p = {"id": 3, "text": "Useful caption with several real words.", "media_kind": "photo"}

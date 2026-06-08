@@ -758,6 +758,28 @@ class ContentSafetyTest(unittest.TestCase):
         )
         self.assertTrue(validation["allowed"])
 
+    def test_marketplace_wb_product_ignores_channel_dna_unknown_facts(self):
+        channel = {
+            **MARKETPLACE_CHANNEL,
+            "channel_dna": {
+                "unknown_facts": ["price", "discount", "free_trial"],
+                "known_facts": {},
+            },
+        }
+        validation = validate_generated_post(
+            channel,
+            {
+                "format": "wb_product",
+                "content": (
+                    'Органайзер для дома со скидкой, цена 499 руб.\n'
+                    '<a href="https://www.wildberries.ru/catalog/123/detail.aspx">WB</a>'
+                ),
+            },
+            {"decision": "allowed", "safe_topic": "товар"},
+            {},
+        )
+        self.assertTrue(validation["allowed"])
+
     def test_marketplace_reference_rejects_product_plus_telegram_invite(self):
         validation = validate_generated_post(
             MARKETPLACE_CHANNEL,

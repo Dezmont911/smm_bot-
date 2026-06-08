@@ -773,7 +773,10 @@ def validate_generated_post(channel: dict, post: dict, safety: dict, brief: dict
         })
         return result
 
-    unsupported_fact = _unsupported_fact_claim(channel, content)
+    if not _requires_marketplace_link(channel, post):
+        unsupported_fact = _unsupported_fact_claim(channel, content)
+    else:
+        unsupported_fact = None
     if unsupported_fact:
         result.update({
             "allowed": False,
