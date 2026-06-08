@@ -105,6 +105,10 @@ _TRAILING_LINK_PHRASE_RE = re.compile(
     r"\s+(?:по|по этой|по товарной)\s+ссылке(?:\s+ниже)?\s*$",
     re.IGNORECASE,
 )
+_LINK_PLACEHOLDER_SUFFIX_RE = re.compile(
+    r"\s*(?:[-–—:]\s*)?(?:ссылка(?:\s+на\s+товар)?|тут|здесь|подробнее)\s*$",
+    re.IGNORECASE,
+)
 _FOOTER_LINE_MARKERS = (
     "подпишись", "подписывайся", "наш канал", "больше тут", "больше здесь",
     "больше новостей", "читать в канале", "по вопросам рекламы", "реклама",
@@ -292,7 +296,16 @@ def cleanup_reference_text_after_rephrase(text: str, source_handle: str | None, 
     text = _MARKDOWN_LINK_RE.sub(r"\1", text)
     text = _LABEL_URL_RE.sub(r"\1", text)
     text = cleanup_reference_text_before_rephrase(text, source_handle, channel)
+    anchors = []
+
+    def keep_anchor(match: re.Match) -> str:
+        anchors.append(match.group(0))
+        return f"__REF_ANCHOR_{len(anchors) - 1}__"
+
+    text = _LINK_RE.sub(keep_anchor, text)
     text = _URL_RE.sub("", text)
+    for i, anchor in enumerate(anchors):
+        text = text.replace(f"__REF_ANCHOR_{i}__", anchor)
     lines = []
     for line in text.splitlines():
         clean = re.sub(r"\s{2,}", " ", line).strip()
@@ -301,10 +314,30 @@ def cleanup_reference_text_after_rephrase(text: str, source_handle: str | None, 
         if _GENERIC_LINK_LABEL_RE.fullmatch(clean):
             continue
         line = _TRAILING_LINK_PHRASE_RE.sub("", line.rstrip())
+        if not re.search(r"https?://|<a\s+|href=", line, re.IGNORECASE):
+            line = _LINK_PLACEHOLDER_SUFFIX_RE.sub("", line).rstrip()
         if line.strip():
             lines.append(line)
     text = "\n".join(lines)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _strip_link_placeholders_from_body(text: str) -> str:
+    if not text:
+        return ""
+    lines = []
+    for line in str(text).splitlines():
+        clean = re.sub(r"\s{2,}", " ", line).strip()
+        if not clean or _GENERIC_LINK_LABEL_RE.fullmatch(clean):
+            continue
+        if not re.search(r"https?://|<a\s+|href=", clean, re.IGNORECASE):
+            without_placeholder = _LINK_PLACEHOLDER_SUFFIX_RE.sub("", clean).strip()
+            if without_placeholder and not _GENERIC_LINK_LABEL_RE.fullmatch(without_placeholder):
+                clean = without_placeholder
+            else:
+                continue
+        lines.append(clean)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
 
 _MEANINGFUL_WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]{2,}")
@@ -400,10 +433,17 @@ def _restore_allowed_links(content: str, links: list[tuple[str, str]], channel: 
     body = _sanitize_reference_html_links(content or "", None, channel)
     body = _MARKDOWN_LINK_RE.sub(r"\1", body)
     body = _LABEL_URL_RE.sub(r"\1", body)
+    allowed_urls = {_clean_url(url) for url, _ in allowed}
+
+    def drop_existing_allowed_anchor(match: re.Match) -> str:
+        url = _clean_url(match.group(1))
+        return "" if url in allowed_urls else match.group(0)
+
+    body = _LINK_RE.sub(drop_existing_allowed_anchor, body)
     for url, _label in allowed:
         body = body.replace(url, "")
     body = _URL_RE.sub("", body)
-    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+    body = _strip_link_placeholders_from_body(body)
     if "<" not in body and ">" not in body:
         body = html_lib.escape(body)
     existing = set(_clean_url(u) for u, _ in _LINK_RE.findall(body))

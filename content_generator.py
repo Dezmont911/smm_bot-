@@ -555,6 +555,9 @@ class ContentGenerator:
         except Exception as e:
             logger.error(f"WB-pipeline [{channel_id}]: ошибка парсера: {e}")
             posts = []
+            parser_error = type(e).__name__
+        else:
+            parser_error = None
 
         if not posts:
             logger.warning(f"WB-pipeline [{channel_id}]: все парсеры вернули 0 товаров")
@@ -564,10 +567,19 @@ class ContentGenerator:
                 "skipped": 0,
                 "buffer_level": buffer.get_level(channel_id),
                 "sources_used": [parser_name],
+                "reason": (
+                    f"WB-парсер упал ({parser_error})"
+                    if parser_error
+                    else "WB-парсер не вернул товары: проверь категории WB, доступ card.wb.ru/прокси и кеш артикулов"
+                ),
             }
 
         generated = 0
         skipped = 0
+        skip_reasons: dict[str, int] = {}
+
+        def count_skip(reason: str):
+            skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
 
         for post_data in posts:
             try:
@@ -576,6 +588,7 @@ class ContentGenerator:
                 if article and self._wb_article_in_buffer(channel_id, article):
                     logger.debug(f"WB дубликат [{channel_id}]: арт. {article}")
                     skipped += 1
+                    count_skip("duplicate")
                     continue
 
                 # Формируем запись для буфера
@@ -601,6 +614,7 @@ class ContentGenerator:
                         f"{safety.get('reason_code')} арт. {article}"
                     )
                     skipped += 1
+                    count_skip(f"safety:{safety.get('reason_code') or 'unknown'}")
                     continue
                 brief = build_content_brief(channel, safety, "wb_product")
                 validation = validate_generated_post(channel, buf_post, safety, brief)
@@ -610,6 +624,7 @@ class ContentGenerator:
                         f"{validation.get('reason_code')} арт. {article}"
                     )
                     skipped += 1
+                    count_skip(f"validation:{validation.get('reason_code') or 'unknown'}")
                     continue
                 buffer.add(buf_post)
                 generated += 1
@@ -618,6 +633,7 @@ class ContentGenerator:
             except Exception as e:
                 logger.error(f"WB-pipeline [{channel_id}]: ошибка добавления поста: {e}")
                 skipped += 1
+                count_skip("exception")
 
         new_level = buffer.get_level(channel_id)
         logger.info(
@@ -625,12 +641,22 @@ class ContentGenerator:
             f"создано={generated}, пропущено={skipped}, буфер={new_level}"
         )
 
+        reason = None
+        if generated == 0:
+            if skip_reasons:
+                parts = ", ".join(f"{key}={value}" for key, value in sorted(skip_reasons.items()))
+                reason = f"WB-товары найдены, но все отсеяны: {parts}"
+            else:
+                reason = "WB-парсер вернул товары, но ни один пост не был добавлен"
+
         return {
             "channel_id": channel_id,
             "generated": generated,
             "skipped": skipped,
             "buffer_level": new_level,
             "sources_used": [parser_name],
+            "skip_reasons": skip_reasons,
+            "reason": reason,
         }
 
     def _wb_article_in_buffer(self, channel_id: str, article: str) -> bool:

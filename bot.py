@@ -3441,6 +3441,26 @@ def is_rsy_ad(message) -> bool:
     return False
 
 
+def _match_channel_for_chat(channels: list[dict], chat) -> dict | None:
+    """Find channel card by stable chat_id first, then by current username/legacy channel_id."""
+    chat_id = getattr(chat, "id", None)
+    username = getattr(chat, "username", None)
+    username_id = f"@{username}" if username else None
+    chat_id_str = str(chat_id) if chat_id is not None else None
+    for channel in channels:
+        channel_id = str(channel.get("channel_id") or "")
+        if chat_id is not None and str(channel.get("chat_id_num") or "") == chat_id_str:
+            return channel
+        if username_id and (
+            channel_id.lower() == username_id.lower()
+            or str(channel.get("username") or "").lower() == username_id.lower()
+        ):
+            return channel
+        if chat_id_str and channel_id == chat_id_str:
+            return channel
+    return None
+
+
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Обработчик новых постов в каналах.
@@ -3472,13 +3492,18 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         logger.exception(f"Boost dry-run handler failed: {e}")
 
-    channel_id = f"@{message.chat.username}" if message.chat.username else str(message.chat.id)
+    incoming_channel_id = f"@{message.chat.username}" if message.chat.username else str(message.chat.id)
 
     # Это наш канал? (бот видит channel_post только по каналам, где он админ)
     channels = load_all_channels()
-    channel = next((c for c in channels if c["channel_id"] == channel_id), None)
+    channel = _match_channel_for_chat(channels, message.chat)
     if not channel:
+        logger.debug(
+            f"channel_post ignored: channel card not found for incoming={incoming_channel_id} "
+            f"chat_id={getattr(message.chat, 'id', None)}"
+        )
         return  # не наш канал — игнор
+    channel_id = channel["channel_id"]
 
     if not is_rsy_ad(message):
         # Обычный (ручной) пост админа — это публикация. Бот свои посты обратно

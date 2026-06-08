@@ -267,6 +267,15 @@ class WBParser:
         )
 
         posts = await self._fetch_posts(article_ids, count)
+        if source == "search" and not posts:
+            cache_ids = self._pick_articles(channel, count)
+            if cache_ids:
+                logger.warning(
+                    f"WB-парсер [{channel.get('channel_id', '?')}]: search дал артикулы, "
+                    "но card API собрал 0 постов — пробую кеш"
+                )
+                source = "cache_after_empty_cards"
+                posts = await self._fetch_posts(cache_ids, count)
         random.shuffle(posts)
         final = posts[:count]
         logger.info(f"WB-парсер: собрано {len(final)} из {count} запрошенных")
@@ -440,6 +449,7 @@ class WBParser:
                 "parse_mode": "HTML",
                 "source": "wb_parser",
                 "wb_article": str(article),
+                "wb_category": product.get("subjectName") or product.get("subject") or "",
             }
 
         except Exception as e:

@@ -160,6 +160,34 @@ class ViewsMonitorTests(unittest.IsolatedAsyncioTestCase):
         fake_poster.post_now.assert_not_awaited()
         fake_bot.send_message.assert_not_awaited()
 
+    async def test_rsy_channel_post_matches_by_chat_id_num(self):
+        channel = {
+            "channel_id": "@old_handle",
+            "username": "@new_handle",
+            "chat_id_num": -1001234567890,
+            "rsy_override": True,
+        }
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-1001234567890, username="new_handle"),
+            message_id=77,
+            text="Реклама erid: test",
+            caption=None,
+            entities=[],
+            caption_entities=[],
+        )
+        update = SimpleNamespace(channel_post=message)
+        fake_buffer = SimpleNamespace(record_pending_ad=Mock(return_value=True))
+
+        with patch.object(bot_module, "handle_boost_channel_post_dry_run", new=AsyncMock(return_value={})), \
+                patch.object(bot_module, "load_all_channels", return_value=[channel]), \
+                patch.object(bot_module, "buffer", fake_buffer):
+            await bot_module.handle_channel_post(update, SimpleNamespace())
+
+        fake_buffer.record_pending_ad.assert_called_once()
+        args = fake_buffer.record_pending_ad.call_args.args
+        self.assertEqual(args[0], "@old_handle")
+        self.assertEqual(args[1], 77)
+
 
 if __name__ == "__main__":
     unittest.main()

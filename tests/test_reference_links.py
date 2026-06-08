@@ -184,6 +184,66 @@ class ReattachLinkInStoreTest(unittest.TestCase):
         self.assertNotIn("@prepodsteam", captured["content"])
         self.assertNotIn("t.me/prepodsteam", captured["content"])
 
+    def test_rephrased_reference_drops_plain_link_placeholders(self):
+        channel = {
+            "channel_id": "@angelResursPack",
+            "name": "Angel",
+            "topic": "Minecraft news",
+            "post_length": "100 words",
+            "channel_type": "content",
+        }
+        p = {
+            "id": 2743,
+            "text": (
+                "Minecraft cape drop\n"
+                "Minecraft on Twitch https://www.twitch.tv/directory/category/minecraft\n"
+                "Key inventory https://www.twitch.tv/drops/inventory\n"
+                "Redeem https://www.minecraft.net/ru-ru/redeem"
+            ),
+            "text_html": (
+                'Minecraft cape drop\n'
+                '<a href="https://www.twitch.tv/directory/category/minecraft">ссылка</a>\n'
+                '<a href="https://www.twitch.tv/drops/inventory">ссылка</a>\n'
+                '<a href="https://www.minecraft.net/ru-ru/redeem">ссылка</a>'
+            ),
+            "media_kind": "photo",
+            "match_user": "minecraftoday",
+            "match_id": 2743,
+        }
+        captured = {}
+
+        async def fake_rephrase(text, ch):
+            return (
+                "Плащ строителя уже начали раздавать за просмотры стримов на Twitch.\n"
+                "🔷 Minecraft на Twitch — ссылка\n"
+                "🔷 Твой ключ будет здесь — ссылка\n"
+                "🔷 Активировать плащ — ссылка\n"
+                "ссылка\n"
+                "ссылка (https://www.twitch.tv/directory/category/minecraft)\n"
+                "ссылка (https://www.twitch.tv/drops/inventory)\n"
+                "ссылка (https://www.minecraft.net/ru-ru/redeem)"
+            )
+
+        def fake_add(record):
+            captured.update(record)
+
+        with mock.patch("ai_client.rephrase_text", new=fake_rephrase), \
+             mock.patch.object(ri, "evaluate_topic_candidate",
+                               return_value={"decision": "ok", "safe_topic": "minecraft", "reason_code": None}), \
+             mock.patch.object(ri, "build_content_brief", return_value={}), \
+             mock.patch.object(ri, "validate_generated_post", return_value={"allowed": True}), \
+             mock.patch.object(ri.buffer, "add", side_effect=fake_add):
+            asyncio.run(ri._store_reference_post(channel, "@angelResursPack", "@minecraftoday", p, do_rephrase=True))
+
+        content = captured["content"]
+        self.assertNotIn("— ссылка", content)
+        self.assertNotRegex(content, r"(?m)^ссылка$")
+        self.assertNotIn("ссылка (https://", content)
+        self.assertEqual(content.count("<a href="), 3)
+        self.assertIn("https://www.twitch.tv/directory/category/minecraft", content)
+        self.assertIn("https://www.twitch.tv/drops/inventory", content)
+        self.assertIn("https://www.minecraft.net/ru-ru/redeem", content)
+
     def test_rephrased_marketplace_keeps_product_but_drops_donor_invite(self):
         channel = {
             "channel_id": "@shop",

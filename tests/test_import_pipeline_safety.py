@@ -5,6 +5,7 @@ import unittest
 import ai_client
 import content_generator
 import reference_importer
+import wb_parser
 
 
 class FakeBuffer:
@@ -208,6 +209,57 @@ class ImportPipelineSafetyTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["generated"], 0)
         self.assertEqual(fake_buffer.posts, [])
+
+    async def test_marketplace_empty_parser_returns_wb_reason(self):
+        fake_buffer = FakeBuffer()
+        original_buffer = content_generator.buffer
+        original_wb = sys.modules.get("wb_parser")
+
+        class FakeParser:
+            async def generate_posts(self, channel, count):
+                return []
+
+        sys.modules["wb_parser"] = types.SimpleNamespace(wb_parser=FakeParser())
+        content_generator.buffer = fake_buffer
+        try:
+            result = await content_generator.ContentGenerator()._run_marketplace(
+                {"channel_id": "@shop", "topic": "товары", "channel_type": "marketplace"},
+                3,
+            )
+        finally:
+            content_generator.buffer = original_buffer
+            if original_wb is None:
+                sys.modules.pop("wb_parser", None)
+            else:
+                sys.modules["wb_parser"] = original_wb
+
+        self.assertEqual(result["generated"], 0)
+        self.assertIn("WB-парсер", result["reason"])
+
+    async def test_wb_parser_falls_back_to_cache_when_search_cards_empty(self):
+        class FakeWBParser(wb_parser.WBParser):
+            def __init__(self):
+                super().__init__()
+                self.fetch_calls = []
+
+            async def _discover_articles(self, channel, count):
+                return [101, 102]
+
+            def _pick_articles(self, channel, count):
+                return [201]
+
+            async def _fetch_posts(self, article_ids, count):
+                self.fetch_calls.append(list(article_ids))
+                if article_ids == [101, 102]:
+                    return []
+                return [{"content": "post", "wb_article": "201"}]
+
+        parser = FakeWBParser()
+        posts = await parser.generate_posts({"channel_id": "@shop"}, 1)
+
+        self.assertEqual(parser.fetch_calls, [[101, 102], [201]])
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0]["wb_article"], "201")
 
 
 if __name__ == "__main__":
