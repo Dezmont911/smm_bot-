@@ -27,3 +27,4 @@ python-dotenv==1.0.1       # Загрузка .env файла
 
 # --- Логирование ---
 loguru==0.7.2              # Удобные логи вместо стандартного logging
+openai>=1.90.0             # OpenAI API - optional GPT provider for text generation/analyze/rephrase

@@ -72,12 +72,27 @@ class Config:
         default_factory=lambda: _optional("PEXELS_API_KEY", "")
     )
 
+    # --- LLM provider ---
+    # LLM_PROVIDER=anthropic keeps the old behavior.
+    # LLM_PROVIDER=openai routes text generation/analyze/rephrase through OpenAI.
+    LLM_PROVIDER: str = field(
+        default_factory=lambda: _optional("LLM_PROVIDER", "anthropic").strip().lower()
+    )
+
     # --- Claude API ---
     ANTHROPIC_API_KEY: str = field(
-        default_factory=lambda: _require("ANTHROPIC_API_KEY")
+        default_factory=lambda: _optional("ANTHROPIC_API_KEY", "")
     )
     CLAUDE_MODEL: str = field(
         default_factory=lambda: _optional("CLAUDE_MODEL", "claude-sonnet-4-5")
+    )
+
+    # --- OpenAI API ---
+    OPENAI_API_KEY: str = field(
+        default_factory=lambda: _optional("OPENAI_API_KEY", "")
+    )
+    OPENAI_MODEL: str = field(
+        default_factory=lambda: _optional("OPENAI_MODEL", "gpt-5-mini")
     )
 
     # --- База данных ---
@@ -185,6 +200,12 @@ class Config:
     )
     CLAUDE_OUTPUT_USD_PER_MTOK: float = field(
         default_factory=lambda: float(_optional("CLAUDE_OUTPUT_USD_PER_MTOK", "5.0"))
+    )
+    OPENAI_INPUT_USD_PER_MTOK: float = field(
+        default_factory=lambda: float(_optional("OPENAI_INPUT_USD_PER_MTOK", "0.25"))
+    )
+    OPENAI_OUTPUT_USD_PER_MTOK: float = field(
+        default_factory=lambda: float(_optional("OPENAI_OUTPUT_USD_PER_MTOK", "2.0"))
     )
     # fal.ai FLUX schnell — цена за одну картинку.
     FAL_IMAGE_USD: float = field(

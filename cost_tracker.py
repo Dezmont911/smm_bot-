@@ -28,6 +28,15 @@ _PRICING = {
     "opus":   (15.0, 75.0),
 }
 
+_OPENAI_PRICING = {
+    "gpt-5-mini": (0.25, 2.0),
+    "gpt-5": (1.25, 10.0),
+    "gpt-5.1": (1.25, 10.0),
+    "gpt-5.2": (1.75, 14.0),
+    "gpt-4.1-mini": (0.40, 1.60),
+    "gpt-4o-mini": (0.15, 0.60),
+}
+
 # Часовой пояс для границы «сегодня» (МСК = UTC+3) — чтобы «сегодня» совпадало
 # с календарным днём Arthur, а не с UTC-полночью.
 _MSK_OFFSET_H = 3
@@ -44,6 +53,14 @@ def _claude_price(model: str) -> tuple[float, float]:
         if key in m:
             return price
     return (cfg.CLAUDE_INPUT_USD_PER_MTOK, cfg.CLAUDE_OUTPUT_USD_PER_MTOK)
+
+
+def _openai_price(model: str) -> tuple[float, float]:
+    m = (model or "").lower()
+    for key, price in _OPENAI_PRICING.items():
+        if key in m:
+            return price
+    return (cfg.OPENAI_INPUT_USD_PER_MTOK, cfg.OPENAI_OUTPUT_USD_PER_MTOK)
 
 
 def _insert(service: str, model: str, purpose: str,
@@ -66,6 +83,13 @@ def record_claude(model: str, input_tokens: int, output_tokens: int, purpose: st
     pin, pout = _claude_price(model)
     cost = (input_tokens or 0) / 1_000_000 * pin + (output_tokens or 0) / 1_000_000 * pout
     _insert("claude", model, purpose, input_tokens, output_tokens, 0, cost)
+
+
+def record_openai(model: str, input_tokens: int, output_tokens: int, purpose: str = "") -> None:
+    """Tracks one OpenAI text response by tokens."""
+    pin, pout = _openai_price(model)
+    cost = (input_tokens or 0) / 1_000_000 * pin + (output_tokens or 0) / 1_000_000 * pout
+    _insert("openai", model, purpose, input_tokens, output_tokens, 0, cost)
 
 
 def record_fal(units: int = 1, model: str = "fal-ai/flux/schnell", purpose: str = "image") -> None:
@@ -102,6 +126,7 @@ def summary(since: str | None = None) -> dict:
     """
     out = {
         "claude": {"cost": 0.0, "calls": 0, "in_tok": 0, "out_tok": 0},
+        "openai": {"cost": 0.0, "calls": 0, "in_tok": 0, "out_tok": 0},
         "fal":    {"cost": 0.0, "calls": 0, "units": 0},
         "total":  0.0,
     }
@@ -125,10 +150,10 @@ def summary(since: str | None = None) -> dict:
                 continue
             out[svc]["cost"] = float(r["cost"] or 0.0)
             out[svc]["calls"] = int(r["calls"] or 0)
-            if svc == "claude":
-                out["claude"]["in_tok"] = int(r["in_tok"] or 0)
-                out["claude"]["out_tok"] = int(r["out_tok"] or 0)
-            else:
+            if svc in ("claude", "openai"):
+                out[svc]["in_tok"] = int(r["in_tok"] or 0)
+                out[svc]["out_tok"] = int(r["out_tok"] or 0)
+            elif svc == "fal":
                 out["fal"]["units"] = int(r["units"] or 0)
             out["total"] += float(r["cost"] or 0.0)
     except Exception as e:

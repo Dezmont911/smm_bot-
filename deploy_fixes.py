@@ -219,6 +219,8 @@ print(run("/opt/smm_bot/venv/bin/python /tmp/migrate.py"))
 # 3. Устанавливаем fal-client если ещё нет
 print("Установка fal-client...")
 print(run("/opt/smm_bot/venv/bin/pip install fal-client --quiet 2>&1 | tail -2"))
+print("Installing openai...")
+print(run("/opt/smm_bot/venv/bin/pip install openai --quiet 2>&1 | tail -2"))
 
 # 4. Перезапуск
 print("Перезапуск сервиса...")
