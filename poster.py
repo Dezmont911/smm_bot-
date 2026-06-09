@@ -19,8 +19,10 @@ poster.py — Планировщик публикаций (Слой 4 из handb
 """
 
 import asyncio
+import html as html_lib
 import random
 from datetime import datetime, timezone, timedelta
+from html.parser import HTMLParser
 from io import BytesIO
 
 import aiohttp
@@ -44,11 +46,142 @@ MIN_PUBLISH_GAP_MIN = 40
 TG_CAPTION_LIMIT = 1024
 
 
-def _clip_caption(caption):
-    """Обрезает подпись медиа до лимита Telegram (с многоточием). None/короткие — как есть."""
+_HTML_INLINE_TAGS = {
+    "a", "b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "code", "pre",
+    "tg-spoiler",
+}
+_HTML_BLOCK_TAGS = {"br", "p", "div", "li"}
+
+
+def _is_html_parse_mode(parse_mode) -> bool:
+    return str(parse_mode or "").lower() == "html"
+
+
+class _HTMLTextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() == "br":
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag.lower() in _HTML_BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+    def text(self) -> str:
+        return "".join(self.parts).strip()
+
+
+class _HTMLCaptionClipper(HTMLParser):
+    def __init__(self, visible_limit: int):
+        super().__init__(convert_charrefs=True)
+        self.remaining = max(0, visible_limit - 3)
+        self.parts: list[str] = []
+        self.stack: list[str] = []
+        self.truncated = False
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if self.remaining <= 0:
+            self.truncated = True
+            return
+        if tag == "br":
+            self.parts.append("\n")
+            self.remaining -= 1
+            return
+        if tag not in _HTML_INLINE_TAGS:
+            return
+        if tag == "a":
+            href = ""
+            for key, value in attrs:
+                if key.lower() == "href":
+                    href = value or ""
+                    break
+            if not href:
+                return
+            self.parts.append(f'<a href="{html_lib.escape(href, quote=True)}">')
+        else:
+            self.parts.append(f"<{tag}>")
+        self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag not in self.stack:
+            return
+        while self.stack:
+            open_tag = self.stack.pop()
+            self.parts.append(f"</{open_tag}>")
+            if open_tag == tag:
+                break
+
+    def handle_data(self, data):
+        if self.remaining <= 0:
+            if data:
+                self.truncated = True
+            return
+        if len(data) <= self.remaining:
+            self.parts.append(html_lib.escape(data))
+            self.remaining -= len(data)
+            return
+        piece = data[:self.remaining].rstrip()
+        if piece:
+            self.parts.append(html_lib.escape(piece))
+        self.remaining = 0
+        self.truncated = True
+
+    def clipped(self) -> str:
+        if self.truncated:
+            self.parts.append("...")
+        while self.stack:
+            self.parts.append(f"</{self.stack.pop()}>")
+        return "".join(self.parts).strip()
+
+
+def _html_visible_text(value: str) -> str:
+    parser = _HTMLTextExtractor()
+    try:
+        parser.feed(value or "")
+        parser.close()
+        return parser.text()
+    except Exception:
+        return html_lib.unescape(str(value or ""))
+
+
+def _clip_plain_caption(caption: str | None) -> str | None:
     if caption and len(caption) > TG_CAPTION_LIMIT:
-        return caption[:TG_CAPTION_LIMIT - 1].rstrip() + "…"
+        return caption[:TG_CAPTION_LIMIT - 3].rstrip() + "..."
     return caption
+
+
+def _clip_html_caption(caption: str | None) -> str | None:
+    if not caption:
+        return caption
+    if len(_html_visible_text(caption)) <= TG_CAPTION_LIMIT:
+        return caption
+    parser = _HTMLCaptionClipper(TG_CAPTION_LIMIT)
+    try:
+        parser.feed(caption)
+        parser.close()
+        return parser.clipped()
+    except Exception:
+        return _clip_plain_caption(_html_visible_text(caption))
+
+
+def _clip_caption(caption, parse_mode=None):
+    if _is_html_parse_mode(parse_mode):
+        return _clip_html_caption(caption)
+    return _clip_plain_caption(caption)
+
+
+def _caption_for_parse_mode(caption, parse_mode, original_parse_mode=None):
+    if parse_mode is None and _is_html_parse_mode(original_parse_mode):
+        return _clip_plain_caption(_html_visible_text(caption))
+    return _clip_caption(caption, parse_mode)
 
 
 class Poster:
@@ -396,8 +529,8 @@ class Poster:
     async def _send_by_file_id(self, channel_id, file_id, media_type, caption, parse_mode):
         """Публикует relay-референс по file_id (медиа уже на серверах Telegram).
         Без скачивания и без лимита 50 МБ. Пробует оба parse_mode."""
-        cap = _clip_caption(caption) or None
         for pm in (parse_mode, None):
+            cap = _caption_for_parse_mode(caption, pm, parse_mode) or None
             try:
                 if media_type == "video":
                     return await self.bot.send_video(chat_id=channel_id, video=file_id, caption=cap, parse_mode=pm)
@@ -422,9 +555,9 @@ class Poster:
             return None
         members = data.get("members", [])
         items = data.get("items", {})
-        cap = _clip_caption(caption) or None
 
         for pm in (parse_mode, None):
+            cap = _caption_for_parse_mode(caption, pm, parse_mode) or None
             media = []
             for i, mid in enumerate(members[:10]):  # лимит Telegram — 10
                 it = items.get(str(mid))
@@ -454,8 +587,8 @@ class Poster:
     async def _send_local_media(self, channel_id, path, media_type, caption, parse_mode):
         """Отправляет локальный медиа-файл (референс «как есть»): фото или видео.
         Пробует оба parse_mode. Подпись может быть пустой."""
-        cap = _clip_caption(caption) or None
         for pm in (parse_mode, None):
+            cap = _caption_for_parse_mode(caption, pm, parse_mode) or None
             try:
                 with open(path, "rb") as fh:
                     photo_or_video = InputFile(fh)
@@ -555,8 +688,8 @@ class Poster:
 
         # ---- Вспомогательные отправщики (пробуют оба parse_mode) ----
         async def _send_with_image():
-            cap = _clip_caption(content)  # подпись медиа ≤1024, иначе Telegram отвергнет
             for pm in (post_parse_mode, None):
+                cap = _caption_for_parse_mode(content, pm, post_parse_mode)  # подпись медиа ≤1024
                 try:
                     if wb_image_bytes:
                         photo = InputFile(BytesIO(wb_image_bytes), filename="product.webp")

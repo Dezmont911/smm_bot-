@@ -530,5 +530,28 @@ class ReferenceTextMediaModesTest(unittest.TestCase):
         self.assertEqual(captured["content"], "")
 
 
+class PosterCaptionClippingTest(unittest.TestCase):
+    def test_html_caption_clip_does_not_break_anchor(self):
+        from poster import TG_CAPTION_LIMIT, _caption_for_parse_mode, _html_visible_text
+
+        body = "A" * (TG_CAPTION_LIMIT + 50)
+        html = body + '\n<a href="https://store.steampowered.com/app/1/">Steam page</a>'
+        clipped = _caption_for_parse_mode(html, "HTML", "HTML")
+
+        self.assertLessEqual(len(_html_visible_text(clipped)), TG_CAPTION_LIMIT)
+        self.assertNotIn('<a href="https://st...', clipped)
+        self.assertNotRegex(clipped, r'<a\\s+href="[^"]*$')
+
+    def test_html_caption_plain_fallback_strips_tags(self):
+        from poster import _caption_for_parse_mode
+
+        html = 'Lead <a href="https://store.steampowered.com/app/1/">Steam page</a>'
+        plain = _caption_for_parse_mode(html, None, "HTML")
+
+        self.assertEqual(plain, "Lead Steam page")
+        self.assertNotIn("<a href", plain)
+        self.assertNotIn("https://store.steampowered.com", plain)
+
+
 if __name__ == "__main__":
     unittest.main()
