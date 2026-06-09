@@ -77,7 +77,7 @@ def _looks_like_marketplace_fallback(text: str) -> bool:
     if generic_ads and product_signals <= generic_ads:
         return False
 
-    return product_signals >= 5
+    return False
 
 
 # ============================================================

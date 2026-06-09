@@ -30,6 +30,17 @@ class ChannelAnalyzerFallbackTests(unittest.TestCase):
 
         self.assertEqual(result["channel_type"], "marketplace")
 
+    def test_product_words_without_marketplace_brand_stay_content(self):
+        posts = [
+            "Как выбрать прикормку для карася: цена не главное, важнее свежесть.",
+            "Разбираем снасти, катушки и наживку без рекламы магазинов.",
+            "Иногда дорогой товар хуже простой рабочей вещи из рыбацкого ящика.",
+        ]
+
+        result = ChannelAnalyzer()._fallback_analysis(posts, "Рыбное место")
+
+        self.assertEqual(result["channel_type"], "content")
+
 
 if __name__ == "__main__":
     unittest.main()
