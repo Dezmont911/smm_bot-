@@ -173,6 +173,7 @@ class Poster:
         if result["success"]:
             buffer.mark_published(post["id"])
             self.record_published(channel_id)
+            await self._boost_published_post(post, result)
             logger.success(
                 f"Опубликован пост в {channel_id} | "
                 f"формат: {post.get('format', '?')} | "
@@ -392,26 +393,25 @@ class Poster:
     # Публикация поста
     # --------------------------------------------------------
 
-    async def _send_by_file_id(self, channel_id, file_id, media_type, caption, parse_mode) -> bool:
+    async def _send_by_file_id(self, channel_id, file_id, media_type, caption, parse_mode):
         """Публикует relay-референс по file_id (медиа уже на серверах Telegram).
         Без скачивания и без лимита 50 МБ. Пробует оба parse_mode."""
         cap = _clip_caption(caption) or None
         for pm in (parse_mode, None):
             try:
                 if media_type == "video":
-                    await self.bot.send_video(chat_id=channel_id, video=file_id, caption=cap, parse_mode=pm)
+                    return await self.bot.send_video(chat_id=channel_id, video=file_id, caption=cap, parse_mode=pm)
                 elif media_type == "animation":
-                    await self.bot.send_animation(chat_id=channel_id, animation=file_id, caption=cap, parse_mode=pm)
+                    return await self.bot.send_animation(chat_id=channel_id, animation=file_id, caption=cap, parse_mode=pm)
                 elif media_type == "document":
-                    await self.bot.send_document(chat_id=channel_id, document=file_id, caption=cap, parse_mode=pm)
+                    return await self.bot.send_document(chat_id=channel_id, document=file_id, caption=cap, parse_mode=pm)
                 else:
-                    await self.bot.send_photo(chat_id=channel_id, photo=file_id, caption=cap, parse_mode=pm)
-                return True
+                    return await self.bot.send_photo(chat_id=channel_id, photo=file_id, caption=cap, parse_mode=pm)
             except Exception as e:
                 logger.warning(f"send by file_id [{media_type}, parse={pm}] в {channel_id}: {e}")
-        return False
+        return None
 
-    async def _send_album(self, channel_id, album_json, caption, parse_mode) -> bool:
+    async def _send_album(self, channel_id, album_json, caption, parse_mode):
         """Публикует альбом (media_group) по списку file_id. Подпись — на первом кадре.
         Telegram разрешает до 10 элементов в группе."""
         import json
@@ -419,7 +419,7 @@ class Poster:
         try:
             data = json.loads(album_json or "{}")
         except Exception:
-            return False
+            return None
         members = data.get("members", [])
         items = data.get("items", {})
         cap = _clip_caption(caption) or None
@@ -436,22 +436,22 @@ class Poster:
                 else:
                     media.append(InputMediaPhoto(it["file_id"], caption=c, parse_mode=pm))
             if not media:
-                return False
+                return None
             # send_media_group требует 2..10 элементов; если остался один — шлём как одиночное
             if len(media) == 1:
                 only = members[:10][0]
                 it = items.get(str(only)) if members else None
                 if it:
                     return await self._send_by_file_id(channel_id, it["file_id"], it.get("type"), caption, parse_mode)
-                return False
+                return None
             try:
-                await self.bot.send_media_group(chat_id=channel_id, media=media)
-                return True
+                messages = await self.bot.send_media_group(chat_id=channel_id, media=media)
+                return messages[0] if messages else None
             except Exception as e:
                 logger.warning(f"send_media_group [parse={pm}] в {channel_id}: {e}")
-        return False
+        return None
 
-    async def _send_local_media(self, channel_id, path, media_type, caption, parse_mode) -> bool:
+    async def _send_local_media(self, channel_id, path, media_type, caption, parse_mode):
         """Отправляет локальный медиа-файл (референс «как есть»): фото или видео.
         Пробует оба parse_mode. Подпись может быть пустой."""
         cap = _clip_caption(caption) or None
@@ -460,17 +460,16 @@ class Poster:
                 with open(path, "rb") as fh:
                     photo_or_video = InputFile(fh)
                     if media_type == "video":
-                        await self.bot.send_video(
+                        return await self.bot.send_video(
                             chat_id=channel_id, video=photo_or_video, caption=cap, parse_mode=pm
                         )
                     else:
-                        await self.bot.send_photo(
+                        return await self.bot.send_photo(
                             chat_id=channel_id, photo=photo_or_video, caption=cap, parse_mode=pm
                         )
-                return True
             except Exception as e:
                 logger.warning(f"send media [{media_type}, parse={pm}] в {channel_id}: {e}")
-        return False
+        return None
 
     async def _publish(self, post: dict) -> dict:
         """
@@ -514,14 +513,16 @@ class Poster:
         # ---- Relay-референс: альбом (media_group) ----
         tg_file_id = post.get("tg_file_id")
         if media_type == "album" and tg_file_id:
-            if await self._send_album(target, tg_file_id, content, post_parse_mode):
-                return {"success": True, "used_image": True}
+            sent_message = await self._send_album(target, tg_file_id, content, post_parse_mode)
+            if sent_message:
+                return {"success": True, "used_image": True, "message": sent_message}
             logger.warning(f"Не отправил альбом [{channel_id}] — пробую как текст")
 
         # ---- Relay-референс: одиночное медиа по file_id (без скачивания, любой размер) ----
         elif tg_file_id:
-            if await self._send_by_file_id(target, tg_file_id, media_type, content, post_parse_mode):
-                return {"success": True, "used_image": True}
+            sent_message = await self._send_by_file_id(target, tg_file_id, media_type, content, post_parse_mode)
+            if sent_message:
+                return {"success": True, "used_image": True, "message": sent_message}
             logger.warning(f"Не отправил по file_id [{channel_id}] — пробую как текст")
 
         # ---- Легаси-референс с локальным медиа-файлом (фото/видео «как есть») ----
@@ -537,7 +538,7 @@ class Poster:
                         os.remove(media_path)  # файл больше не нужен
                     except OSError:
                         pass
-                    return {"success": True, "used_image": True}
+                    return {"success": True, "used_image": True, "message": sent}
                 logger.warning(f"Не удалось отправить медиа-файл [{channel_id}] — публикую как текст")
             else:
                 logger.warning(f"Медиа-файл пропал [{channel_id}]: {media_path}")
@@ -553,7 +554,7 @@ class Poster:
                 image_url = None
 
         # ---- Вспомогательные отправщики (пробуют оба parse_mode) ----
-        async def _send_with_image() -> bool:
+        async def _send_with_image():
             cap = _clip_caption(content)  # подпись медиа ≤1024, иначе Telegram отвергнет
             for pm in (post_parse_mode, None):
                 try:
@@ -561,27 +562,26 @@ class Poster:
                         photo = InputFile(BytesIO(wb_image_bytes), filename="product.webp")
                     else:
                         photo = image_url
-                    await self.bot.send_photo(
+                    return await self.bot.send_photo(
                         chat_id=target, photo=photo, caption=cap, parse_mode=pm
                     )
-                    return True
                 except Exception as e:
                     logger.warning(f"send_photo [parse={pm}] в {channel_id} не удалась: {e}")
-            return False
+            return None
 
-        async def _send_text() -> bool:
+        async def _send_text():
             for pm in (post_parse_mode, None):
                 try:
-                    await self.bot.send_message(chat_id=target, text=content, parse_mode=pm)
-                    return True
+                    return await self.bot.send_message(chat_id=target, text=content, parse_mode=pm)
                 except Exception as e:
                     logger.warning(f"send_message [parse={pm}] в {channel_id} не удалась: {e}")
-            return False
+            return None
 
         # ---- 1) Пробуем с картинкой ----
         if image_url or wb_image_bytes:
-            if await _send_with_image():
-                return {"success": True, "used_image": True}
+            sent_message = await _send_with_image()
+            if sent_message:
+                return {"success": True, "used_image": True, "message": sent_message}
 
             # 2) Telegram отверг картинку. Для не-WB — перегенерируем и пробуем ещё раз.
             if image_url and not wb_image_bytes:
@@ -589,14 +589,16 @@ class Poster:
                 new_url = await self._regenerate_image(post)
                 if new_url:
                     image_url = new_url
-                    if await _send_with_image():
-                        return {"success": True, "used_image": True}
+                    sent_message = await _send_with_image()
+                    if sent_message:
+                        return {"success": True, "used_image": True, "message": sent_message}
 
             logger.warning(f"Публикую БЕЗ картинки (не удалось ни одной): {channel_id}")
 
         # ---- 3) Без картинки ----
-        if await _send_text():
-            return {"success": True, "used_image": False}
+        sent_message = await _send_text()
+        if sent_message:
+            return {"success": True, "used_image": False, "message": sent_message}
 
         # Пост нечем публиковать (медиа-файл пропал, нет file_id/URL/текста) —
         # помечаем skipped, чтобы не долбиться им каждый тик.
@@ -610,6 +612,27 @@ class Poster:
 
         logger.error(f"Все попытки публикации в {channel_id} провалились")
         return {"success": False, "used_image": False}
+
+    async def _boost_published_post(self, post: dict, result: dict):
+        """Send successfully published bot posts into Boost using the real Telegram message id."""
+        message = result.get("message")
+        if not message:
+            return
+        try:
+            from boost_manager import handle_boost_channel_post_dry_run
+
+            boost_result = await handle_boost_channel_post_dry_run(message, defer_media_groups=False)
+            event = boost_result.get("event") or {}
+            logger.info(
+                "Boost published post result | status={} reason={} channel={} message_id={} event_id={}",
+                boost_result.get("status"),
+                boost_result.get("reason"),
+                post.get("channel_id"),
+                getattr(message, "message_id", None),
+                event.get("id"),
+            )
+        except Exception as e:
+            logger.exception(f"Boost published post handler failed [{post.get('channel_id')}]: {e}")
 
     # --------------------------------------------------------
     # Проверка буфера и запуск генерации
@@ -755,6 +778,7 @@ class Poster:
         if result["success"]:
             buffer.mark_published(post["id"])
             self.record_published(channel_id)
+            await self._boost_published_post(post, result)
             return {"success": True, "post": post, "used_image": result["used_image"]}
         else:
             return {"success": False, "error": "Ошибка отправки в Telegram"}

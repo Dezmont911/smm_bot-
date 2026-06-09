@@ -2,9 +2,10 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from database import Database
+import poster as poster_module
 from boost_manager import (
     TwiBoostClientWrapper,
     add_tracked_channel,
@@ -918,6 +919,50 @@ class TwiBoostClientDryRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("action=add", captured["url"])
         self.assertIn("service=123", captured["url"])
         self.assertIn("quantity=500", captured["url"])
+
+
+class PosterBoostIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_post_now_sends_published_bot_post_to_boost(self):
+        sent_message = SimpleNamespace(
+            message_id=5375,
+            chat=SimpleNamespace(id=-1001753440231, username="history_loopa"),
+            text="published text",
+            caption=None,
+            entities=[],
+            caption_entities=[],
+            photo=None,
+            video=None,
+            media_group_id=None,
+        )
+        fake_bot = SimpleNamespace(send_message=AsyncMock(return_value=sent_message))
+        fake_post = {
+            "id": "post-1",
+            "channel_id": "@history_loopa",
+            "content": "published text",
+            "format": "text",
+            "topic": "topic",
+            "parse_mode": "HTML",
+        }
+        fake_buffer = SimpleNamespace(
+            get_next=Mock(return_value=fake_post),
+            mark_published=Mock(),
+        )
+        poster = poster_module.Poster()
+        poster.set_bot(fake_bot)
+        poster.record_published = Mock()
+        poster._load_channel_by_id = Mock(return_value={"chat_id_num": -1001753440231})
+
+        with patch.object(poster_module, "buffer", fake_buffer), \
+                patch("boost_manager.handle_boost_channel_post_dry_run", new=AsyncMock(return_value={"status": "ordered", "event": {"id": 42}})) as boost_handler:
+            result = await poster.post_now("@history_loopa")
+
+        self.assertTrue(result["success"])
+        fake_buffer.mark_published.assert_called_once_with("post-1")
+        poster.record_published.assert_called_once_with("@history_loopa")
+        boost_handler.assert_awaited_once()
+        args, kwargs = boost_handler.await_args
+        self.assertIs(args[0], sent_message)
+        self.assertFalse(kwargs["defer_media_groups"])
 
 
 if __name__ == "__main__":
