@@ -4469,7 +4469,9 @@ def main():
     app.post_shutdown = on_shutdown
 
     logger.success("Бот запущен! Нажми Ctrl+C для остановки.")
-    app.run_polling(drop_pending_updates=True)
+    # Не сбрасываем pending updates на рестарте: channel_post во время деплоя
+    # должен дойти до Boost/РСЯ-обработчиков после старта сервиса.
+    app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
