@@ -28,6 +28,7 @@ from io import BytesIO
 import aiohttp
 from loguru import logger
 from telegram import InputFile
+from telegram.error import TimedOut
 
 from buffer_manager import buffer
 from config import cfg
@@ -44,6 +45,7 @@ MIN_PUBLISH_GAP_MIN = 40
 # Лимит подписи Telegram для медиа (send_photo/video/...). Длиннее — Telegram
 # отвергает весь пост; поэтому подпись медиа обрезаем, чтобы картинка всё же вышла.
 TG_CAPTION_LIMIT = 1024
+_AMBIGUOUS_SEND = object()
 
 
 _HTML_INLINE_TAGS = {
@@ -182,6 +184,10 @@ def _caption_for_parse_mode(caption, parse_mode, original_parse_mode=None):
     if parse_mode is None and _is_html_parse_mode(original_parse_mode):
         return _clip_plain_caption(_html_visible_text(caption))
     return _clip_caption(caption, parse_mode)
+
+
+def _is_ambiguous_send(value) -> bool:
+    return value is _AMBIGUOUS_SEND
 
 
 class Poster:
@@ -698,6 +704,12 @@ class Poster:
                     return await self.bot.send_photo(
                         chat_id=target, photo=photo, caption=cap, parse_mode=pm
                     )
+                except TimedOut:
+                    logger.warning(
+                        f"send_photo [parse={pm}] in {channel_id}: TimedOut; "
+                        "skip retry to avoid duplicate"
+                    )
+                    return _AMBIGUOUS_SEND
                 except Exception as e:
                     logger.warning(f"send_photo [parse={pm}] в {channel_id} не удалась: {e}")
             return None
@@ -713,6 +725,8 @@ class Poster:
         # ---- 1) Пробуем с картинкой ----
         if image_url or wb_image_bytes:
             sent_message = await _send_with_image()
+            if _is_ambiguous_send(sent_message):
+                return {"success": True, "used_image": True, "message": None, "ambiguous_timeout": True}
             if sent_message:
                 return {"success": True, "used_image": True, "message": sent_message}
 
@@ -723,6 +737,8 @@ class Poster:
                 if new_url:
                     image_url = new_url
                     sent_message = await _send_with_image()
+                    if _is_ambiguous_send(sent_message):
+                        return {"success": True, "used_image": True, "message": None, "ambiguous_timeout": True}
                     if sent_message:
                         return {"success": True, "used_image": True, "message": sent_message}
 

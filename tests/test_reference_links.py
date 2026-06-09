@@ -552,6 +552,35 @@ class PosterCaptionClippingTest(unittest.TestCase):
         self.assertNotIn("<a href", plain)
         self.assertNotIn("https://store.steampowered.com", plain)
 
+    def test_send_photo_timeout_is_ambiguous_success_without_retry(self):
+        from telegram.error import TimedOut
+        from poster import Poster
+
+        class TimeoutBot:
+            def __init__(self):
+                self.calls = 0
+
+            async def send_photo(self, **kwargs):
+                self.calls += 1
+                raise TimedOut("Timed out")
+
+        bot = TimeoutBot()
+        p = Poster()
+        p.bot = bot
+        post = {
+            "id": "timeout-post",
+            "channel_id": "@timeout_channel",
+            "content": "Тестовый пост с картинкой",
+            "image_url": "https://example.com/image.jpg",
+            "parse_mode": "Markdown",
+        }
+
+        result = asyncio.run(p._publish(post))
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["ambiguous_timeout"])
+        self.assertEqual(bot.calls, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
