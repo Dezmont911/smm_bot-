@@ -76,6 +76,38 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(query.answers, [("Только для владельца.", True)])
 
+    def test_views_monitor_superadmin_uses_all_admin_channels(self):
+        captured = {}
+
+        def fake_load_channels(include_inactive=False, owner_id=None, scope=None):
+            captured["include_inactive"] = include_inactive
+            captured["owner_id"] = owner_id
+            captured["scope"] = scope
+            return [
+                {"channel_id": "@mine", "owner_id": 100, "active": True, "folder": "Каналы РСЯ"},
+                {"channel_id": "@other_admin", "owner_id": 200, "active": True, "folder": "Каналы РСЯ"},
+                {"channel_id": "@inactive", "owner_id": 200, "active": False, "folder": "Каналы РСЯ"},
+            ]
+
+        with patch.object(ui.accounts, "is_superadmin", side_effect=lambda uid: uid == 100), \
+                patch.object(ui, "_load_channels", side_effect=fake_load_channels):
+            channels = ui._admin_monitor_channels(100)
+
+        self.assertEqual([c["channel_id"] for c in channels], ["@mine", "@other_admin"])
+        self.assertTrue(captured["include_inactive"])
+        self.assertEqual(captured["owner_id"], 100)
+        self.assertEqual(captured["scope"], "mine")
+
+    def test_views_monitor_regular_admin_stays_owner_scoped(self):
+        owned = [{"channel_id": "@mine", "owner_id": 200, "active": True, "folder": "Каналы РСЯ"}]
+
+        with patch.object(ui.accounts, "is_superadmin", return_value=False), \
+                patch.object(ui, "_admin_owned_active_channels", return_value=owned) as owned_channels:
+            channels = ui._admin_monitor_channels(200)
+
+        self.assertEqual(channels, owned)
+        owned_channels.assert_called_once_with(200)
+
     async def test_duplicate_picker_add_opens_existing_boost_channel(self):
         query = FakeQuery(100)
         context = SimpleNamespace(user_data={})

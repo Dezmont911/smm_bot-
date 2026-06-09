@@ -5404,6 +5404,13 @@ VIEWS_MONITOR_PAGE_SIZE = 10
 
 
 def _admin_monitor_channels(uid: int | None) -> list[dict]:
+    if uid is None:
+        return []
+    if accounts.is_superadmin(uid):
+        return [
+            c for c in _load_channels(include_inactive=True, owner_id=uid, scope="mine")
+            if c.get("active", True)
+        ]
     return _admin_owned_active_channels(uid)
 
 
