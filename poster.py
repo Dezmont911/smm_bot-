@@ -617,7 +617,7 @@ class Poster:
         Для WB постов (wbbasket.ru):
           - Скачивает webp через резидентный прокси
           - Отправляет как InputFile(BytesIO) — Telegram принимает байты напрямую
-          - Если прокси недоступен — публикует без картинки
+          - Если картинку не удалось скачать/отправить — WB-пост не публикуется текстом
 
         Для остальных постов — стандартная логика:
           1. parse_mode + картинка (URL)
@@ -630,6 +630,7 @@ class Poster:
         content = post["content"]
         image_url = post.get("image_url")
         post_parse_mode = post.get("parse_mode", "Markdown")
+        is_wb_product = post.get("format") == "wb_product"
 
         # Предохранитель: запретный контент в готовом посте (война/Украина/дрон/ЛГБТ)
         # не публикуем — помечаем skipped (ловит уже сгенерированные до фикса посты).
@@ -690,6 +691,10 @@ class Poster:
                 logger.info(f"WB CDN: картинка скачана ({len(wb_image_bytes)} байт)")
             else:
                 logger.warning(f"WB CDN: не удалось скачать картинку [{channel_id}]")
+                if is_wb_product:
+                    buffer.mark_skipped(post["id"])
+                    logger.warning(f"WB-пост без картинки не публикую [{channel_id}]")
+                    return {"success": False, "used_image": False, "reason": "wb_image_unavailable"}
                 image_url = None
 
         # ---- Вспомогательные отправщики (пробуют оба parse_mode) ----
@@ -742,9 +747,19 @@ class Poster:
                     if sent_message:
                         return {"success": True, "used_image": True, "message": sent_message}
 
+            if is_wb_product:
+                buffer.mark_skipped(post["id"])
+                logger.warning(f"WB-пост без картинки не публикую [{channel_id}]")
+                return {"success": False, "used_image": False, "reason": "wb_image_unavailable"}
+
             logger.warning(f"Публикую БЕЗ картинки (не удалось ни одной): {channel_id}")
 
         # ---- 3) Без картинки ----
+        if is_wb_product:
+            buffer.mark_skipped(post["id"])
+            logger.warning(f"WB-пост без image_url не публикую [{channel_id}]")
+            return {"success": False, "used_image": False, "reason": "wb_image_missing"}
+
         sent_message = await _send_text()
         if sent_message:
             return {"success": True, "used_image": False, "message": sent_message}

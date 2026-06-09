@@ -581,6 +581,72 @@ class PosterCaptionClippingTest(unittest.TestCase):
         self.assertTrue(result["ambiguous_timeout"])
         self.assertEqual(bot.calls, 1)
 
+    def test_wb_product_without_image_is_not_published_as_text(self):
+        import poster
+        from poster import Poster
+
+        class Bot:
+            def __init__(self):
+                self.messages = 0
+
+            async def send_message(self, **kwargs):
+                self.messages += 1
+                return object()
+
+        bot = Bot()
+        p = Poster()
+        p.bot = bot
+        post = {
+            "id": "wb-no-image",
+            "channel_id": "@shop",
+            "content": "WB product text",
+            "format": "wb_product",
+            "parse_mode": "HTML",
+        }
+
+        with mock.patch.object(poster.buffer, "mark_skipped") as mark_skipped:
+            result = asyncio.run(p._publish(post))
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["reason"], "wb_image_missing")
+        self.assertEqual(bot.messages, 0)
+        mark_skipped.assert_called_once_with("wb-no-image")
+
+    def test_wb_product_failed_cdn_image_is_not_published_as_text(self):
+        import poster
+        from poster import Poster
+
+        class Bot:
+            def __init__(self):
+                self.messages = 0
+
+            async def send_message(self, **kwargs):
+                self.messages += 1
+                return object()
+
+        bot = Bot()
+        p = Poster()
+        p.bot = bot
+        post = {
+            "id": "wb-cdn-failed",
+            "channel_id": "@shop",
+            "content": "WB product text",
+            "format": "wb_product",
+            "image_url": "https://basket-10.wbbasket.ru/vol1/part1/1/images/big/1.webp",
+            "parse_mode": "HTML",
+        }
+
+        with (
+            mock.patch.object(p, "_download_wb_image", new=mock.AsyncMock(return_value=None)),
+            mock.patch.object(poster.buffer, "mark_skipped") as mark_skipped,
+        ):
+            result = asyncio.run(p._publish(post))
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["reason"], "wb_image_unavailable")
+        self.assertEqual(bot.messages, 0)
+        mark_skipped.assert_called_once_with("wb-cdn-failed")
+
 
 if __name__ == "__main__":
     unittest.main()

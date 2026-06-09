@@ -15,6 +15,9 @@ wb_parser.py — Парсер товаров Wildberries для marketplace-ка
 import asyncio
 import json
 import random
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from loguru import logger
 
@@ -328,6 +331,19 @@ class WBParser:
         proxy: str | None = None,
     ) -> list[dict]:
         """Запрашивает данные по пачке артикулов через card.wb.ru."""
+        return await asyncio.to_thread(self._fetch_batch_sync, article_ids, proxy)
+
+    def _fetch_batch_sync(
+        self,
+        article_ids: list[int],
+        proxy: str | None = None,
+    ) -> list[dict]:
+        """Синхронный card.wb.ru запрос.
+
+        WB начал резать aiohttp-клиенты на card API 403, даже с браузерными
+        headers. urllib проходит как обычный HTTPS-клиент; вызываем его через
+        asyncio.to_thread(), чтобы не блокировать event loop.
+        """
         nm_param = ";".join(str(a) for a in article_ids)
         params = {
             "appType": "1",
@@ -335,25 +351,31 @@ class WBParser:
             "dest": "-1257786",
             "nm": nm_param,
         }
+        url = f"{self.CARD_API}?{urllib.parse.urlencode(params)}"
+        request = urllib.request.Request(url, headers=self.HEADERS)
+        opener = (
+            urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            )
+            if proxy
+            else urllib.request.build_opener()
+        )
 
         for attempt in range(3):
             try:
-                async with session.get(
-                    self.CARD_API,
-                    params=params,
-                    proxy=proxy,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    if resp.status == 429:
+                with opener.open(request, timeout=15) as resp:
+                    status = getattr(resp, "status", resp.getcode())
+                    if status == 429:
                         wait = 10 * (attempt + 1)
                         logger.warning(f"WB card API 429, жду {wait}с")
-                        await asyncio.sleep(wait)
+                        import time
+                        time.sleep(wait)
                         continue
-                    if resp.status != 200:
-                        logger.warning(f"WB card API → HTTP {resp.status}")
+                    if status != 200:
+                        logger.warning(f"WB card API → HTTP {status}")
                         return []
-
-                    data = await resp.json(content_type=None)
+                    raw = resp.read()
+                    data = json.loads(raw.decode("utf-8", "replace"))
 
                 # v4 API: {"products": [...]}  (v2 было: {"data": {"products": [...]}})
                 products = data.get("products") or data.get("data", {}).get("products", [])
@@ -366,9 +388,19 @@ class WBParser:
                 logger.debug(f"WB card API: батч {len(article_ids)} → {len(posts)} постов")
                 return posts
 
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(f"WB card API: таймаут (попытка {attempt+1}/3)")
-                await asyncio.sleep(3)
+                import time
+                time.sleep(3)
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    wait = 10 * (attempt + 1)
+                    logger.warning(f"WB card API 429, жду {wait}с")
+                    import time
+                    time.sleep(wait)
+                    continue
+                logger.warning(f"WB card API → HTTP {e.code}")
+                return []
             except Exception as e:
                 logger.error(f"WB card API: {e}")
                 return []
