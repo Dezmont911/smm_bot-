@@ -581,6 +581,42 @@ class PosterCaptionClippingTest(unittest.TestCase):
         self.assertTrue(result["ambiguous_timeout"])
         self.assertEqual(bot.calls, 1)
 
+    def test_album_publish_returns_lowest_message_id_for_boost(self):
+        import json
+        from types import SimpleNamespace
+        from poster import Poster
+
+        class AlbumBot:
+            async def send_media_group(self, **kwargs):
+                return [
+                    SimpleNamespace(message_id=7081, media_group_id="album-modlenca", chat=SimpleNamespace(id=-1001, username="modlenca")),
+                    SimpleNamespace(message_id=7080, media_group_id="album-modlenca", chat=SimpleNamespace(id=-1001, username="modlenca")),
+                ]
+
+        p = Poster()
+        p.bot = AlbumBot()
+        post = {
+            "id": "album-post",
+            "channel_id": "@modlenca",
+            "content": "album caption",
+            "media_type": "album",
+            "tg_file_id": json.dumps(
+                {
+                    "members": [1, 2],
+                    "items": {
+                        "1": {"file_id": "photo-1", "type": "photo"},
+                        "2": {"file_id": "photo-2", "type": "photo"},
+                    },
+                }
+            ),
+            "parse_mode": "HTML",
+        }
+
+        result = asyncio.run(p._publish(post))
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["message"].message_id, 7080)
+
     def test_wb_product_without_image_is_not_published_as_text(self):
         import poster
         from poster import Poster

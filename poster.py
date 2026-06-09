@@ -585,7 +585,9 @@ class Poster:
                 return None
             try:
                 messages = await self.bot.send_media_group(chat_id=channel_id, media=media)
-                return messages[0] if messages else None
+                if not messages:
+                    return None
+                return min(messages, key=lambda m: int(getattr(m, "message_id", 0) or 0))
             except Exception as e:
                 logger.warning(f"send_media_group [parse={pm}] в {channel_id}: {e}")
         return None
