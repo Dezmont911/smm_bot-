@@ -26,6 +26,7 @@ channel_analyzer.py — Анализ Telegram-канала по экспорту
 
 import json
 import random
+import re
 from pathlib import Path
 
 from loguru import logger
@@ -34,6 +35,49 @@ from config import cfg
 from claude_helper import claude_text
 from content_safety import build_safe_channel_profile
 from channel_dna import attach_channel_dna
+
+
+_MARKETPLACE_BRAND_RE = re.compile(
+    r"\b(?:wb|ozon|aliexpress|ali|lamoda)\b|"
+    r"wildberries|вайлдберриз|озон|алиэкспресс|яндекс\s*маркет|"
+    r"wildberries\.ru|ozon\.ru|aliexpress\.|market\.yandex\.",
+    re.IGNORECASE,
+)
+_MARKETPLACE_PRODUCT_RE = re.compile(
+    r"артикул|sku|цена|скидк|промокод|распродаж|купить|заказать|"
+    r"в\s+корзин|товар|находк[аи]|руб\.?|рублей|₽|\d+\s*(?:₽|руб\.?|рублей)",
+    re.IGNORECASE,
+)
+_MARKETPLACE_URL_RE = re.compile(
+    r"https?://(?:www\.)?(?:wildberries\.ru|ozon\.ru|aliexpress\.|market\.yandex\.)",
+    re.IGNORECASE,
+)
+_GENERIC_AD_RE = re.compile(
+    r"реклама|сотрудничество|ответственност|рекламодател|прайс|закуп|размещени[ея]",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_marketplace_fallback(text: str) -> bool:
+    """Conservative fallback: classify as marketplace only on product evidence."""
+    if not text:
+        return False
+
+    product_urls = len(_MARKETPLACE_URL_RE.findall(text))
+    brands = len(_MARKETPLACE_BRAND_RE.findall(text))
+    product_signals = len(_MARKETPLACE_PRODUCT_RE.findall(text))
+
+    if product_urls:
+        return True
+    if brands and product_signals >= 1:
+        return True
+
+    # Do not let generic ad footers turn a content channel into WB mode.
+    generic_ads = len(_GENERIC_AD_RE.findall(text))
+    if generic_ads and product_signals <= generic_ads:
+        return False
+
+    return product_signals >= 5
 
 
 # ============================================================
@@ -339,10 +383,7 @@ class ChannelAnalyzer:
         """Базовый анализ без Claude — простая эвристика по ключевым словам."""
         all_text = " ".join(posts).lower()
 
-        # Определяем тип по ключевым словам
-        marketplace_keywords = ["wb", "wildberries", "ozon", "озон", "артикул", "₽", "скидка", "цена", "руб.", "рублей"]
-        marketplace_score = sum(1 for kw in marketplace_keywords if kw in all_text)
-        channel_type = "marketplace" if marketplace_score >= 3 else "content"
+        channel_type = "marketplace" if _looks_like_marketplace_fallback(all_text) else "content"
 
         return {
             "name": channel_name,
