@@ -104,11 +104,14 @@ async def _openai_text(
         raise RuntimeError("OpenAI SDK is not installed; deploy/install requirements first")
 
     selected_model = _openai_model_for(model)
+    output_tokens = max(max_tokens, 64)
     kwargs: dict = {
         "model": selected_model,
         "input": messages,
-        "max_output_tokens": max_tokens,
+        "max_output_tokens": output_tokens,
     }
+    if selected_model.startswith("gpt-5") or selected_model.startswith("o"):
+        kwargs["reasoning"] = {"effort": "minimal"}
     if system is not None:
         kwargs["instructions"] = system
     if temperature is not None:
