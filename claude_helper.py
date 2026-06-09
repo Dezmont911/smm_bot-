@@ -58,6 +58,14 @@ def _anthropic_model_for(requested: str | None) -> str:
     return model
 
 
+def _openai_uses_reasoning_params(model: str) -> bool:
+    return model.startswith("gpt-5") or model.startswith("o")
+
+
+def _openai_supports_temperature(model: str) -> bool:
+    return not _openai_uses_reasoning_params(model)
+
+
 def _extract_text(message) -> str:
     """
     Безопасно достаёт текст из ответа Claude.
@@ -110,11 +118,11 @@ async def _openai_text(
         "input": messages,
         "max_output_tokens": output_tokens,
     }
-    if selected_model.startswith("gpt-5") or selected_model.startswith("o"):
+    if _openai_uses_reasoning_params(selected_model):
         kwargs["reasoning"] = {"effort": "minimal"}
     if system is not None:
         kwargs["instructions"] = system
-    if temperature is not None:
+    if temperature is not None and _openai_supports_temperature(selected_model):
         kwargs["temperature"] = temperature
 
     last_err: Exception | None = None
