@@ -3654,6 +3654,20 @@ async def process_due_ads(bot):
                     await generator.run_for_channel(channel, target_count=1, force=True)
 
             result = await poster.post_now(cid)
+            retryable_reasons = {"wb_image_missing", "wb_image_unavailable"}
+            attempts = 1
+            while (
+                not result.get("success")
+                and result.get("reason") in retryable_reasons
+                and attempts < 3
+                and buffer.get_ready_count(cid) > 0
+            ):
+                logger.warning(
+                    f"РСЯ {cid}: пост {str((result.get('post') or {}).get('id') or '')[:8]} "
+                    f"пропущен ({result.get('reason')}) — пробую следующий"
+                )
+                attempts += 1
+                result = await poster.post_now(cid)
             if result.get("success"):
                 post = result.get("post", {})
                 buffer.mark_ad_published(ad_id, post.get("id"))

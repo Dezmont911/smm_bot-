@@ -947,7 +947,13 @@ class Poster:
             await self._boost_published_post(post, result)
             return {"success": True, "post": post, "used_image": result["used_image"]}
         else:
-            return {"success": False, "error": "Ошибка отправки в Telegram"}
+            reason = result.get("reason") or "telegram_send_failed"
+            return {
+                "success": False,
+                "error": "Ошибка отправки в Telegram",
+                "reason": reason,
+                "post": post,
+            }
 
 
 # ============================================================
