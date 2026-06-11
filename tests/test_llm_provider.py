@@ -117,6 +117,39 @@ class LLMProviderTests(unittest.TestCase):
         self.assertEqual(kwargs["temperature"], 0.7)
         self.assertNotIn("reasoning", kwargs)
 
+    async def _run_openai_web_search_payload(self, model: str):
+        original_key = claude_helper.cfg.OPENAI_API_KEY
+        original_client = claude_helper.openai_client
+        fake_client = _FakeOpenAIClient()
+        try:
+            claude_helper.cfg.OPENAI_API_KEY = "test-key"
+            claude_helper.openai_client = fake_client
+            await claude_helper.openai_web_search_text(
+                messages=[{"role": "user", "content": "Найди свежие темы"}],
+                max_tokens=64,
+                system=None,
+                model=model,
+                temperature=0.3,
+                retries=0,
+                purpose="test",
+                allowed_domains=["example.com"],
+            )
+            return fake_client.responses.kwargs
+        finally:
+            claude_helper.cfg.OPENAI_API_KEY = original_key
+            claude_helper.openai_client = original_client
+
+    def test_openai_web_search_payload_forces_tool(self):
+        kwargs = __import__("asyncio").run(
+            self._run_openai_web_search_payload("gpt-5-mini")
+        )
+        self.assertEqual(kwargs["model"], "gpt-5-mini")
+        self.assertEqual(kwargs["tool_choice"], "required")
+        self.assertEqual(kwargs["tools"][0]["type"], "web_search")
+        self.assertEqual(kwargs["tools"][0]["search_context_size"], "low")
+        self.assertEqual(kwargs["tools"][0]["filters"]["allowed_domains"], ["example.com"])
+        self.assertNotIn("reasoning", kwargs)
+
     def test_anthropic_credit_error_falls_back_to_openai(self):
         original_provider = claude_helper.cfg.LLM_PROVIDER
         original_openai_key = claude_helper.cfg.OPENAI_API_KEY
@@ -148,29 +181,39 @@ class LLMProviderTests(unittest.TestCase):
         original_openai_key = claude_helper.cfg.OPENAI_API_KEY
         original_openai_client = claude_helper.openai_client
         original_topic_client = topic_search.aclient
-        original_fallback = topic_search.openai_fallback_text
+        original_fallback = topic_search.openai_web_search_text
 
-        async def fake_openai_fallback(**kwargs):
-            return '["вечнозелёная тема 1", "вечнозелёная тема 2"]'
+        captured = {}
+
+        async def fake_openai_web_search(**kwargs):
+            captured.update(kwargs)
+            return '["свежая тема 1", "свежая тема 2"]'
 
         try:
             claude_helper.cfg.OPENAI_API_KEY = "test-key"
             claude_helper.openai_client = _FakeOpenAIClient()
             topic_search.aclient = _FakeAnthropicClient()
-            topic_search.openai_fallback_text = fake_openai_fallback
+            topic_search.openai_web_search_text = fake_openai_web_search
             topics = __import__("asyncio").run(
                 topic_search.discover_topics(
-                    {"channel_id": "@test", "name": "Test", "topic": "тестовая тема"},
+                    {
+                        "channel_id": "@test",
+                        "name": "Test",
+                        "topic": "тестовая тема",
+                        "search_domains": ["example.com"],
+                    },
                     count=2,
                     used_topics=[],
                 )
             )
-            self.assertEqual(topics, ["вечнозелёная тема 1", "вечнозелёная тема 2"])
+            self.assertEqual(topics, ["свежая тема 1", "свежая тема 2"])
+            self.assertEqual(captured["allowed_domains"], ["example.com"])
+            self.assertEqual(captured["purpose"], "topic_search_openai_web_search_fallback")
         finally:
             claude_helper.cfg.OPENAI_API_KEY = original_openai_key
             claude_helper.openai_client = original_openai_client
             topic_search.aclient = original_topic_client
-            topic_search.openai_fallback_text = original_fallback
+            topic_search.openai_web_search_text = original_fallback
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ from claude_helper import (
     aclient,
     _is_anthropic_billing_error,
     _openai_available,
-    openai_fallback_text,
+    openai_web_search_text,
 )
 from config import cfg
 from database import db
@@ -94,33 +94,6 @@ def _build_prompt(channel: dict, count: int, used_topics: list[str]) -> str:
 Пример: ["Valve выпустила обновление X для CS2", "Команда Y выиграла мажор Z"]"""
 
 
-def _build_openai_fallback_prompt(channel: dict, count: int, used_topics: list[str]) -> str:
-    name = channel.get("name", "")
-    topic = channel.get("topic", "")
-    audience = channel.get("audience", "")
-
-    dedup = ""
-    if used_topics:
-        items = "\n".join(f"- {t[:100]}" for t in used_topics[:20])
-        dedup = f"\n\nНе повторяй эти темы и близкие к ним:\n{items}"
-
-    audience_line = f"Аудитория: {audience}\n" if audience else ""
-    return f"""Ты — редактор Telegram-канала «{name}».
-Тема канала: {topic}
-{audience_line}
-Anthropic web_search сейчас недоступен из-за лимита/баланса, поэтому это fallback без live web-search.
-Сформулируй {count} безопасных тем для постов, которые подходят каналу.
-
-Правила:
-- не утверждай свежие факты, даты, релизы или новости, если не можешь их проверить;
-- делай темы evergreen, обзорными, практическими или объясняющими;
-- темы должны быть разные между собой;
-- не используй запрещённые/сомнительные углы;
-- не повторяй уже использованные темы.{dedup}
-
-Верни ТОЛЬКО JSON-массив строк, без пояснений и markdown."""
-
-
 async def _search_once(prompt: str, model: str, max_uses: int,
                        allowed_domains: list[str] | None) -> str:
     """
@@ -154,30 +127,39 @@ async def _search_once(prompt: str, model: str, max_uses: int,
     return ""
 
 
-async def _search_openai_fallback(channel: dict, count: int, used_topics: list[str]) -> list[str]:
+async def _search_openai_fallback(
+    channel: dict,
+    count: int,
+    used_topics: list[str],
+    allowed_domains: list[str] | None = None,
+) -> list[str]:
     if not _openai_available():
         return []
     channel_id = channel.get("channel_id", "?")
-    prompt = _build_openai_fallback_prompt(channel, count, used_topics)
+    prompt = _build_prompt(channel, count, used_topics)
     try:
-        text = await openai_fallback_text(
+        text = await openai_web_search_text(
             messages=[{"role": "user", "content": prompt}],
             max_tokens=900,
-            system="Ты помогаешь редактору Telegram-канала. Верни только JSON-массив строк.",
+            system=(
+                "Ты помогаешь редактору Telegram-канала искать свежие темы. "
+                "Обязательно используй веб-поиск. Верни только JSON-массив строк."
+            ),
             temperature=0.5,
             retries=1,
-            purpose="topic_search_openai_fallback",
+            purpose="topic_search_openai_web_search_fallback",
+            allowed_domains=allowed_domains,
         )
         topics = _parse_topics(text)
         if topics:
             logger.info(
                 f"web_search [{channel_id}]: Anthropic недоступен, "
-                f"OpenAI fallback дал {len(topics)} тем"
+                f"OpenAI web_search fallback дал {len(topics)} тем"
             )
             return topics[:count]
     except Exception as e:
         logger.warning(
-            f"web_search [{channel_id}]: OpenAI fallback не помог: "
+            f"web_search [{channel_id}]: OpenAI web_search fallback не помог: "
             f"{type(e).__name__}: {e}"
         )
     return []
@@ -217,7 +199,9 @@ async def discover_topics(
             )
         except anthropic.APIError as e:
             if _is_anthropic_billing_error(e):
-                topics = await _search_openai_fallback(channel, count, used_topics)
+                topics = await _search_openai_fallback(
+                    channel, count, used_topics, allowed_domains
+                )
                 if topics:
                     return topics
             logger.warning(

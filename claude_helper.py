@@ -199,6 +199,73 @@ async def openai_fallback_text(
     )
 
 
+async def openai_web_search_text(
+    *,
+    messages: list[dict],
+    max_tokens: int = 1024,
+    system: str | None = None,
+    model: str | None = None,
+    temperature: float | None = None,
+    retries: int = 1,
+    purpose: str = "",
+    allowed_domains: list[str] | None = None,
+    search_context_size: str = "low",
+) -> str:
+    if not cfg.OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+    if openai_client is None:
+        raise RuntimeError("OpenAI SDK is not installed; deploy/install requirements first")
+
+    selected_model = _openai_model_for(model)
+    tool: dict = {
+        "type": "web_search",
+        "search_context_size": search_context_size,
+    }
+    if allowed_domains:
+        tool["filters"] = {"allowed_domains": allowed_domains}
+
+    kwargs: dict = {
+        "model": selected_model,
+        "input": messages,
+        "max_output_tokens": max(max_tokens, 64),
+        "tools": [tool],
+        "tool_choice": "required",
+    }
+    if system is not None:
+        kwargs["instructions"] = system
+    if temperature is not None and _openai_supports_temperature(selected_model):
+        kwargs["temperature"] = temperature
+
+    last_err: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            response = await openai_client.responses.create(**kwargs)
+            try:
+                from cost_tracker import record_openai
+                u = getattr(response, "usage", None)
+                record_openai(
+                    selected_model,
+                    getattr(u, "input_tokens", 0) or 0,
+                    getattr(u, "output_tokens", 0) or 0,
+                    purpose=purpose,
+                )
+            except Exception:
+                pass
+            return _extract_openai_text(response)
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                wait = 2 ** attempt
+                logger.warning(
+                    f"OpenAI web_search ошибка (попытка {attempt + 1}/{retries + 1}): "
+                    f"{type(e).__name__}: {e}. Повтор через {wait}с"
+                )
+                await asyncio.sleep(wait)
+
+    logger.error(f"OpenAI web_search: все попытки исчерпаны: {last_err}")
+    raise last_err
+
+
 async def claude_text(
     *,
     messages: list[dict],
