@@ -109,6 +109,23 @@ _LINK_PLACEHOLDER_SUFFIX_RE = re.compile(
     r"\s*(?:[-–—:]\s*)?(?:ссылка(?:\s+на\s+товар)?|тут|здесь|подробнее)\s*$",
     re.IGNORECASE,
 )
+_TRAILING_MARKETPLACE_CTA_RE = re.compile(
+    r"\s*[🛒🔗👉➡️•\-–—:]*\s*"
+    r"(?:купить|заказать|смотреть|посмотреть|найти|перейти|забрать|открыть)\s+"
+    r"(?:на|в)\s+"
+    r"(?:ali\s*express|aliexpress|алиэкспресс|wildberries|вайлдберриз|wb|ozon|озон|"
+    r"яндекс(?:\s+маркет)?|yandex(?:\s+market)?)\s*$",
+    re.IGNORECASE,
+)
+_MARKETPLACE_CTA_NAMES = (
+    "aliexpress", "ali express", "алиэкспресс",
+    "wildberries", "вайлдберриз", "wb",
+    "ozon", "озон",
+    "яндекс маркет", "yandex market",
+)
+_MARKETPLACE_CTA_VERBS = (
+    "купить", "заказать", "смотреть", "посмотреть", "найти", "перейти", "забрать", "открыть",
+)
 _FOOTER_LINE_MARKERS = (
     "подпишись", "подписывайся", "наш канал", "больше тут", "больше здесь",
     "больше новостей", "читать в канале", "по вопросам рекламы", "реклама",
@@ -340,6 +357,39 @@ def _strip_link_placeholders_from_body(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
 
+def _looks_like_standalone_marketplace_cta(line: str) -> bool:
+    """True for bare CTA lines like "🛒 Купить на AliExpress" without a real URL."""
+    if not line or re.search(r"https?://|<a\s+|href=", line, re.IGNORECASE):
+        return False
+    clean = html_lib.unescape(re.sub(r"<[^>]+>", " ", line)).lower()
+    clean = clean.replace("ё", "е")
+    clean = re.sub(r"[^a-zа-я0-9]+", " ", clean, flags=re.IGNORECASE).strip()
+    if not clean:
+        return False
+    has_marketplace = any(name.replace("ё", "е") in clean for name in _MARKETPLACE_CTA_NAMES)
+    has_cta = any(re.search(rf"\b{re.escape(verb)}\b", clean, re.IGNORECASE) for verb in _MARKETPLACE_CTA_VERBS)
+    if not has_marketplace or not has_cta:
+        return False
+    return len(clean.split()) <= 8
+
+
+def _strip_marketplace_cta_placeholders_from_body(text: str) -> str:
+    if not text:
+        return ""
+    lines = []
+    for line in str(text).splitlines():
+        clean = re.sub(r"\s{2,}", " ", line).strip()
+        if not clean:
+            continue
+        if _looks_like_standalone_marketplace_cta(clean):
+            continue
+        if not re.search(r"https?://|<a\s+|href=", clean, re.IGNORECASE):
+            clean = _TRAILING_MARKETPLACE_CTA_RE.sub("", clean).rstrip()
+        if clean:
+            lines.append(clean)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
 _MEANINGFUL_WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]{2,}")
 _MEANINGFUL_LETTER_RE = re.compile(r"[A-Za-zА-Яа-яЁё]")
 
@@ -465,6 +515,7 @@ def _restore_allowed_links(content: str, links: list[tuple[str, str]], channel: 
         body = body.replace(url, "")
     body = _URL_RE.sub("", body)
     body = _strip_link_placeholders_from_body(body)
+    body = _strip_marketplace_cta_placeholders_from_body(body)
     if "<" not in body and ">" not in body:
         body = html_lib.escape(body)
     existing = set(_clean_url(u) for u, _ in _LINK_RE.findall(body))

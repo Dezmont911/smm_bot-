@@ -8,6 +8,7 @@
 """
 
 import os
+import html
 # Фиктивные секреты до импортов: config._require() падает без них, а локально
 # (вне VPS) реального ключа нет/он пустой. Ставим, только если пусто — настоящий
 # непустой ключ не трогаем (рефраз в тесте замокан, реальный вызов не идёт).
@@ -145,6 +146,83 @@ class ReattachLinkInStoreTest(unittest.TestCase):
         self.assertIn("content", captured, "пост не сохранён в буфер")
         self.assertIn('<a href="https://ali.click/', captured["content"],
                       "партнёрская ссылка потеряна при рефразе — переклейка сломана")
+        self.assertEqual(captured.get("parse_mode"), "HTML")
+
+    def test_rephrased_marketplace_drops_duplicate_cta_and_raw_url(self):
+        channel = {"channel_id": "@myjicki", "name": "Myjicki", "topic": "товары",
+                   "post_length": "100 слов", "channel_type": "marketplace"}
+        url = "https://ali.click/iql3e1b?erid=2SDnje9xsyU&sub=1"
+        p = {
+            "id": 3569,
+            "text": "Тренажёр для кисти и мышц предплечья",
+            "text_html": f'Тренажёр для кисти и мышц предплечья\n<a href="{url}">ссылка</a>',
+            "media_kind": "video",
+            "match_user": "nahodki_for_man",
+            "match_id": 3569,
+        }
+        captured = {}
+
+        async def fake_rephrase(text, ch):
+            return (
+                "Тренажёр для кисти и мышц предплечья\n"
+                "🛒 Купить на AliExpress\n\n"
+                f"[Смотреть на Aliexpress]({url}) ({url})"
+            )
+
+        def fake_add(record):
+            captured.update(record)
+
+        with mock.patch("ai_client.rephrase_text", new=fake_rephrase), \
+             mock.patch.object(ri, "evaluate_topic_candidate",
+                               return_value={"decision": "ok", "safe_topic": "товар", "reason_code": None}), \
+             mock.patch.object(ri, "build_content_brief", return_value={}), \
+             mock.patch.object(ri, "validate_generated_post", return_value={"allowed": True}), \
+             mock.patch.object(ri.buffer, "add", side_effect=fake_add):
+            asyncio.run(ri._store_reference_post(channel, "@myjicki", "@nahodki_for_man", p, do_rephrase=True))
+
+        content = captured["content"]
+        escaped_url = html.escape(url, quote=True)
+        self.assertIn("Тренажёр для кисти", content)
+        self.assertNotIn("Купить на AliExpress", content)
+        self.assertNotIn("[Смотреть на Aliexpress]", content)
+        self.assertNotIn(f"({url})", content)
+        self.assertEqual(content.count(escaped_url), 1)
+        self.assertEqual(content.count("<a href="), 1)
+        self.assertIn(">Смотреть на Aliexpress</a>", content)
+        self.assertEqual(captured.get("parse_mode"), "HTML")
+
+    def test_rephrased_marketplace_keeps_contextual_platform_sentence(self):
+        channel = {"channel_id": "@test_mp", "name": "Тест", "topic": "товары с маркетплейсов",
+                   "post_length": "100 слов", "channel_type": "marketplace"}
+        url = "https://ali.click/context"
+        p = {
+            "id": 2,
+            "text": "Полезная вещь для дома",
+            "text_html": f'Полезная вещь для дома\n<a href="{url}">ссылка</a>',
+            "media_kind": None,
+            "match_user": "donor",
+            "match_id": 2,
+        }
+        captured = {}
+
+        async def fake_rephrase(text, ch):
+            return "Поймать его можно на Aliexpress, если нужен компактный вариант для дома."
+
+        def fake_add(record):
+            captured.update(record)
+
+        with mock.patch("ai_client.rephrase_text", new=fake_rephrase), \
+             mock.patch.object(ri, "evaluate_topic_candidate",
+                               return_value={"decision": "ok", "safe_topic": "товар", "reason_code": None}), \
+             mock.patch.object(ri, "build_content_brief", return_value={}), \
+             mock.patch.object(ri, "validate_generated_post", return_value={"allowed": True}), \
+             mock.patch.object(ri.buffer, "add", side_effect=fake_add):
+            asyncio.run(ri._store_reference_post(channel, "@test_mp", "@donor", p, do_rephrase=True))
+
+        content = captured["content"]
+        self.assertIn("Поймать его можно на Aliexpress", content)
+        self.assertEqual(content.count(url), 1)
+        self.assertEqual(content.count("<a href="), 1)
         self.assertEqual(captured.get("parse_mode"), "HTML")
 
     def test_rephrased_reference_strips_source_channel_footer(self):
