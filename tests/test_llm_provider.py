@@ -1,6 +1,10 @@
 import unittest
 
+import anthropic
+import httpx
+
 import claude_helper
+import topic_search
 
 
 class _FakeUsage:
@@ -25,6 +29,22 @@ class _FakeResponses:
 class _FakeOpenAIClient:
     def __init__(self):
         self.responses = _FakeResponses()
+
+
+class _FakeAnthropicMessages:
+    async def create(self, **kwargs):
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        response = httpx.Response(400, request=request)
+        raise anthropic.BadRequestError(
+            "Your credit balance is too low to access the Anthropic API.",
+            response=response,
+            body={"error": {"message": "Your credit balance is too low"}},
+        )
+
+
+class _FakeAnthropicClient:
+    def __init__(self):
+        self.messages = _FakeAnthropicMessages()
 
 
 class LLMProviderTests(unittest.TestCase):
@@ -96,6 +116,61 @@ class LLMProviderTests(unittest.TestCase):
         self.assertEqual(kwargs["model"], "gpt-4.1-mini")
         self.assertEqual(kwargs["temperature"], 0.7)
         self.assertNotIn("reasoning", kwargs)
+
+    def test_anthropic_credit_error_falls_back_to_openai(self):
+        original_provider = claude_helper.cfg.LLM_PROVIDER
+        original_openai_key = claude_helper.cfg.OPENAI_API_KEY
+        original_openai_client = claude_helper.openai_client
+        original_anthropic_client = claude_helper.aclient
+        fake_openai = _FakeOpenAIClient()
+        try:
+            claude_helper.cfg.LLM_PROVIDER = "anthropic"
+            claude_helper.cfg.OPENAI_API_KEY = "test-key"
+            claude_helper.openai_client = fake_openai
+            claude_helper.aclient = _FakeAnthropicClient()
+            result = __import__("asyncio").run(
+                claude_helper.claude_text(
+                    messages=[{"role": "user", "content": "Ответь OK"}],
+                    max_tokens=8,
+                    retries=0,
+                    purpose="test",
+                )
+            )
+            self.assertEqual(result, "OK")
+            self.assertEqual(fake_openai.responses.kwargs["model"], claude_helper.cfg.OPENAI_MODEL)
+        finally:
+            claude_helper.cfg.LLM_PROVIDER = original_provider
+            claude_helper.cfg.OPENAI_API_KEY = original_openai_key
+            claude_helper.openai_client = original_openai_client
+            claude_helper.aclient = original_anthropic_client
+
+    def test_topic_search_anthropic_credit_error_uses_openai_fallback(self):
+        original_openai_key = claude_helper.cfg.OPENAI_API_KEY
+        original_openai_client = claude_helper.openai_client
+        original_topic_client = topic_search.aclient
+        original_fallback = topic_search.openai_fallback_text
+
+        async def fake_openai_fallback(**kwargs):
+            return '["вечнозелёная тема 1", "вечнозелёная тема 2"]'
+
+        try:
+            claude_helper.cfg.OPENAI_API_KEY = "test-key"
+            claude_helper.openai_client = _FakeOpenAIClient()
+            topic_search.aclient = _FakeAnthropicClient()
+            topic_search.openai_fallback_text = fake_openai_fallback
+            topics = __import__("asyncio").run(
+                topic_search.discover_topics(
+                    {"channel_id": "@test", "name": "Test", "topic": "тестовая тема"},
+                    count=2,
+                    used_topics=[],
+                )
+            )
+            self.assertEqual(topics, ["вечнозелёная тема 1", "вечнозелёная тема 2"])
+        finally:
+            claude_helper.cfg.OPENAI_API_KEY = original_openai_key
+            claude_helper.openai_client = original_openai_client
+            topic_search.aclient = original_topic_client
+            topic_search.openai_fallback_text = original_fallback
 
 
 if __name__ == "__main__":

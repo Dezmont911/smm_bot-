@@ -66,6 +66,28 @@ def _openai_supports_temperature(model: str) -> bool:
     return not _openai_uses_reasoning_params(model)
 
 
+def _openai_available() -> bool:
+    return bool(cfg.OPENAI_API_KEY and openai_client is not None)
+
+
+def _is_anthropic_billing_error(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    body = getattr(exc, "body", None)
+    if body:
+        text += " " + str(body).lower()
+    markers = (
+        "credit balance is too low",
+        "purchase credits",
+        "billing",
+        "insufficient credit",
+        "insufficient credits",
+        "quota exceeded",
+        "out of credits",
+        "balance is too low",
+    )
+    return any(marker in text for marker in markers)
+
+
 def _extract_text(message) -> str:
     """
     Безопасно достаёт текст из ответа Claude.
@@ -155,6 +177,28 @@ async def _openai_text(
     raise last_err
 
 
+async def openai_fallback_text(
+    *,
+    messages: list[dict],
+    max_tokens: int = 1024,
+    system: str | None = None,
+    model: str | None = None,
+    temperature: float | None = None,
+    retries: int = 1,
+    purpose: str = "",
+) -> str:
+    """Explicit OpenAI call for places where Anthropic-only tools failed."""
+    return await _openai_text(
+        messages=messages,
+        max_tokens=max_tokens,
+        system=system,
+        model=model,
+        temperature=temperature,
+        retries=retries,
+        purpose=purpose,
+    )
+
+
 async def claude_text(
     *,
     messages: list[dict],
@@ -188,6 +232,17 @@ async def claude_text(
         )
 
     if aclient is None:
+        if _openai_available():
+            logger.warning("ANTHROPIC_API_KEY не настроен — использую OpenAI fallback")
+            return await _openai_text(
+                messages=messages,
+                max_tokens=max_tokens,
+                system=system,
+                model=model,
+                temperature=temperature,
+                retries=retries,
+                purpose=purpose or "anthropic_missing_fallback",
+            )
         raise RuntimeError("ANTHROPIC_API_KEY is not configured")
 
     model = _anthropic_model_for(model)
@@ -217,6 +272,20 @@ async def claude_text(
             return _extract_text(message)
         except (anthropic.APIConnectionError, anthropic.APIStatusError) as e:
             last_err = e
+            if _is_anthropic_billing_error(e) and _openai_available():
+                logger.warning(
+                    f"Claude недоступен из-за billing/credits ({type(e).__name__}) — "
+                    f"использую OpenAI fallback"
+                )
+                return await _openai_text(
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    system=system,
+                    model=model,
+                    temperature=temperature,
+                    retries=retries,
+                    purpose=purpose or "anthropic_billing_fallback",
+                )
             if attempt < retries:
                 wait = 2 ** attempt
                 logger.warning(
