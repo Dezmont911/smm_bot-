@@ -46,6 +46,7 @@ MIN_PUBLISH_GAP_MIN = 40
 # отвергает весь пост; поэтому подпись медиа обрезаем, чтобы картинка всё же вышла.
 TG_CAPTION_LIMIT = 1024
 _AMBIGUOUS_SEND = object()
+_WB_MAX_PROXIES_PER_URL = 3
 
 
 _HTML_INLINE_TAGS = {
@@ -53,6 +54,34 @@ _HTML_INLINE_TAGS = {
     "tg-spoiler",
 }
 _HTML_BLOCK_TAGS = {"br", "p", "div", "li"}
+
+
+def _wb_proxy_routes(proxy_list: list[str]) -> list[str | None]:
+    """Proxy routes for one WB image URL attempt. Never expose proxy values in logs."""
+    proxies = [p for p in proxy_list if p]
+    random.shuffle(proxies)
+    if proxies:
+        proxies = proxies[:_WB_MAX_PROXIES_PER_URL]
+        return proxies + [None]
+    return [None]
+
+
+def _wb_route_label(proxy: str | None) -> str:
+    return "proxy" if proxy else "direct"
+
+
+def _safe_wb_exception(exc: Exception) -> str:
+    """Compact exception summary without URLs, because proxy URLs may contain credentials."""
+    status = getattr(exc, "status", None)
+    message = getattr(exc, "message", None)
+    if status is not None or message:
+        parts = []
+        if status is not None:
+            parts.append(f"status={status}")
+        if message:
+            parts.append(f"message={message!r}")
+        return f"{type(exc).__name__}: {' '.join(parts)}"
+    return type(exc).__name__
 
 
 def _is_html_parse_mode(parse_mode) -> bool:
@@ -354,8 +383,6 @@ class Poster:
         if not proxy_list and cfg.WB_PROXY_URL:
             proxy_list = [cfg.WB_PROXY_URL]
 
-        proxy = random.choice(proxy_list) if proxy_list else None
-
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -383,42 +410,44 @@ class Poster:
         connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(connector=connector) as session:
             for try_url in urls_to_try:
-                try:
-                    async with session.get(
-                        try_url,
-                        proxy=proxy,
-                        headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=12),
-                    ) as resp:
-                        if resp.status == 200:
-                            data = await resp.read()
-                            if len(data) > 1000:
-                                basket_used = re.search(r"basket-(\d+)", try_url).group(1)
-                                orig_basket = re.search(r"basket-(\d+)", url).group(1)
-                                if basket_used != orig_basket:
-                                    logger.info(
-                                        f"WB CDN: basket скорректирован "
-                                        f"{orig_basket}→{basket_used} | {len(data)} байт"
-                                    )
-                                else:
-                                    logger.debug(
-                                        f"WB CDN OK: {len(data)} байт | basket-{basket_used}"
-                                    )
-                                return data
-                            # Файл есть но слишком маленький — возможно заглушка
-                            logger.warning(
-                                f"WB CDN: подозрительно мал ({len(data)} байт) | {try_url[:70]}"
-                            )
-                        elif resp.status == 404:
-                            logger.debug(f"WB CDN 404: {try_url[:80]}")
-                        else:
-                            logger.warning(f"WB CDN HTTP {resp.status}: {try_url[:70]}")
-                except asyncio.TimeoutError:
-                    logger.warning(f"WB CDN: таймаут | {try_url[:70]}")
-                except Exception as e:
-                    logger.warning(f"WB CDN ошибка: {type(e).__name__}: {e}")
+                for proxy in _wb_proxy_routes(proxy_list):
+                    route = _wb_route_label(proxy)
+                    try:
+                        async with session.get(
+                            try_url,
+                            proxy=proxy,
+                            headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=12),
+                        ) as resp:
+                            if resp.status == 200:
+                                data = await resp.read()
+                                if len(data) > 1000:
+                                    basket_used = re.search(r"basket-(\d+)", try_url).group(1)
+                                    orig_basket = re.search(r"basket-(\d+)", url).group(1)
+                                    if basket_used != orig_basket:
+                                        logger.info(
+                                            f"WB CDN: basket скорректирован "
+                                            f"{orig_basket}→{basket_used} | {len(data)} байт | {route}"
+                                        )
+                                    else:
+                                        logger.debug(
+                                            f"WB CDN OK: {len(data)} байт | basket-{basket_used} | {route}"
+                                        )
+                                    return data
+                                # Файл есть но слишком маленький — возможно заглушка
+                                logger.warning(
+                                    f"WB CDN: подозрительно мал ({len(data)} байт) | {route} | {try_url[:70]}"
+                                )
+                            elif resp.status == 404:
+                                logger.debug(f"WB CDN 404: {route} | {try_url[:80]}")
+                            else:
+                                logger.warning(f"WB CDN HTTP {resp.status}: {route} | {try_url[:70]}")
+                    except asyncio.TimeoutError:
+                        logger.warning(f"WB CDN: таймаут | {route} | {try_url[:70]}")
+                    except Exception as e:
+                        logger.warning(f"WB CDN ошибка: {route} | {_safe_wb_exception(e)}")
 
-        logger.warning(f"WB CDN: не удалось скачать (все {len(urls_to_try)} попыток) | {url[:70]}")
+        logger.warning(f"WB CDN: не удалось скачать (все URL/маршруты: {len(urls_to_try)}) | {url[:70]}")
         return None
 
     # --------------------------------------------------------

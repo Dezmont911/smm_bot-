@@ -762,5 +762,37 @@ class PosterCaptionClippingTest(unittest.TestCase):
         mark_skipped.assert_called_once_with("wb-cdn-failed")
 
 
+class WbImageDownloadRoutingTest(unittest.TestCase):
+    def test_proxy_routes_rotate_cap_proxies_and_add_direct_fallback(self):
+        import poster
+
+        def reverse_in_place(items):
+            items.reverse()
+
+        with mock.patch.object(poster.random, "shuffle", side_effect=reverse_in_place):
+            routes = poster._wb_proxy_routes(["proxy-1", "proxy-2", "proxy-3", "proxy-4"])
+
+        self.assertEqual(routes, ["proxy-4", "proxy-3", "proxy-2", None])
+
+    def test_safe_wb_exception_does_not_leak_proxy_credentials(self):
+        import poster
+
+        class ProxyError(Exception):
+            status = 502
+            message = "Bad Gateway"
+
+            def __str__(self):
+                return "http://user:secret@example.proxy:9000"
+
+        text = poster._safe_wb_exception(ProxyError())
+
+        self.assertIn("ProxyError", text)
+        self.assertIn("status=502", text)
+        self.assertIn("Bad Gateway", text)
+        self.assertNotIn("secret", text)
+        self.assertNotIn("example.proxy", text)
+        self.assertNotIn("http://", text)
+
+
 if __name__ == "__main__":
     unittest.main()
