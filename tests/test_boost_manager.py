@@ -842,7 +842,21 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
 
             async def create_views_order(self, post_url, quantity, service_id, dry_run=True):
                 self.calls.append(
-                    {"post_url": post_url, "quantity": quantity, "service_id": service_id, "dry_run": dry_run}
+                    {"kind": "views", "post_url": post_url, "quantity": quantity, "service_id": service_id, "dry_run": dry_run}
+                )
+                return {"order": f"order-{service_id}"}
+
+            async def create_auto_reactions_order(self, post_url, min_quantity, max_quantity, service_id, posts=1, dry_run=True):
+                self.calls.append(
+                    {
+                        "kind": "reactions",
+                        "post_url": post_url,
+                        "min": min_quantity,
+                        "max": max_quantity,
+                        "posts": posts,
+                        "service_id": service_id,
+                        "dry_run": dry_run,
+                    }
                 )
                 return {"order": f"order-{service_id}"}
 
@@ -870,14 +884,17 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "ordered")
         self.assertEqual(len(client.calls), 2)
+        self.assertEqual(client.calls[0]["kind"], "views")
         self.assertEqual(client.calls[0]["post_url"], "https://t.me/boosted/77")
         self.assertGreaterEqual(client.calls[0]["quantity"], 500)
         self.assertLessEqual(client.calls[0]["quantity"], 550)
         self.assertEqual(client.calls[0]["service_id"], 4702)
         self.assertFalse(client.calls[0]["dry_run"])
+        self.assertEqual(client.calls[1]["kind"], "reactions")
         self.assertEqual(client.calls[1]["post_url"], "https://t.me/boosted/77")
-        self.assertGreaterEqual(client.calls[1]["quantity"], 3)
-        self.assertLessEqual(client.calls[1]["quantity"], 5)
+        self.assertEqual(client.calls[1]["min"], 3)
+        self.assertEqual(client.calls[1]["max"], 5)
+        self.assertEqual(client.calls[1]["posts"], 1)
         self.assertEqual(client.calls[1]["service_id"], 3303)
         self.assertFalse(client.calls[1]["dry_run"])
         self.assertEqual({event["order_kind"] for event in events}, {"views", "reactions"})
@@ -1029,6 +1046,31 @@ class TwiBoostClientDryRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["would_create_order"])
         self.assertEqual(result["request"]["action"], "add")
         self.assertEqual(result["request"]["service"], 123)
+
+    async def test_auto_reactions_dry_run_uses_posts_min_max_payload(self):
+        class ExplodingClient(TwiBoostClientWrapper):
+            def _request_sync(self, params):
+                raise AssertionError("dry-run must not call HTTP")
+
+        client = ExplodingClient(api_key="secret", api_url="https://example.test/api", service_id=3303)
+
+        result = await client.create_auto_reactions_order(
+            "https://t.me/example/1",
+            min_quantity=1,
+            max_quantity=3,
+            service_id=3303,
+            posts=1,
+            dry_run=True,
+        )
+
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(result["request"]["action"], "add")
+        self.assertEqual(result["request"]["service"], 3303)
+        self.assertEqual(result["request"]["link"], "https://t.me/example/1")
+        self.assertEqual(result["request"]["posts"], 1)
+        self.assertEqual(result["request"]["min"], 1)
+        self.assertEqual(result["request"]["max"], 3)
+        self.assertNotIn("quantity", result["request"])
 
     async def test_real_order_without_config_returns_error(self):
         client = TwiBoostClientWrapper(api_key="", api_url="", service_id=0)
