@@ -14,11 +14,14 @@ from typing import Any
 
 
 BASE_DIR = Path(__file__).resolve().parent
-ENV_PATH = BASE_DIR / ".env"
+ENV_PATHS = [
+    BASE_DIR / ".env",
+    BASE_DIR / ".env.boost_tester",
+]
 DB_PATH = BASE_DIR / "data" / "content_factory.db"
 
 
-def _read_env(path: Path) -> dict[str, str]:
+def _read_env_file(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not path.exists():
         return values
@@ -28,6 +31,13 @@ def _read_env(path: Path) -> dict[str, str]:
             continue
         key, value = line.split("=", 1)
         values[key.strip()] = value.strip().strip("'\"")
+    return values
+
+
+def _read_env(paths: list[Path]) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for path in paths:
+        values.update(_read_env_file(path))
     return values
 
 
@@ -189,7 +199,7 @@ def _print_conflicts(conn: sqlite3.Connection, channel: dict[str, Any]) -> None:
 
 
 def main() -> int:
-    env_values = _read_env(ENV_PATH)
+    env_values = _read_env(ENV_PATHS)
     tester_ids = _tester_ids(env_values)
     dry_run = _env_bool(env_values, "BOOST_DRY_RUN", True)
     real_orders_enabled = _env_bool(env_values, "BOOST_REAL_ORDERS_ENABLED", False)
@@ -198,7 +208,9 @@ def main() -> int:
     default_reactions_service = _env_int(env_values, "TWIBOOST_TESTER_REACTIONS_SERVICE_ID")
 
     print("Boost runtime check")
-    print(f"env file: {ENV_PATH}")
+    print("env files:")
+    for path in ENV_PATHS:
+        print(f"  {path} exists={path.exists()}")
     print(f"db file: {DB_PATH}")
     print("read-only: yes")
     print(f"BOOST_TESTER_IDS: {tester_ids or 'not configured'}")

@@ -11,10 +11,12 @@ config.py — Конфигурация проекта
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from dotenv import load_dotenv
 
 # Загружаем .env файл (ищет его в текущей папке или выше)
 load_dotenv()
+load_dotenv(Path(__file__).with_name(".env.boost_tester"), override=True)
 
 
 def _require(key: str) -> str:

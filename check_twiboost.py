@@ -16,11 +16,14 @@ from pathlib import Path
 from typing import Any
 
 
-ENV_PATH = Path(__file__).with_name(".env")
+ENV_PATHS = [
+    Path(__file__).with_name(".env"),
+    Path(__file__).with_name(".env.boost_tester"),
+]
 TIMEOUT_SECONDS = 25
 
 
-def _read_env(path: Path) -> dict[str, str]:
+def _read_env_file(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not path.exists():
         return values
@@ -34,6 +37,13 @@ def _read_env(path: Path) -> dict[str, str]:
         value = value.strip().strip("'\"")
         if key:
             values[key] = value
+    return values
+
+
+def _read_env(paths: list[Path]) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for path in paths:
+        values.update(_read_env_file(path))
     return values
 
 
@@ -151,9 +161,11 @@ def _check_profile(
 
 
 def main() -> int:
-    env_values = _read_env(ENV_PATH)
+    env_values = _read_env(ENV_PATHS)
     print("TwiBoost safe check")
-    print(f"env file: {ENV_PATH}")
+    print("env files:")
+    for path in ENV_PATHS:
+        print(f"  {path} exists={path.exists()}")
     print("actions used: balance, services")
     print("orders created: no")
 

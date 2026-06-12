@@ -4,6 +4,9 @@
 
 # --- Секреты (НИКОГДА не коммитить!) ---
 .env
+.env.*
+!.env.example
+!.env.*.example
 *.pem
 *.key
 *.session
