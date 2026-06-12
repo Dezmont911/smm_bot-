@@ -18,6 +18,7 @@ LOCAL_BASE = r"C:\Projects\smm_bot\smm_bot"
 REMOTE_BASE = "/opt/smm_bot"
 
 FILES = [
+    "check_twiboost.py",
     "bot.py",
     "ai_client.py",       # ВАЖНО: тут async-клиент, детектор мета-ответов, санитизация, стиль
     "config.py",
