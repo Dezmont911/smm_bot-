@@ -35,6 +35,8 @@ BOOST_EVENT_TYPE_POST = "post"
 BOOST_EVENT_TYPE_TEXT = "text"
 BOOST_EVENT_TYPE_PHOTO = "photo"
 BOOST_EVENT_TYPE_VIDEO = "video"
+BOOST_ORDER_KIND_VIEWS = "views"
+BOOST_ORDER_KIND_REACTIONS = "reactions"
 BOOST_REASON_NO_PUBLIC_POST_URL = "no_public_post_url"
 BOOST_REASON_PUBLIC_USERNAME = "public_username"
 BOOST_REASON_GLOBAL_DISABLED = "boost_global_disabled"
@@ -57,6 +59,14 @@ REQUIRED_ENV_VARS = (
     "BOOST_REAL_ORDERS_ENABLED",
 )
 
+TESTER_REQUIRED_ENV_VARS = (
+    "BOOST_TESTER_IDS",
+    "TWIBOOST_TESTER_API_KEY",
+    "TWIBOOST_TESTER_API_URL",
+    "TWIBOOST_TESTER_VIEWS_SERVICE_ID",
+    "TWIBOOST_TESTER_REACTIONS_SERVICE_ID",
+)
+
 
 @contextmanager
 def _connect(database=db):
@@ -73,6 +83,10 @@ def utc_now() -> str:
 
 def required_env_vars() -> list[str]:
     return list(REQUIRED_ENV_VARS)
+
+
+def tester_required_env_vars() -> list[str]:
+    return list(TESTER_REQUIRED_ENV_VARS)
 
 
 _ALBUM_PENDING_LOCK = threading.Lock()
@@ -109,6 +123,12 @@ def ensure_boost_schema(database=db):
                 quantity_max INTEGER,
                 quantity_display TEXT,
                 service_id TEXT,
+                reactions_enabled INTEGER NOT NULL DEFAULT 0,
+                reactions_quantity INTEGER,
+                reactions_quantity_min INTEGER,
+                reactions_quantity_max INTEGER,
+                reactions_quantity_display TEXT,
+                reactions_service_id TEXT,
                 note TEXT,
                 last_seen_message_id INTEGER,
                 last_order_id TEXT,
@@ -126,6 +146,7 @@ def ensure_boost_schema(database=db):
                 media_group_id TEXT,
                 canonical_message_id INTEGER,
                 event_type TEXT NOT NULL DEFAULT 'post',
+                order_kind TEXT NOT NULL DEFAULT 'views',
                 post_url TEXT,
                 quantity INTEGER NOT NULL,
                 service_id TEXT,
@@ -156,6 +177,7 @@ def _ensure_boost_order_columns(conn):
         "media_group_id": "TEXT",
         "canonical_message_id": "INTEGER",
         "event_type": "TEXT NOT NULL DEFAULT 'post'",
+        "order_kind": "TEXT NOT NULL DEFAULT 'views'",
         "reason_code": "TEXT",
     }
     for name, definition in required.items():
@@ -167,18 +189,22 @@ def _ensure_boost_order_columns(conn):
         SET
             canonical_message_id = COALESCE(canonical_message_id, message_id),
             event_type = COALESCE(NULLIF(event_type, ''), 'post'),
+            order_kind = COALESCE(NULLIF(order_kind, ''), 'views'),
             event_key = COALESCE(NULLIF(event_key, ''), 'msg:' || message_id)
         WHERE canonical_message_id IS NULL
            OR event_type IS NULL
            OR event_type = ''
+           OR order_kind IS NULL
+           OR order_kind = ''
            OR event_key IS NULL
            OR event_key = ''
         """
     )
+    conn.execute("DROP INDEX IF EXISTS idx_boost_orders_unique_event")
     conn.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_boost_orders_unique_event
-            ON boost_orders(boost_channel_id, event_key, COALESCE(service_id, ''))
+            ON boost_orders(boost_channel_id, event_key, order_kind, COALESCE(service_id, ''))
         """
     )
     channel_columns = {row["name"] for row in conn.execute("PRAGMA table_info(boost_channels)").fetchall()}
@@ -188,6 +214,12 @@ def _ensure_boost_order_columns(conn):
         "quantity_min": "INTEGER",
         "quantity_max": "INTEGER",
         "quantity_display": "TEXT",
+        "reactions_enabled": "INTEGER NOT NULL DEFAULT 0",
+        "reactions_quantity": "INTEGER",
+        "reactions_quantity_min": "INTEGER",
+        "reactions_quantity_max": "INTEGER",
+        "reactions_quantity_display": "TEXT",
+        "reactions_service_id": "TEXT",
     }.items():
         if name not in channel_columns:
             conn.execute(f"ALTER TABLE boost_channels ADD COLUMN {name} {definition}")
@@ -300,6 +332,41 @@ def boost_configured(config=cfg) -> bool:
     )
 
 
+def boost_tester_ids(config=cfg) -> set[int]:
+    return {int(v) for v in getattr(config, "BOOST_TESTER_IDS", []) if str(v).lstrip("-").isdigit()}
+
+
+def is_boost_tester(user_id: int | None, config=cfg) -> bool:
+    return bool(user_id is not None and int(user_id) in boost_tester_ids(config))
+
+
+def boost_owner_uses_tester_api(owner_id: int | None, config=cfg) -> bool:
+    return is_boost_tester(owner_id, config)
+
+
+def boost_provider_profile(owner_id: int | None, config=cfg) -> dict:
+    if boost_owner_uses_tester_api(owner_id, config):
+        return {
+            "api_key": getattr(config, "TWIBOOST_TESTER_API_KEY", ""),
+            "api_url": getattr(config, "TWIBOOST_TESTER_API_URL", ""),
+            "views_service_id": _service_id_int(getattr(config, "TWIBOOST_TESTER_VIEWS_SERVICE_ID", 0)),
+            "reactions_service_id": _service_id_int(getattr(config, "TWIBOOST_TESTER_REACTIONS_SERVICE_ID", 0)),
+            "profile": "tester",
+        }
+    return {
+        "api_key": getattr(config, "TWIBOOST_API_KEY", ""),
+        "api_url": getattr(config, "TWIBOOST_API_URL", ""),
+        "views_service_id": _service_id_int(getattr(config, "TWIBOOST_VIEWS_SERVICE_ID", 0)),
+        "reactions_service_id": 0,
+        "profile": "owner",
+    }
+
+
+def boost_profile_configured(owner_id: int | None, config=cfg) -> bool:
+    profile = boost_provider_profile(owner_id, config)
+    return bool(profile["api_key"] and profile["api_url"])
+
+
 def boost_real_orders_allowed(settings: dict | None = None, config=cfg) -> bool:
     settings = settings or get_boost_settings(config=config)
     return (
@@ -307,6 +374,16 @@ def boost_real_orders_allowed(settings: dict | None = None, config=cfg) -> bool:
         and not bool(getattr(config, "BOOST_DRY_RUN", settings.get("boost_dry_run", True)))
         and bool(getattr(config, "BOOST_REAL_ORDERS_ENABLED", settings.get("real_orders_enabled", False)))
         and boost_configured(config)
+    )
+
+
+def boost_real_orders_allowed_for_owner(owner_id: int | None, settings: dict | None = None, config=cfg) -> bool:
+    settings = settings or get_boost_settings(config=config)
+    return (
+        bool(settings.get("boost_enabled"))
+        and not bool(getattr(config, "BOOST_DRY_RUN", settings.get("boost_dry_run", True)))
+        and bool(getattr(config, "BOOST_REAL_ORDERS_ENABLED", settings.get("real_orders_enabled", False)))
+        and boost_profile_configured(owner_id, config)
     )
 
 
@@ -341,6 +418,20 @@ def normalize_channel_input(raw: str) -> dict:
     return {"channel_key": f"user:{username}", "tg_chat_id": None, "username": username}
 
 
+def _owner_scoped_channel_key(channel_key: str, owner_id: int | None) -> str:
+    if owner_id is None:
+        return channel_key
+    return f"owner:{int(owner_id)}:{channel_key}"
+
+
+def _owner_match_sql(owner_id: int | None, include_unowned: bool = False) -> tuple[str, list[Any]]:
+    if owner_id is None:
+        return "", []
+    if include_unowned:
+        return "(owner_id = ? OR owner_id IS NULL)", [int(owner_id)]
+    return "owner_id = ?", [int(owner_id)]
+
+
 def _normalize_username_value(value: str | None) -> str | None:
     if not value:
         return None
@@ -366,7 +457,7 @@ def validate_boost_quantity(value: int | str, config=cfg) -> int:
     return int(spec["quantity_min"])
 
 
-def parse_boost_quantity(value: int | str, config=cfg) -> dict:
+def parse_boost_quantity(value: int | str, config=cfg, min_quantity: int | None = None, max_quantity: int | None = None) -> dict:
     raw = str(value if value is not None else "").strip()
     if not raw:
         raise ValueError("quantity_empty")
@@ -375,8 +466,8 @@ def parse_boost_quantity(value: int | str, config=cfg) -> dict:
         raise ValueError("quantity_invalid")
     quantity_min = int(match.group(1))
     quantity_max = int(match.group(2) or match.group(1))
-    min_quantity = int(getattr(config, "BOOST_MIN_QUANTITY", MIN_BOOST_QUANTITY) or MIN_BOOST_QUANTITY)
-    max_quantity = int(getattr(config, "BOOST_MAX_QUANTITY", MAX_BOOST_QUANTITY) or MAX_BOOST_QUANTITY)
+    min_quantity = int(min_quantity if min_quantity is not None else getattr(config, "BOOST_MIN_QUANTITY", MIN_BOOST_QUANTITY) or MIN_BOOST_QUANTITY)
+    max_quantity = int(max_quantity if max_quantity is not None else getattr(config, "BOOST_MAX_QUANTITY", MAX_BOOST_QUANTITY) or MAX_BOOST_QUANTITY)
     if quantity_min <= 0 or quantity_max <= 0:
         raise ValueError("quantity_must_be_positive")
     if quantity_min < min_quantity or quantity_max < min_quantity:
@@ -392,12 +483,12 @@ def parse_boost_quantity(value: int | str, config=cfg) -> dict:
     }
 
 
-def select_boost_quantity(quantity_min: int, quantity_max: int, rng=None, config=cfg) -> int:
+def select_boost_quantity(quantity_min: int, quantity_max: int, rng=None, config=cfg, min_quantity: int | None = None, max_quantity_limit: int | None = None) -> int:
     rng = rng or random.randint
     quantity_min = int(quantity_min)
     quantity_max = int(quantity_max)
-    min_quantity = int(getattr(config, "BOOST_MIN_QUANTITY", MIN_BOOST_QUANTITY) or MIN_BOOST_QUANTITY)
-    max_quantity = int(getattr(config, "BOOST_MAX_QUANTITY", MAX_BOOST_QUANTITY) or MAX_BOOST_QUANTITY)
+    min_quantity = int(min_quantity if min_quantity is not None else getattr(config, "BOOST_MIN_QUANTITY", MIN_BOOST_QUANTITY) or MIN_BOOST_QUANTITY)
+    max_quantity = int(max_quantity_limit if max_quantity_limit is not None else getattr(config, "BOOST_MAX_QUANTITY", MAX_BOOST_QUANTITY) or MAX_BOOST_QUANTITY)
     if quantity_min < min_quantity or quantity_max < quantity_min or quantity_max > max_quantity:
         raise ValueError("quantity_invalid")
     if quantity_min == quantity_max:
@@ -416,6 +507,23 @@ def boost_quantity_spec_from_channel(channel: dict, settings: dict | None = None
         )
     fallback = channel.get("quantity") or settings.get("default_quantity") or getattr(config, "BOOST_DEFAULT_QUANTITY", 500) or 500
     return parse_boost_quantity(fallback, config)
+
+
+def boost_reactions_quantity_spec_from_channel(channel: dict, config=cfg) -> dict | None:
+    if not bool(channel.get("reactions_enabled")):
+        return None
+    quantity_min = channel.get("reactions_quantity_min")
+    quantity_max = channel.get("reactions_quantity_max")
+    if quantity_min is not None and quantity_max is not None:
+        return parse_boost_quantity(
+            f"{int(quantity_min)}-{int(quantity_max)}" if int(quantity_min) != int(quantity_max) else str(int(quantity_min)),
+            config,
+            min_quantity=1,
+        )
+    fallback = channel.get("reactions_quantity")
+    if fallback:
+        return parse_boost_quantity(fallback, config, min_quantity=1)
+    return None
 
 
 def _service_id_ok(value: int | str | None) -> bool:
@@ -460,27 +568,43 @@ def _find_existing_for_identity(
     smm_channel_id: str | None = None,
     tg_chat_id: int | str | None = None,
     username: str | None = None,
+    owner_id: int | None = None,
+    include_unowned: bool = False,
 ):
+    owner_where, owner_params = _owner_match_sql(owner_id, include_unowned)
+
+    def _with_owner(base: str) -> str:
+        return f"{base} AND {owner_where}" if owner_where else base
+
     if smm_channel_id:
         row = conn.execute(
-            "SELECT * FROM boost_channels WHERE smm_channel_id = ?",
-            (str(smm_channel_id),),
+            _with_owner("SELECT * FROM boost_channels WHERE smm_channel_id = ?"),
+            [str(smm_channel_id), *owner_params],
         ).fetchone()
         if row:
             return row
 
     if channel_key:
-        row = conn.execute("SELECT * FROM boost_channels WHERE channel_key = ?", (channel_key,)).fetchone()
-        if row:
-            return row
+        keys = [channel_key]
+        scoped = _owner_scoped_channel_key(channel_key, owner_id)
+        if scoped not in keys:
+            keys.insert(0, scoped)
+        for key in keys:
+            row = conn.execute(
+                _with_owner("SELECT * FROM boost_channels WHERE channel_key = ?"),
+                [key, *owner_params],
+            ).fetchone()
+            if row:
+                return row
 
     normalized_chat_id = _normalize_chat_id_value(tg_chat_id)
     if normalized_chat_id:
         for query, value in (
             ("SELECT * FROM boost_channels WHERE tg_chat_id = ?", normalized_chat_id),
             ("SELECT * FROM boost_channels WHERE channel_key = ?", f"chat:{normalized_chat_id}"),
+            ("SELECT * FROM boost_channels WHERE channel_key = ?", _owner_scoped_channel_key(f"chat:{normalized_chat_id}", owner_id)),
         ):
-            row = conn.execute(query, (value,)).fetchone()
+            row = conn.execute(_with_owner(query), [value, *owner_params]).fetchone()
             if row:
                 return row
 
@@ -489,15 +613,16 @@ def _find_existing_for_identity(
         for query, value in (
             ("SELECT * FROM boost_channels WHERE username = ?", normalized_username),
             ("SELECT * FROM boost_channels WHERE channel_key = ?", f"user:{normalized_username}"),
+            ("SELECT * FROM boost_channels WHERE channel_key = ?", _owner_scoped_channel_key(f"user:{normalized_username}", owner_id)),
         ):
-            row = conn.execute(query, (value,)).fetchone()
+            row = conn.execute(_with_owner(query), [value, *owner_params]).fetchone()
             if row:
                 return row
 
     return None
 
 
-def _find_existing_for_smm_channel(conn, channel: dict):
+def _find_existing_for_smm_channel(conn, channel: dict, owner_id: int | None = None, include_unowned: bool = False):
     smm_channel_id = channel.get("channel_id")
     chat_id = _smm_channel_chat_id(channel)
     username = _smm_channel_username(channel)
@@ -508,13 +633,20 @@ def _find_existing_for_smm_channel(conn, channel: dict):
         smm_channel_id=str(smm_channel_id) if smm_channel_id else None,
         tg_chat_id=chat_id,
         username=username,
+        owner_id=owner_id,
+        include_unowned=include_unowned,
     )
 
 
-def find_tracked_channel_for_smm_channel(smm_channel: dict, database=db) -> dict | None:
+def find_tracked_channel_for_smm_channel(
+    smm_channel: dict,
+    database=db,
+    owner_id: int | None = None,
+    include_unowned: bool = False,
+) -> dict | None:
     ensure_boost_schema(database)
     with _connect(database) as conn:
-        row = _find_existing_for_smm_channel(conn, smm_channel)
+        row = _find_existing_for_smm_channel(conn, smm_channel, owner_id, include_unowned)
     return _row_to_dict(row)
 
 
@@ -524,6 +656,8 @@ def find_tracked_channel_for_input(
     snapshot_username: str | None = None,
     snapshot_tg_chat_id: int | str | None = None,
     database=db,
+    owner_id: int | None = None,
+    include_unowned: bool = False,
 ) -> dict | None:
     ensure_boost_schema(database)
     normalized = normalize_channel_input(raw_channel)
@@ -536,6 +670,8 @@ def find_tracked_channel_for_input(
             smm_channel_id=smm_channel_id,
             tg_chat_id=tg_chat_id,
             username=username,
+            owner_id=owner_id,
+            include_unowned=include_unowned,
         )
     return _row_to_dict(row)
 
@@ -579,6 +715,9 @@ def add_tracked_channel(
     owner_id: int | None,
     quantity: int | str | None = None,
     service_id: int | str | None = None,
+    reactions_enabled: bool = False,
+    reactions_quantity: int | str | None = None,
+    reactions_service_id: int | str | None = None,
     title: str | None = None,
     note: str | None = None,
     enabled: bool = False,
@@ -590,6 +729,7 @@ def add_tracked_channel(
 ) -> dict:
     ensure_boost_schema(database)
     normalized = normalize_channel_input(raw_channel)
+    stored_channel_key = _owner_scoped_channel_key(normalized["channel_key"], owner_id)
     now = utc_now()
     quantity_spec = parse_boost_quantity(
         quantity if quantity is not None else getattr(config, "BOOST_DEFAULT_QUANTITY", 500) or 500,
@@ -597,6 +737,8 @@ def add_tracked_channel(
     )
     qty = int(quantity_spec["quantity_min"])
     svc = str(_service_id_int(service_id)) if _service_id_ok(service_id) else None
+    reactions_spec = parse_boost_quantity(reactions_quantity, config, min_quantity=1) if reactions_quantity is not None else None
+    reactions_svc = str(_service_id_int(reactions_service_id)) if _service_id_ok(reactions_service_id) else None
     tg_chat_id = _normalize_chat_id_value(snapshot_tg_chat_id if snapshot_tg_chat_id is not None else normalized["tg_chat_id"])
     username = _normalize_username_value(snapshot_username or normalized["username"])
     with _connect(database) as conn:
@@ -606,6 +748,8 @@ def add_tracked_channel(
             smm_channel_id=smm_channel_id,
             tg_chat_id=tg_chat_id,
             username=username,
+            owner_id=owner_id,
+            include_unowned=owner_id is None,
         )
         if existing:
             conn.execute(
@@ -621,6 +765,12 @@ def add_tracked_channel(
                     quantity_max = CASE WHEN ? THEN ? ELSE quantity_max END,
                     quantity_display = CASE WHEN ? THEN ? ELSE quantity_display END,
                     service_id = COALESCE(?, service_id),
+                    reactions_enabled = ?,
+                    reactions_quantity = CASE WHEN ? THEN ? ELSE reactions_quantity END,
+                    reactions_quantity_min = CASE WHEN ? THEN ? ELSE reactions_quantity_min END,
+                    reactions_quantity_max = CASE WHEN ? THEN ? ELSE reactions_quantity_max END,
+                    reactions_quantity_display = CASE WHEN ? THEN ? ELSE reactions_quantity_display END,
+                    reactions_service_id = COALESCE(?, reactions_service_id),
                     note = COALESCE(?, note),
                     updated_at = ?
                 WHERE id = ?
@@ -640,6 +790,16 @@ def add_tracked_channel(
                     1 if quantity is not None else 0,
                     quantity_spec["quantity_display"],
                     svc,
+                    _bool_int(reactions_enabled),
+                    1 if reactions_spec else 0,
+                    int(reactions_spec["quantity_min"]) if reactions_spec else None,
+                    1 if reactions_spec else 0,
+                    int(reactions_spec["quantity_min"]) if reactions_spec else None,
+                    1 if reactions_spec else 0,
+                    int(reactions_spec["quantity_max"]) if reactions_spec else None,
+                    1 if reactions_spec else 0,
+                    reactions_spec["quantity_display"] if reactions_spec else None,
+                    reactions_svc,
                     note,
                     now,
                     int(existing["id"]),
@@ -650,11 +810,14 @@ def add_tracked_channel(
                 """
                 INSERT INTO boost_channels (
                     channel_key, smm_channel_id, owner_id, tg_chat_id, username, title, enabled,
-                    quantity, quantity_min, quantity_max, quantity_display, service_id, note, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    quantity, quantity_min, quantity_max, quantity_display, service_id,
+                    reactions_enabled, reactions_quantity, reactions_quantity_min, reactions_quantity_max,
+                    reactions_quantity_display, reactions_service_id,
+                    note, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    normalized["channel_key"],
+                    stored_channel_key,
                     smm_channel_id,
                     owner_id,
                     tg_chat_id,
@@ -666,6 +829,12 @@ def add_tracked_channel(
                     int(quantity_spec["quantity_max"]),
                     quantity_spec["quantity_display"],
                     svc,
+                    _bool_int(reactions_enabled),
+                    int(reactions_spec["quantity_min"]) if reactions_spec else None,
+                    int(reactions_spec["quantity_min"]) if reactions_spec else None,
+                    int(reactions_spec["quantity_max"]) if reactions_spec else None,
+                    reactions_spec["quantity_display"] if reactions_spec else None,
+                    reactions_svc,
                     note,
                     now,
                     now,
@@ -684,6 +853,9 @@ def add_tracked_channel_from_smm_channel(
     owner_id: int | None,
     quantity: int | str,
     service_id: int | str | None = None,
+    reactions_enabled: bool = False,
+    reactions_quantity: int | str | None = None,
+    reactions_service_id: int | str | None = None,
     enabled: bool = False,
     database=db,
     config=cfg,
@@ -691,7 +863,7 @@ def add_tracked_channel_from_smm_channel(
     ensure_boost_schema(database)
     quantity_spec = parse_boost_quantity(quantity, config)
     with _connect(database) as conn:
-        existing = _find_existing_for_smm_channel(conn, smm_channel)
+        existing = _find_existing_for_smm_channel(conn, smm_channel, owner_id=owner_id, include_unowned=owner_id is None)
     if existing:
         linked = link_tracked_channel_to_smm_channel(existing["id"], smm_channel, owner_id, database)
         return linked or _row_to_dict(existing), False
@@ -702,6 +874,9 @@ def add_tracked_channel_from_smm_channel(
         owner_id=owner_id,
         quantity=quantity_spec["quantity_display"],
         service_id=service_id,
+        reactions_enabled=reactions_enabled,
+        reactions_quantity=reactions_quantity,
+        reactions_service_id=reactions_service_id,
         title=smm_channel.get("name") or smm_channel.get("title"),
         note="linked_smm_channel",
         enabled=enabled,
@@ -714,12 +889,26 @@ def add_tracked_channel_from_smm_channel(
     return channel, True
 
 
-def list_tracked_channels(database=db, include_disabled: bool = True) -> list[dict]:
+def list_tracked_channels(
+    database=db,
+    include_disabled: bool = True,
+    owner_id: int | None = None,
+    include_unowned: bool = False,
+) -> list[dict]:
     ensure_boost_schema(database)
-    where = "" if include_disabled else "WHERE enabled = 1"
+    clauses = []
+    params: list[Any] = []
+    if not include_disabled:
+        clauses.append("enabled = 1")
+    owner_where, owner_params = _owner_match_sql(owner_id, include_unowned)
+    if owner_where:
+        clauses.append(owner_where)
+        params.extend(owner_params)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with _connect(database) as conn:
         rows = conn.execute(
-            f"SELECT * FROM boost_channels {where} ORDER BY id DESC"
+            f"SELECT * FROM boost_channels {where} ORDER BY id DESC",
+            params,
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -747,6 +936,40 @@ def find_tracked_channel(chat_id: int | str | None = None, username: str | None 
         if row:
             return dict(row)
     return None
+
+
+def find_tracked_channels(chat_id: int | str | None = None, username: str | None = None, database=db) -> list[dict]:
+    ensure_boost_schema(database)
+    username = _normalize_username_value(username)
+    chat_id = _normalize_chat_id_value(chat_id)
+    if not username and not chat_id:
+        return []
+    clauses = []
+    params: list[Any] = []
+    if chat_id:
+        clauses.extend(["tg_chat_id = ?", "channel_key = ?", "channel_key LIKE ?"])
+        params.extend([chat_id, f"chat:{chat_id}", f"owner:%:chat:{chat_id}"])
+    if username:
+        clauses.extend(["username = ?", "channel_key = ?", "channel_key LIKE ?"])
+        params.extend([username, f"user:{username}", f"owner:%:user:{username}"])
+    with _connect(database) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM boost_channels
+            WHERE {' OR '.join(clauses)}
+            ORDER BY CASE WHEN owner_id IS NULL THEN 0 ELSE 1 END, id
+            """,
+            params,
+        ).fetchall()
+    seen = set()
+    result = []
+    for row in rows:
+        item = dict(row)
+        if item["id"] in seen:
+            continue
+        seen.add(item["id"])
+        result.append(item)
+    return result
 
 
 def set_tracked_channel_enabled(channel_id: int, enabled: bool, database=db) -> dict | None:
@@ -779,6 +1002,49 @@ def set_tracked_channel_quantity(channel_id: int, quantity: int | str, database=
                 int(quantity_spec["quantity_min"]),
                 int(quantity_spec["quantity_max"]),
                 quantity_spec["quantity_display"],
+                utc_now(),
+                int(channel_id),
+            ),
+        )
+        conn.commit()
+    return get_tracked_channel(channel_id, database)
+
+
+def set_tracked_channel_reactions(
+    channel_id: int,
+    enabled: bool,
+    quantity: int | str | None = None,
+    service_id: int | str | None = None,
+    database=db,
+    config=cfg,
+) -> dict | None:
+    quantity_spec = parse_boost_quantity(quantity, config, min_quantity=1) if quantity is not None else None
+    svc = str(_service_id_int(service_id)) if _service_id_ok(service_id) else None
+    ensure_boost_schema(database)
+    with _connect(database) as conn:
+        conn.execute(
+            """
+            UPDATE boost_channels SET
+                reactions_enabled = ?,
+                reactions_quantity = CASE WHEN ? THEN ? ELSE reactions_quantity END,
+                reactions_quantity_min = CASE WHEN ? THEN ? ELSE reactions_quantity_min END,
+                reactions_quantity_max = CASE WHEN ? THEN ? ELSE reactions_quantity_max END,
+                reactions_quantity_display = CASE WHEN ? THEN ? ELSE reactions_quantity_display END,
+                reactions_service_id = COALESCE(?, reactions_service_id),
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                _bool_int(enabled),
+                1 if quantity_spec else 0,
+                int(quantity_spec["quantity_min"]) if quantity_spec else None,
+                1 if quantity_spec else 0,
+                int(quantity_spec["quantity_min"]) if quantity_spec else None,
+                1 if quantity_spec else 0,
+                int(quantity_spec["quantity_max"]) if quantity_spec else None,
+                1 if quantity_spec else 0,
+                quantity_spec["quantity_display"] if quantity_spec else None,
+                svc,
                 utc_now(),
                 int(channel_id),
             ),
@@ -883,6 +1149,7 @@ def get_boost_event_by_key(
     boost_channel_id: int,
     event_key: str,
     service_id: int | str | None,
+    order_kind: str = BOOST_ORDER_KIND_VIEWS,
     database=db,
 ) -> dict | None:
     ensure_boost_schema(database)
@@ -892,11 +1159,12 @@ def get_boost_event_by_key(
             SELECT * FROM boost_orders
             WHERE boost_channel_id = ?
               AND event_key = ?
+              AND order_kind = ?
               AND COALESCE(service_id, '') = COALESCE(?, '')
             ORDER BY id DESC
             LIMIT 1
             """,
-            (int(boost_channel_id), event_key, str(service_id) if service_id is not None else None),
+            (int(boost_channel_id), event_key, order_kind, str(service_id) if service_id is not None else None),
         ).fetchone()
     return _row_to_dict(row)
 
@@ -1020,15 +1288,22 @@ def _schedule_pending_boost_album(
 def list_boost_events(
     limit: int = 10,
     boost_channel_id: int | None = None,
+    owner_id: int | None = None,
+    include_unowned: bool = False,
     database=db,
 ) -> list[dict]:
     ensure_boost_schema(database)
     limit = max(1, min(int(limit or 10), 100))
     params: list[Any] = []
-    where = ""
+    clauses = []
     if boost_channel_id is not None:
-        where = "WHERE o.boost_channel_id = ?"
+        clauses.append("o.boost_channel_id = ?")
         params.append(int(boost_channel_id))
+    owner_where, owner_params = _owner_match_sql(owner_id, include_unowned)
+    if owner_where:
+        clauses.append(owner_where.replace("owner_id", "c.owner_id"))
+        params.extend(owner_params)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     params.append(limit)
     with _connect(database) as conn:
         rows = conn.execute(
@@ -1044,7 +1319,10 @@ def list_boost_events(
                 c.enabled AS channel_enabled,
                 c.quantity_min AS channel_quantity_min,
                 c.quantity_max AS channel_quantity_max,
-                c.quantity_display AS channel_quantity_display
+                c.quantity_display AS channel_quantity_display,
+                c.reactions_quantity_min AS channel_reactions_quantity_min,
+                c.reactions_quantity_max AS channel_reactions_quantity_max,
+                c.reactions_quantity_display AS channel_reactions_quantity_display
             FROM boost_orders o
             LEFT JOIN boost_channels c ON c.id = o.boost_channel_id
             {where}
@@ -1100,6 +1378,7 @@ def create_boost_event(
     media_group_id: str | None = None,
     canonical_message_id: int | None = None,
     event_type: str | None = None,
+    order_kind: str = BOOST_ORDER_KIND_VIEWS,
     reason_code: str | None = None,
     provider_order_id: int | str | None = None,
     error: str | None = None,
@@ -1115,9 +1394,9 @@ def create_boost_event(
                 """
                 INSERT INTO boost_orders (
                     boost_channel_id, tg_chat_id, message_id, event_key, media_group_id,
-                    canonical_message_id, event_type, post_url, quantity, service_id,
+                    canonical_message_id, event_type, order_kind, post_url, quantity, service_id,
                     provider_order_id, status, dry_run, reason_code, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     int(boost_channel["id"]),
@@ -1127,6 +1406,7 @@ def create_boost_event(
                     str(media_group_id) if media_group_id is not None else None,
                     int(canonical_message_id or message_id),
                     event_type or BOOST_EVENT_TYPE_POST,
+                    order_kind,
                     post_url,
                     int(quantity),
                     service_value,
@@ -1145,11 +1425,12 @@ def create_boost_event(
                 SELECT * FROM boost_orders
                 WHERE boost_channel_id = ?
                   AND event_key = ?
+                  AND order_kind = ?
                   AND COALESCE(service_id, '') = COALESCE(?, '')
                 ORDER BY id DESC
                 LIMIT 1
                 """,
-                (int(boost_channel["id"]), event_key, service_value),
+                (int(boost_channel["id"]), event_key, order_kind, service_value),
             ).fetchone()
             if row:
                 return dict(row)
@@ -1205,7 +1486,11 @@ async def handle_boost_channel_post_dry_run(
         return {"status": "ignored", "reason": "no_message_id", "channel": channel}
 
     settings = get_boost_settings(database, config)
-    service_id = channel.get("service_id") or settings.get("default_service_id") or getattr(config, "TWIBOOST_VIEWS_SERVICE_ID", None)
+    provider_profile = boost_provider_profile(channel.get("owner_id"), config)
+    if boost_owner_uses_tester_api(channel.get("owner_id"), config):
+        service_id = channel.get("service_id") or provider_profile.get("views_service_id")
+    else:
+        service_id = channel.get("service_id") or settings.get("default_service_id") or provider_profile.get("views_service_id")
     event_key = build_boost_event_key(message)
     event_type = infer_boost_event_type(message)
     media_group_id = getattr(message, "media_group_id", None)
@@ -1226,7 +1511,7 @@ async def handle_boost_channel_post_dry_run(
         _log_boost_result(BOOST_STATUS_IGNORED, BOOST_REASON_NO_BOOSTABLE_CONTENT, message=message, channel=channel, event_key=event_key, event_type=event_type, settings=settings)
         return {"status": BOOST_STATUS_IGNORED, "reason": BOOST_REASON_NO_BOOSTABLE_CONTENT, "channel": channel}
 
-    existing = get_boost_event_by_key(channel["id"], event_key, service_id, database)
+    existing = get_boost_event_by_key(channel["id"], event_key, service_id, BOOST_ORDER_KIND_VIEWS, database)
     if existing:
         existing = update_boost_album_canonical_event(existing, channel, message, database)
         _log_boost_result("duplicate", "already_has_event", message=message, channel=channel, event=existing, event_key=event_key, event_type=event_type, settings=settings)
@@ -1280,7 +1565,12 @@ async def handle_boost_channel_post_dry_run(
             "url": post_url_result,
         }
 
-    wrapper = client or TwiBoostClientWrapper(config=config)
+    wrapper = client or TwiBoostClientWrapper(
+        api_key=provider_profile.get("api_key"),
+        api_url=provider_profile.get("api_url"),
+        service_id=provider_profile.get("views_service_id"),
+        config=config,
+    )
     if not _service_id_ok(service_id):
         event = create_boost_event(
             channel,
@@ -1321,7 +1611,7 @@ async def handle_boost_channel_post_dry_run(
         _log_boost_result(BOOST_STATUS_IGNORED, BOOST_REASON_TWIBOOST_NOT_CONFIGURED, message=message, channel=channel, event=event, event_key=event_key, event_type=event_type, settings=settings)
         return {"status": BOOST_STATUS_IGNORED, "reason": BOOST_REASON_TWIBOOST_NOT_CONFIGURED, "event": event, "url": post_url_result}
 
-    dry_run = not boost_real_orders_allowed(settings, config)
+    dry_run = not boost_real_orders_allowed_for_owner(channel.get("owner_id"), settings, config)
     result = await wrapper.create_views_order(post_url_result["post_url"] or "", quantity, service_id, dry_run=dry_run)
     provider_error = result.get("error")
     provider_order_id = result.get("order") or result.get("order_id")
@@ -1344,13 +1634,94 @@ async def handle_boost_channel_post_dry_run(
         media_group_id=str(media_group_id) if media_group_id is not None else None,
         canonical_message_id=post_url_result["canonical_message_id"] or message_id,
         event_type=event_type,
+        order_kind=BOOST_ORDER_KIND_VIEWS,
         reason_code=reason_code,
         provider_order_id=provider_order_id,
         error=error,
         database=database,
     )
+    reaction_event = None
+    reaction_result = None
+    reaction_spec = boost_reactions_quantity_spec_from_channel(channel, config)
+    reaction_service_id = channel.get("reactions_service_id") or provider_profile.get("reactions_service_id")
+    if reaction_spec:
+        reaction_quantity = select_boost_quantity(
+            reaction_spec["quantity_min"],
+            reaction_spec["quantity_max"],
+            config=config,
+            min_quantity=1,
+        )
+        existing_reaction = get_boost_event_by_key(
+            channel["id"],
+            event_key,
+            reaction_service_id,
+            BOOST_ORDER_KIND_REACTIONS,
+            database,
+        )
+        if not existing_reaction:
+            if not _service_id_ok(reaction_service_id):
+                reaction_event = create_boost_event(
+                    channel,
+                    message_id,
+                    post_url_result["post_url"],
+                    reaction_quantity,
+                    reaction_service_id,
+                    status=BOOST_STATUS_IGNORED,
+                    dry_run=True,
+                    event_key=event_key,
+                    media_group_id=str(media_group_id) if media_group_id is not None else None,
+                    canonical_message_id=post_url_result["canonical_message_id"] or message_id,
+                    event_type=event_type,
+                    order_kind=BOOST_ORDER_KIND_REACTIONS,
+                    reason_code=BOOST_REASON_MISSING_SERVICE_ID,
+                    error=BOOST_REASON_MISSING_SERVICE_ID,
+                    database=database,
+                )
+            else:
+                reaction_result = await wrapper.create_views_order(
+                    post_url_result["post_url"] or "",
+                    reaction_quantity,
+                    reaction_service_id,
+                    dry_run=dry_run,
+                )
+                reaction_error = reaction_result.get("error")
+                reaction_provider_order_id = reaction_result.get("order") or reaction_result.get("order_id")
+                reaction_status = BOOST_STATUS_DRY_RUN if dry_run else BOOST_STATUS_ORDERED
+                reaction_reason = post_url_result["reason_code"]
+                reaction_error_text = None
+                if reaction_error:
+                    reaction_status = BOOST_STATUS_IGNORED if dry_run else BOOST_STATUS_FAILED
+                    reaction_reason = BOOST_REASON_PROVIDER_ERROR
+                    reaction_error_text = str(reaction_error)
+                reaction_event = create_boost_event(
+                    channel,
+                    message_id,
+                    post_url_result["post_url"],
+                    reaction_quantity,
+                    reaction_service_id,
+                    status=reaction_status,
+                    dry_run=dry_run,
+                    event_key=event_key,
+                    media_group_id=str(media_group_id) if media_group_id is not None else None,
+                    canonical_message_id=post_url_result["canonical_message_id"] or message_id,
+                    event_type=event_type,
+                    order_kind=BOOST_ORDER_KIND_REACTIONS,
+                    reason_code=reaction_reason,
+                    provider_order_id=reaction_provider_order_id,
+                    error=reaction_error_text,
+                    database=database,
+                )
+        else:
+            reaction_event = existing_reaction
     _log_boost_result(status, reason_code, message=message, channel=channel, event=event, event_key=event_key, event_type=event_type, settings=settings)
-    return {"status": status, "event": event, "request": result, "url": post_url_result}
+    return {
+        "status": status,
+        "event": event,
+        "reaction_event": reaction_event,
+        "request": result,
+        "reaction_request": reaction_result,
+        "url": post_url_result,
+    }
 
 
 @dataclass

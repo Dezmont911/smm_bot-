@@ -12,6 +12,7 @@ from boost_manager import (
     add_tracked_channel_from_smm_channel,
     build_telegram_post_url,
     boost_configured,
+    boost_provider_profile,
     boost_real_orders_allowed,
     delete_tracked_channel,
     get_boost_settings,
@@ -24,6 +25,7 @@ from boost_manager import (
     select_boost_quantity,
     set_tracked_channel_enabled,
     set_tracked_channel_quantity,
+    set_tracked_channel_reactions,
     validate_boost_quantity,
 )
 
@@ -40,6 +42,11 @@ class BoostManagerTests(unittest.TestCase):
             BOOST_DEFAULT_QUANTITY=500,
             BOOST_DRY_RUN=True,
             BOOST_REAL_ORDERS_ENABLED=False,
+            BOOST_TESTER_IDS=[733891104],
+            TWIBOOST_TESTER_API_KEY="tester-secret",
+            TWIBOOST_TESTER_API_URL="https://tester.example/api/v2",
+            TWIBOOST_TESTER_VIEWS_SERVICE_ID=4702,
+            TWIBOOST_TESTER_REACTIONS_SERVICE_ID=3303,
         )
 
     def tearDown(self):
@@ -82,6 +89,55 @@ class BoostManagerTests(unittest.TestCase):
         self.assertEqual(channels[0]["id"], added["id"])
         self.assertEqual(channels[0]["username"], "boosted")
         self.assertFalse(bool(channels[0]["enabled"]))
+
+    def test_tester_channels_are_owner_scoped_and_hidden_from_owner_boost(self):
+        owner_channel = add_tracked_channel("@boosted", owner_id=100, database=self.db, config=self.config)
+        tester_channel = add_tracked_channel("@boosted", owner_id=733891104, database=self.db, config=self.config)
+
+        owner_visible = list_tracked_channels(self.db, owner_id=100, include_unowned=True)
+        tester_visible = list_tracked_channels(self.db, owner_id=733891104)
+
+        self.assertNotEqual(owner_channel["id"], tester_channel["id"])
+        self.assertEqual([ch["id"] for ch in owner_visible], [owner_channel["id"]])
+        self.assertEqual([ch["id"] for ch in tester_visible], [tester_channel["id"]])
+        self.assertEqual(owner_channel["channel_key"], "owner:100:user:boosted")
+        self.assertEqual(tester_channel["channel_key"], "owner:733891104:user:boosted")
+
+    def test_tester_provider_profile_uses_tester_twiboost_env(self):
+        owner_profile = boost_provider_profile(100, self.config)
+        tester_profile = boost_provider_profile(733891104, self.config)
+
+        self.assertEqual(owner_profile["profile"], "owner")
+        self.assertEqual(owner_profile["views_service_id"], 123)
+        self.assertEqual(tester_profile["profile"], "tester")
+        self.assertEqual(tester_profile["api_url"], "https://tester.example/api/v2")
+        self.assertEqual(tester_profile["views_service_id"], 4702)
+        self.assertEqual(tester_profile["reactions_service_id"], 3303)
+
+    def test_reactions_quantity_storage_and_toggle(self):
+        added = add_tracked_channel(
+            "@boosted",
+            owner_id=733891104,
+            quantity="500-550",
+            reactions_enabled=True,
+            reactions_quantity="3-7",
+            database=self.db,
+            config=self.config,
+        )
+
+        self.assertTrue(bool(added["reactions_enabled"]))
+        self.assertEqual(added["reactions_quantity_min"], 3)
+        self.assertEqual(added["reactions_quantity_max"], 7)
+        self.assertEqual(added["reactions_quantity_display"], "3-7".replace("-", "–"))
+
+        disabled = set_tracked_channel_reactions(added["id"], False, database=self.db, config=self.config)
+        updated = set_tracked_channel_reactions(added["id"], True, "8-9", database=self.db, config=self.config)
+
+        self.assertFalse(bool(disabled["reactions_enabled"]))
+        self.assertTrue(bool(updated["reactions_enabled"]))
+        self.assertEqual(updated["reactions_quantity_min"], 8)
+        self.assertEqual(updated["reactions_quantity_max"], 9)
+        self.assertEqual(updated["reactions_quantity_display"], "8–9")
 
     def test_toggle_quantity_and_delete_tracked_channel(self):
         added = add_tracked_channel("https://t.me/Boosted", owner_id=100, database=self.db, config=self.config)
@@ -230,7 +286,7 @@ class BoostManagerTests(unittest.TestCase):
         self.assertEqual(len(channels), 1)
         self.assertEqual(duplicate["id"], added["id"])
         self.assertEqual(duplicate_link["id"], added["id"])
-        self.assertEqual(channels[0]["channel_key"], "chat:-1001234567890")
+        self.assertEqual(channels[0]["channel_key"], "owner:100:chat:-1001234567890")
         self.assertEqual(channels[0]["username"], "boosted")
         self.assertEqual(channels[0]["smm_channel_id"], "@boosted")
 
@@ -348,6 +404,11 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
             BOOST_DEFAULT_QUANTITY=500,
             BOOST_DRY_RUN=True,
             BOOST_REAL_ORDERS_ENABLED=False,
+            BOOST_TESTER_IDS=[733891104],
+            TWIBOOST_TESTER_API_KEY="tester-secret",
+            TWIBOOST_TESTER_API_URL="https://tester.example/api/v2",
+            TWIBOOST_TESTER_VIEWS_SERVICE_ID=4702,
+            TWIBOOST_TESTER_REACTIONS_SERVICE_ID=3303,
         )
 
     async def asyncTearDown(self):
@@ -732,6 +793,56 @@ class BoostDryRunEventTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "ordered")
         self.assertEqual(client.calls, [{"dry_run": False, "service_id": "123"}])
+
+    async def test_tester_views_and_reactions_use_tester_services(self):
+        class CapturingClient:
+            api_key = "tester-secret"
+            api_url = "https://tester.example/api/v2"
+
+            def __init__(self):
+                self.calls = []
+
+            async def create_views_order(self, post_url, quantity, service_id, dry_run=True):
+                self.calls.append(
+                    {"post_url": post_url, "quantity": quantity, "service_id": service_id, "dry_run": dry_run}
+                )
+                return {"order": f"order-{service_id}"}
+
+        config = SimpleNamespace(**{**self.config.__dict__, "BOOST_REAL_ORDERS_ENABLED": True, "BOOST_DRY_RUN": False})
+        save_boost_settings({"boost_enabled": True}, self.db, config)
+        add_tracked_channel(
+            "@boosted",
+            owner_id=733891104,
+            quantity="500-550",
+            reactions_enabled=True,
+            reactions_quantity="3-5",
+            enabled=True,
+            database=self.db,
+            config=config,
+        )
+        client = CapturingClient()
+
+        result = await handle_boost_channel_post_dry_run(
+            self._message(message_id=77),
+            self.db,
+            config,
+            client=client,
+        )
+        events = list_boost_events(database=self.db)
+
+        self.assertEqual(result["status"], "ordered")
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(client.calls[0]["post_url"], "https://t.me/boosted/77")
+        self.assertGreaterEqual(client.calls[0]["quantity"], 500)
+        self.assertLessEqual(client.calls[0]["quantity"], 550)
+        self.assertEqual(client.calls[0]["service_id"], 4702)
+        self.assertFalse(client.calls[0]["dry_run"])
+        self.assertEqual(client.calls[1]["post_url"], "https://t.me/boosted/77")
+        self.assertGreaterEqual(client.calls[1]["quantity"], 3)
+        self.assertLessEqual(client.calls[1]["quantity"], 5)
+        self.assertEqual(client.calls[1]["service_id"], 3303)
+        self.assertFalse(client.calls[1]["dry_run"])
+        self.assertEqual({event["order_kind"] for event in events}, {"views", "reactions"})
 
     async def test_real_order_media_group_duplicate_calls_provider_once(self):
         class RecordingClient:

@@ -182,6 +182,24 @@ class Config:
     TWIBOOST_VIEWS_SERVICE_ID: int = field(
         default_factory=lambda: int(v) if (v := _optional("TWIBOOST_VIEWS_SERVICE_ID", "0").strip()).isdigit() else 0
     )
+    BOOST_TESTER_IDS: list = field(
+        default_factory=lambda: [
+            int(x.strip()) for x in _optional("BOOST_TESTER_IDS", "").split(",")
+            if x.strip().lstrip("-").isdigit()
+        ]
+    )
+    TWIBOOST_TESTER_API_KEY: str = field(
+        default_factory=lambda: _optional("TWIBOOST_TESTER_API_KEY", "")
+    )
+    TWIBOOST_TESTER_API_URL: str = field(
+        default_factory=lambda: _optional("TWIBOOST_TESTER_API_URL", "https://twiboost.com/api/v2")
+    )
+    TWIBOOST_TESTER_VIEWS_SERVICE_ID: int = field(
+        default_factory=lambda: int(v) if (v := _optional("TWIBOOST_TESTER_VIEWS_SERVICE_ID", "0").strip()).isdigit() else 0
+    )
+    TWIBOOST_TESTER_REACTIONS_SERVICE_ID: int = field(
+        default_factory=lambda: int(v) if (v := _optional("TWIBOOST_TESTER_REACTIONS_SERVICE_ID", "0").strip()).isdigit() else 0
+    )
     BOOST_DEFAULT_QUANTITY: int = field(
         default_factory=lambda: int(v) if (v := _optional("BOOST_DEFAULT_QUANTITY", "500").strip()).isdigit() else 500
     )

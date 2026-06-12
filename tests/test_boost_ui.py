@@ -29,6 +29,9 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
             "boost_add_external_channel": "@old",
             "boost_add_smm_channel_id": "@old",
             "boost_set_quantity_for": 1,
+            "boost_pending_create": {"kind": "external"},
+            "boost_wait_reactions_quantity": True,
+            "boost_set_reactions_quantity_for": 2,
             "other": "keep",
         })
 
@@ -74,7 +77,40 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(ui.accounts, "is_superadmin", return_value=False):
             await ui.screen_boost_smm_picker(query, SimpleNamespace(user_data={}), page=0)
 
-        self.assertEqual(query.answers, [("Только для владельца.", True)])
+        self.assertEqual(query.answers, [("Boost недоступен.", True)])
+
+    async def test_boost_picker_allows_configured_tester_with_owner_scope(self):
+        captured = {}
+
+        def fake_load_channels(include_inactive=False, owner_id=None, scope=None):
+            captured["include_inactive"] = include_inactive
+            captured["owner_id"] = owner_id
+            captured["scope"] = scope
+            return [
+                {
+                    "channel_id": "@tester",
+                    "name": "Tester",
+                    "username": "tester",
+                    "owner_id": 733891104,
+                    "active": True,
+                }
+            ]
+
+        async def fake_answer_or_send(qm, text, kb):
+            captured["text"] = text
+            captured["kb"] = kb
+
+        with patch.object(ui.accounts, "is_superadmin", return_value=False), \
+                patch.object(ui, "is_boost_tester", return_value=True), \
+                patch.object(ui, "_load_channels", side_effect=fake_load_channels), \
+                patch.object(ui, "find_tracked_channel_for_smm_channel", return_value=None), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
+            await ui.screen_boost_smm_picker(FakeQuery(733891104), SimpleNamespace(user_data={}), page=0)
+
+        self.assertTrue(captured["include_inactive"])
+        self.assertEqual(captured["owner_id"], 733891104)
+        self.assertEqual(captured["scope"], "mine")
+        self.assertIn("Tester", captured["text"])
 
     def test_views_monitor_superadmin_uses_all_admin_channels(self):
         captured = {}
@@ -241,7 +277,7 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(ui, "get_boost_settings", return_value=settings), \
                 patch.object(ui, "list_tracked_channels", return_value=[]), \
                 patch.object(ui, "boost_configured", return_value=True), \
-                patch.object(ui, "boost_real_orders_allowed", return_value=False), \
+                patch.object(ui, "boost_real_orders_allowed_for_owner", return_value=False), \
                 patch.object(ui, "boost_status", return_value="dry_run"), \
                 patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
             await ui.screen_boost_admin(FakeQuery(100), SimpleNamespace(user_data={}))

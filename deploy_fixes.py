@@ -129,6 +129,12 @@ CREATE TABLE IF NOT EXISTS boost_channels (
     enabled INTEGER NOT NULL DEFAULT 0,
     quantity INTEGER,
     service_id TEXT,
+    reactions_enabled INTEGER NOT NULL DEFAULT 0,
+    reactions_quantity INTEGER,
+    reactions_quantity_min INTEGER,
+    reactions_quantity_max INTEGER,
+    reactions_quantity_display TEXT,
+    reactions_service_id TEXT,
     note TEXT,
     last_seen_message_id INTEGER,
     last_order_id TEXT,
@@ -145,6 +151,7 @@ CREATE TABLE IF NOT EXISTS boost_orders (
     media_group_id TEXT,
     canonical_message_id INTEGER,
     event_type TEXT NOT NULL DEFAULT 'post',
+    order_kind TEXT NOT NULL DEFAULT 'views',
     post_url TEXT,
     quantity INTEGER NOT NULL,
     service_id TEXT,
@@ -166,6 +173,22 @@ if 'smm_channel_id' not in channel_cols:
     print("  ✅ boost_channels.smm_channel_id добавлена")
 else:
     print("  ℹ️  boost_channels.smm_channel_id уже есть")
+for _col, _definition in (
+    ('quantity_min', 'INTEGER'),
+    ('quantity_max', 'INTEGER'),
+    ('quantity_display', 'TEXT'),
+    ('reactions_enabled', 'INTEGER NOT NULL DEFAULT 0'),
+    ('reactions_quantity', 'INTEGER'),
+    ('reactions_quantity_min', 'INTEGER'),
+    ('reactions_quantity_max', 'INTEGER'),
+    ('reactions_quantity_display', 'TEXT'),
+    ('reactions_service_id', 'TEXT'),
+):
+    if _col not in channel_cols:
+        conn.execute(f"ALTER TABLE boost_channels ADD COLUMN {_col} {_definition}")
+        print(f"  ✅ boost_channels.{_col} добавлена")
+    else:
+        print(f"  ℹ️  boost_channels.{_col} уже есть")
 conn.execute(
     '''
     CREATE UNIQUE INDEX IF NOT EXISTS idx_boost_channels_smm_channel
@@ -178,6 +201,7 @@ for _col, _definition in (
     ('media_group_id', 'TEXT'),
     ('canonical_message_id', 'INTEGER'),
     ('event_type', "TEXT NOT NULL DEFAULT 'post'"),
+    ('order_kind', "TEXT NOT NULL DEFAULT 'views'"),
     ('reason_code', 'TEXT'),
 ):
     if _col not in order_cols:
@@ -191,18 +215,22 @@ conn.execute(
     SET
         canonical_message_id = COALESCE(canonical_message_id, message_id),
         event_type = COALESCE(NULLIF(event_type, ''), 'post'),
+        order_kind = COALESCE(NULLIF(order_kind, ''), 'views'),
         event_key = COALESCE(NULLIF(event_key, ''), 'msg:' || message_id)
     WHERE canonical_message_id IS NULL
        OR event_type IS NULL
        OR event_type = ''
+       OR order_kind IS NULL
+       OR order_kind = ''
        OR event_key IS NULL
        OR event_key = ''
     '''
 )
+conn.execute("DROP INDEX IF EXISTS idx_boost_orders_unique_event")
 conn.execute(
     '''
     CREATE UNIQUE INDEX IF NOT EXISTS idx_boost_orders_unique_event
-    ON boost_orders(boost_channel_id, event_key, COALESCE(service_id, ''))
+    ON boost_orders(boost_channel_id, event_key, order_kind, COALESCE(service_id, ''))
     '''
 )
 print("  ✅ boost tables ready")

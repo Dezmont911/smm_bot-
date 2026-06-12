@@ -202,6 +202,12 @@ class Database:
                     enabled INTEGER NOT NULL DEFAULT 0,
                     quantity INTEGER,
                     service_id TEXT,
+                    reactions_enabled INTEGER NOT NULL DEFAULT 0,
+                    reactions_quantity INTEGER,
+                    reactions_quantity_min INTEGER,
+                    reactions_quantity_max INTEGER,
+                    reactions_quantity_display TEXT,
+                    reactions_service_id TEXT,
                     note TEXT,
                     last_seen_message_id INTEGER,
                     last_order_id TEXT,
@@ -219,6 +225,7 @@ class Database:
                     media_group_id TEXT,
                     canonical_message_id INTEGER,
                     event_type TEXT NOT NULL DEFAULT 'post',
+                    order_kind TEXT NOT NULL DEFAULT 'views',
                     post_url TEXT,
                     quantity INTEGER NOT NULL,
                     service_id TEXT,
@@ -242,7 +249,7 @@ class Database:
                     ON boost_orders(boost_channel_id, message_id);
 
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_boost_orders_unique_event
-                    ON boost_orders(boost_channel_id, event_key, COALESCE(service_id, ''));
+                    ON boost_orders(boost_channel_id, event_key, order_kind, COALESCE(service_id, ''));
 
                 -- --------------------------------------------------------
                 -- Индексы для быстрых запросов

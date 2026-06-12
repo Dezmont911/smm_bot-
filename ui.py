@@ -61,7 +61,10 @@ from boost_manager import (
     add_tracked_channel,
     add_tracked_channel_from_smm_channel,
     boost_configured,
+    boost_profile_configured,
+    boost_provider_profile,
     boost_real_orders_allowed,
+    boost_real_orders_allowed_for_owner,
     boost_status,
     delete_tracked_channel,
     find_tracked_channel_for_input,
@@ -76,6 +79,8 @@ from boost_manager import (
     set_boost_enabled,
     set_tracked_channel_enabled,
     set_tracked_channel_quantity,
+    set_tracked_channel_reactions,
+    is_boost_tester,
 )
 from views_monitor import (
     DEFAULT_FOLDER as VIEWS_MONITOR_DEFAULT_FOLDER,
@@ -155,15 +160,22 @@ def _set_admin_default_rsy_enabled(user_id: int, enabled: bool):
     _save_admin_settings(data)
 
 
-def _boost_mode_label() -> str:
+def _boost_mode_label(owner_id: int | None = None) -> str:
     settings = get_boost_settings()
-    if boost_real_orders_allowed(settings, cfg):
+    if boost_real_orders_allowed_for_owner(owner_id, settings, cfg):
         return "реальные заказы"
     return "тестовый режим"
 
 
-def _boost_real_order_hint(settings: dict) -> str:
-    if boost_real_orders_allowed(settings, cfg):
+def _boost_views_service_configured(settings: dict, owner_id: int | None = None) -> bool:
+    profile = boost_provider_profile(owner_id, cfg)
+    if profile.get("profile") == "tester":
+        return bool(profile.get("views_service_id"))
+    return bool(settings.get("default_service_id") or profile.get("views_service_id"))
+
+
+def _boost_real_order_hint(settings: dict, owner_id: int | None = None) -> str:
+    if boost_real_orders_allowed_for_owner(owner_id, settings, cfg):
         return "Реальные заказы включены. Новые публичные посты будут отправляться в TwiBoost."
 
     reasons = []
@@ -173,9 +185,9 @@ def _boost_real_order_hint(settings: dict) -> str:
         reasons.append("включен тестовый режим")
     if not getattr(cfg, "BOOST_REAL_ORDERS_ENABLED", False):
         reasons.append("реальные заказы не разрешены в настройках")
-    if not boost_configured(cfg):
+    if not boost_profile_configured(owner_id, cfg):
         reasons.append("TwiBoost API не настроен")
-    if not _boost_service_configured(settings):
+    if not _boost_views_service_configured(settings, owner_id):
         reasons.append("ID сервиса не настроен")
 
     reason_text = "; ".join(reasons) if reasons else "не выполнены условия безопасности"
@@ -189,12 +201,31 @@ def _boost_real_order_hint(settings: dict) -> str:
 BOOST_PICKER_PAGE_SIZE = 8
 
 
+def _can_use_boost(uid: int | None) -> bool:
+    return bool(uid is not None and (accounts.is_superadmin(uid) or is_boost_tester(uid, cfg)))
+
+
+def _boost_include_unowned(uid: int | None) -> bool:
+    return bool(uid is not None and accounts.is_superadmin(uid))
+
+
+def _boost_channel_access(ch: dict | None, uid: int | None) -> bool:
+    if not ch or uid is None:
+        return False
+    if accounts.is_superadmin(uid):
+        return ch.get("owner_id") in (None, uid)
+    return is_boost_tester(uid, cfg) and ch.get("owner_id") == uid
+
+
 def _clear_boost_pending(context: ContextTypes.DEFAULT_TYPE):
     for key in (
         "boost_add_channel",
         "boost_add_external_channel",
         "boost_add_smm_channel_id",
+        "boost_pending_create",
+        "boost_wait_reactions_quantity",
         "boost_set_quantity_for",
+        "boost_set_reactions_quantity_for",
     ):
         context.user_data.pop(key, None)
 
@@ -602,6 +633,8 @@ async def screen_main(qm, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("➕ Добавить канал",  callback_data="add_start")],
         [InlineKeyboardButton("❓ Помощь",          callback_data="ui:help")],
     ]
+    if _can_use_boost(_acting_uid(qm)) and not accounts.is_admin(_acting_uid(qm)):
+        rows.append([InlineKeyboardButton("🚀 Мой Boost", callback_data="ui:boost")])
     # Админ-панель: superadmin видит полную, остальные admin — облегчённую.
     if accounts.is_admin(_acting_uid(qm)):
         rows.append([InlineKeyboardButton("👑 Админ-панель", callback_data="ui:admin")])
@@ -4842,28 +4875,33 @@ async def screen_help_section(qm, context: ContextTypes.DEFAULT_TYPE, key: str):
 
 async def screen_boost_admin(qm, context: ContextTypes.DEFAULT_TYPE):
     uid = _acting_uid(qm)
-    if not accounts.is_superadmin(uid):
-        await qm.answer("Только для владельца.", show_alert=True)
+    if not _can_use_boost(uid):
+        await qm.answer("Boost недоступен.", show_alert=True)
         return
 
     settings = get_boost_settings()
-    channels = list_tracked_channels()
+    channels = list_tracked_channels(owner_id=uid, include_unowned=_boost_include_unowned(uid))
     enabled_count = sum(1 for ch in channels if ch.get("enabled"))
     global_state = _boost_onoff_label(bool(settings.get("boost_enabled")))
-    api_state = _boost_config_label(boost_configured(cfg))
-    service_state = _boost_config_label(_boost_service_configured(settings))
-    real_allowed = _boost_yesno_label(boost_real_orders_allowed(settings, cfg))
+    profile = boost_provider_profile(uid, cfg)
+    api_state = _boost_config_label(boost_profile_configured(uid, cfg))
+    service_state = _boost_config_label(_boost_views_service_configured(settings, uid))
+    reactions_service_state = _boost_config_label(bool(profile.get("reactions_service_id")))
+    real_allowed = _boost_yesno_label(boost_real_orders_allowed_for_owner(uid, settings, cfg))
+    status_code = "disabled" if not settings.get("boost_enabled") else "enabled" if boost_real_orders_allowed_for_owner(uid, settings, cfg) else "dry_run"
     global_hint = "\n\nБуст выключен глобально. Новые посты не обрабатываются." if not settings.get("boost_enabled") else ""
-    real_order_hint = _boost_real_order_hint(settings)
+    real_order_hint = _boost_real_order_hint(settings, uid)
+    title = "🚀 <b>Настройки Boost</b>" if accounts.is_superadmin(uid) else "🚀 <b>Мой Boost</b>"
 
     text = (
-        "🚀 <b>Настройки Boost</b>\n\n"
+        f"{title}\n\n"
         f"Boost: <b>{global_state}</b>\n"
-        f"Статус: <b>{_boost_status_label(boost_status(settings, cfg))}</b>\n"
-        f"Режим: <b>{_boost_mode_label()}</b>\n"
+        f"Статус: <b>{_boost_status_label(status_code)}</b>\n"
+        f"Режим: <b>{_boost_mode_label(uid)}</b>\n"
         f"Реальные заказы разрешены: <b>{real_allowed}</b>\n"
         f"TwiBoost API: <b>{api_state}</b>\n"
-        f"ID сервиса: <b>{service_state}</b>\n"
+        f"ID сервиса просмотров: <b>{service_state}</b>\n"
+        f"ID сервиса реакций: <b>{reactions_service_state}</b>\n"
         f"Количество по умолчанию: <b>{settings.get('default_quantity')}</b>\n"
         f"Отслеживаемые каналы: <b>{len(channels)}</b>\n"
         f"Включено каналов: <b>{enabled_count}</b>\n"
@@ -4871,23 +4909,25 @@ async def screen_boost_admin(qm, context: ContextTypes.DEFAULT_TYPE):
         f"{real_order_hint}"
         f"{global_hint}"
     )
-    rows = [
-        [InlineKeyboardButton(f"Глобальный Boost: {global_state}", callback_data="ui:boost_toggle")],
+    rows = []
+    if accounts.is_superadmin(uid):
+        rows.append([InlineKeyboardButton(f"Глобальный Boost: {global_state}", callback_data="ui:boost_toggle")])
+    rows.extend([
         [InlineKeyboardButton("➕ Добавить канал", callback_data="ui:boost_add")],
         [InlineKeyboardButton("📋 Список каналов", callback_data="ui:boost_channels")],
         [InlineKeyboardButton("🧾 Журнал событий", callback_data="ui:boost_events")],
-        [InlineKeyboardButton("◀️ В админ-панель", callback_data="ui:admin")],
-    ]
+    ])
+    rows.append([InlineKeyboardButton("◀️ В админ-панель" if accounts.is_admin(uid) else "◀️ В меню", callback_data="ui:admin" if accounts.is_admin(uid) else "ui:main")])
     await _answer_or_send(qm, text, InlineKeyboardMarkup(rows))
 
 
 async def screen_boost_channels(qm, context: ContextTypes.DEFAULT_TYPE):
     uid = _acting_uid(qm)
-    if not accounts.is_superadmin(uid):
-        await qm.answer("Только для владельца.", show_alert=True)
+    if not _can_use_boost(uid):
+        await qm.answer("Boost недоступен.", show_alert=True)
         return
 
-    channels = list_tracked_channels()
+    channels = list_tracked_channels(owner_id=uid, include_unowned=_boost_include_unowned(uid))
     rows = [
         [InlineKeyboardButton(_boost_channel_button_label(ch), callback_data=f"ui:boost_ch:{ch['id']}")]
         for ch in channels[:25]
@@ -4915,17 +4955,24 @@ def _boost_event_channel_name(event: dict) -> str:
 def _boost_event_line(event: dict) -> str:
     reason = event.get("reason_code") or event.get("error")
     reason_label = _boost_reason_label(reason)
-    range_display = event.get("channel_quantity_display")
-    quantity_line = f"{event.get('quantity')} просмотров"
+    order_kind = event.get("order_kind") or "views"
+    range_display = (
+        event.get("channel_reactions_quantity_display")
+        if order_kind == "reactions"
+        else event.get("channel_quantity_display")
+    )
+    unit = "реакций" if order_kind == "reactions" else "просмотров"
+    quantity_line = f"{event.get('quantity')} {unit}"
     if range_display and str(range_display) != str(event.get("quantity")):
-        quantity_line = f"{range_display} просмотров, выбрано: {event.get('quantity')}"
+        quantity_line = f"{range_display} {unit}, выбрано: {event.get('quantity')}"
+    kind_line = "Реакции" if order_kind == "reactions" else "Просмотры"
     status_line = f"Статус: {_boost_status_label(event.get('status'))}"
     if event.get("status") in ("ignored", "failed") and reason:
         status_line = f"Статус: {_boost_status_label(event.get('status'))}\nПричина: {html.escape(reason_label)}"
     link_line = f"Ссылка: {html.escape(str(event.get('post_url')))}" if event.get("post_url") else ""
     return (
         f"#{event.get('id')} · <b>{html.escape(_boost_event_channel_name(event))}</b>\n"
-        f"{_boost_event_type_label(event.get('event_type')).capitalize()} · сообщение <code>{event.get('message_id')}</code> · "
+        f"{kind_line} · {_boost_event_type_label(event.get('event_type')).capitalize()} · сообщение <code>{event.get('message_id')}</code> · "
         f"{html.escape(quantity_line)}\n"
         f"{status_line}\n"
         f"{link_line + chr(10) if link_line else ''}"
@@ -4935,11 +4982,20 @@ def _boost_event_line(event: dict) -> str:
 
 async def screen_boost_events(qm, context: ContextTypes.DEFAULT_TYPE, channel_id: int | None = None):
     uid = _acting_uid(qm)
-    if not accounts.is_superadmin(uid):
-        await qm.answer("Только для владельца.", show_alert=True)
+    if not _can_use_boost(uid):
+        await qm.answer("Boost недоступен.", show_alert=True)
+        return
+    if channel_id is not None and not _boost_channel_access(get_tracked_channel(channel_id), uid):
+        await qm.answer("Канал Boost не найден.", show_alert=True)
+        await screen_boost_channels(qm, context)
         return
 
-    events = list_boost_events(limit=10, boost_channel_id=channel_id)
+    events = list_boost_events(
+        limit=10,
+        boost_channel_id=channel_id,
+        owner_id=uid,
+        include_unowned=_boost_include_unowned(uid),
+    )
     if events:
         body = "\n\n".join(_boost_event_line(event) for event in events)
     else:
@@ -4956,8 +5012,8 @@ async def screen_boost_events(qm, context: ContextTypes.DEFAULT_TYPE, channel_id
 
 async def screen_boost_add_prompt(qm, context: ContextTypes.DEFAULT_TYPE):
     uid = _acting_uid(qm)
-    if not accounts.is_superadmin(uid):
-        await qm.answer("Только для владельца.", show_alert=True)
+    if not _can_use_boost(uid):
+        await qm.answer("Boost недоступен.", show_alert=True)
         return
     _clear_boost_pending(context)
     text = (
@@ -4976,8 +5032,8 @@ async def screen_boost_add_prompt(qm, context: ContextTypes.DEFAULT_TYPE):
 
 async def screen_boost_add_external_prompt(qm, context: ContextTypes.DEFAULT_TYPE):
     uid = _acting_uid(qm)
-    if not accounts.is_superadmin(uid):
-        await qm.answer("Только для владельца.", show_alert=True)
+    if not _can_use_boost(uid):
+        await qm.answer("Boost недоступен.", show_alert=True)
         return
     _clear_boost_pending(context)
     context.user_data["boost_add_channel"] = True
@@ -5013,7 +5069,7 @@ def _boost_smm_identity(ch: dict) -> str:
 
 
 def _boost_smm_button_label(ch: dict) -> str:
-    existing = find_tracked_channel_for_smm_channel(ch)
+    existing = find_tracked_channel_for_smm_channel(ch, owner_id=ch.get("owner_id"), include_unowned=ch.get("owner_id") is None)
     state = _boost_smm_state_label(existing)
     label = f"{_boost_smm_name(ch)} | {state}"
     return label[:60]
@@ -5021,8 +5077,8 @@ def _boost_smm_button_label(ch: dict) -> str:
 
 async def screen_boost_smm_picker(qm, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
     uid = _acting_uid(qm)
-    if not accounts.is_superadmin(uid):
-        await qm.answer("Только для владельца.", show_alert=True)
+    if not _can_use_boost(uid):
+        await qm.answer("Boost недоступен.", show_alert=True)
         return
     channels = _boost_smm_candidates(uid)
     total = len(channels)
@@ -5042,7 +5098,7 @@ async def screen_boost_smm_picker(qm, context: ContextTypes.DEFAULT_TYPE, page: 
     lines = [f"📋 <b>Из моих каналов</b> ({total}) · стр. {page + 1}/{pages}\n"]
     rows = []
     for idx, ch in enumerate(chunk):
-        existing = find_tracked_channel_for_smm_channel(ch)
+        existing = find_tracked_channel_for_smm_channel(ch, owner_id=ch.get("owner_id"), include_unowned=_boost_include_unowned(uid))
         status = _boost_smm_state_label(existing)
         lines.append(
             f"{idx + 1}. <b>{html.escape(_boost_smm_name(ch))}</b>\n"
@@ -5063,8 +5119,8 @@ async def screen_boost_smm_picker(qm, context: ContextTypes.DEFAULT_TYPE, page: 
 
 async def action_boost_pick_smm_channel(qm, context: ContextTypes.DEFAULT_TYPE, page: int, index: int):
     uid = _acting_uid(qm)
-    if not accounts.is_superadmin(uid):
-        await qm.answer("Только для владельца.", show_alert=True)
+    if not _can_use_boost(uid):
+        await qm.answer("Boost недоступен.", show_alert=True)
         return
     channels = _boost_smm_candidates(uid)
     offset = int(page) * BOOST_PICKER_PAGE_SIZE + int(index)
@@ -5074,7 +5130,7 @@ async def action_boost_pick_smm_channel(qm, context: ContextTypes.DEFAULT_TYPE, 
         return
 
     ch = channels[offset]
-    existing = find_tracked_channel_for_smm_channel(ch)
+    existing = find_tracked_channel_for_smm_channel(ch, owner_id=ch.get("owner_id"), include_unowned=_boost_include_unowned(uid))
     if existing:
         linked = link_tracked_channel_to_smm_channel(existing["id"], ch, owner_id=ch.get("owner_id"))
         await qm.answer("Уже добавлен в Boost.")
@@ -5114,17 +5170,23 @@ def _boost_channel_button_label(ch: dict) -> str:
 
 async def screen_boost_channel_detail(qm, context: ContextTypes.DEFAULT_TYPE, channel_id: int):
     uid = _acting_uid(qm)
-    if not accounts.is_superadmin(uid):
-        await qm.answer("Только для владельца.", show_alert=True)
+    if not _can_use_boost(uid):
+        await qm.answer("Boost недоступен.", show_alert=True)
         return
     ch = get_tracked_channel(channel_id)
-    if not ch:
+    if not _boost_channel_access(ch, uid):
         await qm.answer("Канал Boost не найден.", show_alert=True)
         await screen_boost_channels(qm, context)
         return
 
     linked = _boost_link_label(ch.get("smm_channel_id"))
-    service_state = _boost_config_label(bool(ch.get("service_id") or _boost_service_configured()))
+    profile = boost_provider_profile(ch.get("owner_id"), cfg)
+    if profile.get("profile") == "tester":
+        service_state = _boost_config_label(bool(ch.get("service_id") or profile.get("views_service_id")))
+    else:
+        service_state = _boost_config_label(bool(ch.get("service_id") or profile.get("views_service_id") or _boost_service_configured()))
+    reactions_state = _boost_onoff_label(bool(ch.get("reactions_enabled")))
+    reactions_qty = ch.get("reactions_quantity_display") or "не задано"
     public_state = "есть" if ch.get("username") else "нет"
     disabled_hint = "\n\n⚠️ Канал выключен. Новые посты не обрабатываются." if not ch.get("enabled") else ""
     text = (
@@ -5133,6 +5195,8 @@ async def screen_boost_channel_detail(qm, context: ContextTypes.DEFAULT_TYPE, ch
         f"Связь с smm_bot: <b>{html.escape(str(linked))}</b>\n"
         f"Состояние: <b>{_boost_onoff_label(bool(ch.get('enabled')))}</b>\n"
         f"Количество: <b>{_boost_quantity_display(ch)}</b>\n"
+        f"Реакции: <b>{reactions_state}</b>\n"
+        f"Количество реакций: <b>{html.escape(str(reactions_qty))}</b>\n"
         f"ID сервиса: <b>{service_state}</b>\n"
         f"Публичная ссылка: <b>{public_state}</b>\n"
         f"Название: <b>{html.escape(_boost_none_label(ch.get('title')))}</b>\n"
@@ -5145,6 +5209,8 @@ async def screen_boost_channel_detail(qm, context: ContextTypes.DEFAULT_TYPE, ch
     rows = [
         [InlineKeyboardButton(f"Состояние: {next_state}", callback_data=f"ui:boost_ch_tgl:{ch['id']}")],
         [InlineKeyboardButton("✏️ Изменить количество", callback_data=f"ui:boost_ch_qty:{ch['id']}")],
+        [InlineKeyboardButton(f"⚡ Реакции: {_boost_onoff_label(not bool(ch.get('reactions_enabled')))}", callback_data=f"ui:boost_ch_react_tgl:{ch['id']}")],
+        [InlineKeyboardButton("✏️ Изменить реакции", callback_data=f"ui:boost_ch_react_qty:{ch['id']}")],
         [InlineKeyboardButton("🧾 Журнал канала", callback_data=f"ui:boost_ch_events:{ch['id']}")],
         [InlineKeyboardButton("Удалить", callback_data=f"ui:boost_ch_del:{ch['id']}")],
         [InlineKeyboardButton("◀️ К списку", callback_data="ui:boost_channels")],
@@ -5154,11 +5220,11 @@ async def screen_boost_channel_detail(qm, context: ContextTypes.DEFAULT_TYPE, ch
 
 async def screen_boost_delete_confirm(qm, context: ContextTypes.DEFAULT_TYPE, channel_id: int):
     uid = _acting_uid(qm)
-    if not accounts.is_superadmin(uid):
-        await qm.answer("Только для владельца.", show_alert=True)
+    if not _can_use_boost(uid):
+        await qm.answer("Boost недоступен.", show_alert=True)
         return
     ch = get_tracked_channel(channel_id)
-    if not ch:
+    if not _boost_channel_access(ch, uid):
         await qm.answer("Канал Boost не найден.", show_alert=True)
         await screen_boost_channels(qm, context)
         return
@@ -5173,9 +5239,72 @@ async def screen_boost_delete_confirm(qm, context: ContextTypes.DEFAULT_TYPE, ch
     await _answer_or_send(qm, text, InlineKeyboardMarkup(rows))
 
 
+async def _finish_boost_pending_create(update: Update, context: ContextTypes.DEFAULT_TYPE, reactions_quantity: str | None):
+    user = getattr(update, "effective_user", None) or getattr(update, "from_user", None)
+    if user is None:
+        return True
+    target = getattr(update, "message", None) or update
+    pending = context.user_data.get("boost_pending_create") or {}
+    views_quantity = pending.get("views_quantity")
+    reactions_enabled = reactions_quantity is not None
+    try:
+        if reactions_quantity is not None:
+            reactions_quantity = parse_boost_quantity(reactions_quantity, min_quantity=1)["quantity_display"]
+    except ValueError:
+        await _answer_or_send(target, "❌ Некорректное количество реакций. Используйте число 10 или диапазон 10-20.", None)
+        return True
+
+    kind = pending.get("kind")
+    if kind == "smm":
+        smm_channel_id = pending.get("smm_channel_id")
+        channels = _boost_smm_candidates(user.id)
+        smm_ch = next((c for c in channels if c.get("channel_id") == smm_channel_id), None)
+        if not smm_ch:
+            _clear_boost_pending(context)
+            await _answer_or_send(target, "❌ Канал больше не доступен в твоём scope.", None)
+            return True
+        ch, created = add_tracked_channel_from_smm_channel(
+            smm_ch,
+            owner_id=smm_ch.get("owner_id"),
+            quantity=views_quantity,
+            reactions_enabled=reactions_enabled,
+            reactions_quantity=reactions_quantity,
+            enabled=False,
+        )
+    elif kind == "external":
+        raw_channel = pending.get("raw_channel")
+        ch = add_tracked_channel(
+            raw_channel,
+            owner_id=user.id,
+            quantity=views_quantity,
+            reactions_enabled=reactions_enabled,
+            reactions_quantity=reactions_quantity,
+            enabled=False,
+        )
+        created = True
+    else:
+        _clear_boost_pending(context)
+        await _answer_or_send(target, "❌ Сценарий добавления Boost устарел. Начни заново.", None)
+        return True
+
+    _clear_boost_pending(context)
+    reactions_line = f"\nРеакции: {'вкл, ' + reactions_quantity if reactions_enabled else 'выкл'}"
+    await _answer_or_send(
+        target,
+        (
+            f"{'✅ Канал Boost добавлен' if created else 'ℹ️ Этот канал уже добавлен в Boost'}: "
+            f"<b>{html.escape(_boost_channel_name(ch))}</b>\n"
+            f"Просмотры: <b>{html.escape(str(views_quantity))}</b>{html.escape(reactions_line)}\n"
+            "Сейчас он выключен. Включи его в карточке Boost."
+        ),
+        InlineKeyboardMarkup([[InlineKeyboardButton("Открыть карточку", callback_data=f"ui:boost_ch:{ch['id']}")]]),
+    )
+    return True
+
+
 async def handle_boost_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
-    if user is None or not accounts.is_superadmin(user.id):
+    if user is None or not _can_use_boost(user.id):
         return False
 
     smm_channel_id = context.user_data.get("boost_add_smm_channel_id")
@@ -5194,23 +5323,19 @@ async def handle_boost_text_input(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text("❌ Канал больше не доступен в твоём scope.")
             return True
 
-        boost_owner_id = smm_ch.get("owner_id")
-        ch, created = add_tracked_channel_from_smm_channel(
-            smm_ch,
-            owner_id=boost_owner_id,
-            quantity=quantity,
-            enabled=False,
-        )
-        _clear_boost_pending(context)
+        context.user_data.pop("boost_add_smm_channel_id", None)
+        context.user_data["boost_pending_create"] = {
+            "kind": "smm",
+            "smm_channel_id": smm_channel_id,
+            "views_quantity": quantity,
+        }
         await update.message.reply_text(
-            (
-                f"{'✅ Канал Boost добавлен' if created else 'ℹ️ Этот канал уже добавлен в Boost'}: "
-                f"<b>{html.escape(_boost_channel_name(ch))}</b>\n"
-                "Сейчас он выключен. Включи его в карточке канала Boost."
-            ),
-            parse_mode=ParseMode.HTML,
+            "Включить реакции для этого канала?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Да, включить", callback_data="ui:boost_react_yes")],
+                [InlineKeyboardButton("Нет, только просмотры", callback_data="ui:boost_react_no")],
+            ]),
         )
-        await screen_boost_channel_detail(update.message, context, int(ch["id"]))
         return True
 
     external_raw = context.user_data.get("boost_add_external_channel")
@@ -5218,17 +5343,22 @@ async def handle_boost_text_input(update: Update, context: ContextTypes.DEFAULT_
         raw = (update.message.text or "").strip()
         try:
             quantity = parse_boost_quantity(raw)["quantity_display"]
-            ch = add_tracked_channel(external_raw, owner_id=user.id, quantity=quantity, enabled=False)
         except ValueError:
             await update.message.reply_text("❌ Минимальное количество просмотров — 500. Используйте число 500 или диапазон 500-550.")
             return True
-        _clear_boost_pending(context)
+        context.user_data.pop("boost_add_external_channel", None)
+        context.user_data["boost_pending_create"] = {
+            "kind": "external",
+            "raw_channel": external_raw,
+            "views_quantity": quantity,
+        }
         await update.message.reply_text(
-            f"✅ Канал Boost добавлен: <b>{html.escape(_boost_channel_name(ch))}</b>\n"
-            "Сейчас он выключен. Включи его в списке каналов.",
-            parse_mode=ParseMode.HTML,
+            "Включить реакции для этого канала?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Да, включить", callback_data="ui:boost_react_yes")],
+                [InlineKeyboardButton("Нет, только просмотры", callback_data="ui:boost_react_no")],
+            ]),
         )
-        await screen_boost_channel_detail(update.message, context, int(ch["id"]))
         return True
 
     if context.user_data.get("boost_add_channel"):
@@ -5238,7 +5368,7 @@ async def handle_boost_text_input(update: Update, context: ContextTypes.DEFAULT_
         except ValueError:
             await update.message.reply_text("❌ Не понял канал. Пришли @username, t.me/channel или numeric chat_id.")
             return True
-        existing = find_tracked_channel_for_input(raw)
+        existing = find_tracked_channel_for_input(raw, owner_id=user.id, include_unowned=_boost_include_unowned(user.id))
         if existing:
             _clear_boost_pending(context)
             await update.message.reply_text(
@@ -5260,6 +5390,11 @@ async def handle_boost_text_input(update: Update, context: ContextTypes.DEFAULT_
 
     qty_channel_id = context.user_data.get("boost_set_quantity_for")
     if qty_channel_id is not None:
+        ch0 = get_tracked_channel(int(qty_channel_id))
+        if not _boost_channel_access(ch0, user.id):
+            _clear_boost_pending(context)
+            await update.message.reply_text("❌ Канал Boost не найден.")
+            return True
         raw = (update.message.text or "").strip()
         try:
             quantity = parse_boost_quantity(raw)["quantity_display"]
@@ -5274,6 +5409,32 @@ async def handle_boost_text_input(update: Update, context: ContextTypes.DEFAULT_
         )
         await screen_boost_channel_detail(update.message, context, int(qty_channel_id))
         return True
+
+    reaction_qty_channel_id = context.user_data.get("boost_set_reactions_quantity_for")
+    if reaction_qty_channel_id is not None:
+        ch0 = get_tracked_channel(int(reaction_qty_channel_id))
+        if not _boost_channel_access(ch0, user.id):
+            _clear_boost_pending(context)
+            await update.message.reply_text("❌ Канал Boost не найден.")
+            return True
+        raw = (update.message.text or "").strip()
+        try:
+            quantity = parse_boost_quantity(raw, min_quantity=1)["quantity_display"]
+            ch = set_tracked_channel_reactions(int(reaction_qty_channel_id), True, quantity)
+        except (TypeError, ValueError):
+            await update.message.reply_text("❌ Некорректное количество реакций. Используйте число 10 или диапазон 10-20.")
+            return True
+        context.user_data.pop("boost_set_reactions_quantity_for", None)
+        await update.message.reply_text(
+            f"✅ Реакции обновлены: <b>{html.escape(str(ch.get('reactions_quantity_display') or quantity))}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        await screen_boost_channel_detail(update.message, context, int(reaction_qty_channel_id))
+        return True
+
+    if context.user_data.get("boost_wait_reactions_quantity"):
+        raw = (update.message.text or "").strip()
+        return await _finish_boost_pending_create(update, context, raw)
 
     return False
 
@@ -5842,7 +6003,7 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         return
 
-    if any(key.startswith("boost_") for key in context.user_data):
+    if not action.startswith("boost") and any(key.startswith("boost_") for key in context.user_data):
         _clear_boost_pending(context)
 
     # 👑 Админ-действия: часть доступна всем admin из env, опасные/глобальные — только superadmin.
@@ -5851,7 +6012,8 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "adm_views", "adm_views_check", "adm_views_tgl", "adm_views_folders", "adm_viewsfold",
         "boost", "boost_toggle", "boost_add", "boost_add_mine", "boost_add_ext", "boost_pick",
         "boost_channels", "boost_events", "boost_ch", "boost_ch_events", "boost_ch_tgl", "boost_ch_qty",
-        "boost_ch_del", "boost_ch_del_ok",
+        "boost_ch_react_tgl", "boost_ch_react_qty", "boost_ch_del", "boost_ch_del_ok",
+        "boost_react_yes", "boost_react_no",
         "adm_rsy_default", "adm_del_my_chans", "adm_del_my_chans_ok",
     }
     _LIMITED_ADMIN_ACTIONS = {
@@ -5860,11 +6022,20 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "adm_rsy_default", "adm_del_my_chans", "adm_del_my_chans_ok",
     }
     if action in _ADMIN_ACTIONS:
-        if not accounts.is_admin(uid):
-            await query.answer("Только для админа.", show_alert=True)
-            return
-        if action not in _LIMITED_ADMIN_ACTIONS and not accounts.is_superadmin(uid):
-            await query.answer("Эта кнопка доступна только владельцу.", show_alert=True)
+        is_boost_action = action.startswith("boost")
+        if is_boost_action:
+            if not _can_use_boost(uid):
+                await query.answer("Boost недоступен.", show_alert=True)
+                return
+        else:
+            if not accounts.is_admin(uid):
+                await query.answer("Только для админа.", show_alert=True)
+                return
+            if action not in _LIMITED_ADMIN_ACTIONS and not accounts.is_superadmin(uid):
+                await query.answer("Эта кнопка доступна только владельцу.", show_alert=True)
+                return
+        if action == "boost_toggle" and not accounts.is_superadmin(uid):
+            await query.answer("Глобальный Boost доступен только владельцу.", show_alert=True)
             return
         if action == "admin":
             await screen_admin(query, context)
@@ -5913,6 +6084,16 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await screen_boost_smm_picker(query, context, page)
         elif action == "boost_add_ext":
             await screen_boost_add_external_prompt(query, context)
+        elif action == "boost_react_no":
+            await query.answer()
+            await _finish_boost_pending_create(query, context, None)
+        elif action == "boost_react_yes":
+            context.user_data["boost_wait_reactions_quantity"] = True
+            await query.answer()
+            await query.edit_message_text(
+                "Введите количество реакций: например 10 или диапазон 10-20.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Нет, только просмотры", callback_data="ui:boost_react_no")]]),
+            )
         elif action == "boost_pick" and len(parts) >= 4 and parts[2].isdigit() and parts[3].isdigit():
             await action_boost_pick_smm_channel(query, context, int(parts[2]), int(parts[3]))
         elif action == "boost_channels":
@@ -5925,22 +6106,57 @@ async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await screen_boost_events(query, context, int(parts[2]))
         elif action == "boost_ch_tgl" and len(parts) >= 3 and parts[2].isdigit():
             ch = get_tracked_channel(int(parts[2]))
-            if not ch:
+            if not _boost_channel_access(ch, uid):
                 await query.answer("Канал Boost не найден.", show_alert=True)
                 return
             set_tracked_channel_enabled(int(parts[2]), not bool(ch.get("enabled")))
             await query.answer("Обновлено.")
             await screen_boost_channel_detail(query, context, int(parts[2]))
         elif action == "boost_ch_qty" and len(parts) >= 3 and parts[2].isdigit():
+            ch = get_tracked_channel(int(parts[2]))
+            if not _boost_channel_access(ch, uid):
+                await query.answer("Канал Boost не найден.", show_alert=True)
+                return
             context.user_data["boost_set_quantity_for"] = int(parts[2])
             await query.answer()
             await query.edit_message_text(
                 "Введите количество просмотров: например 500 или диапазон 500-550.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"ui:boost_ch:{parts[2]}")]]),
             )
+        elif action == "boost_ch_react_tgl" and len(parts) >= 3 and parts[2].isdigit():
+            ch = get_tracked_channel(int(parts[2]))
+            if not _boost_channel_access(ch, uid):
+                await query.answer("Канал Boost не найден.", show_alert=True)
+                return
+            if not bool(ch.get("reactions_enabled")) and not ch.get("reactions_quantity_display"):
+                context.user_data["boost_set_reactions_quantity_for"] = int(parts[2])
+                await query.answer()
+                await query.edit_message_text(
+                    "Введите количество реакций: например 10 или диапазон 10-20.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"ui:boost_ch:{parts[2]}")]]),
+                )
+                return
+            set_tracked_channel_reactions(int(parts[2]), not bool(ch.get("reactions_enabled")))
+            await query.answer("Обновлено.")
+            await screen_boost_channel_detail(query, context, int(parts[2]))
+        elif action == "boost_ch_react_qty" and len(parts) >= 3 and parts[2].isdigit():
+            ch = get_tracked_channel(int(parts[2]))
+            if not _boost_channel_access(ch, uid):
+                await query.answer("Канал Boost не найден.", show_alert=True)
+                return
+            context.user_data["boost_set_reactions_quantity_for"] = int(parts[2])
+            await query.answer()
+            await query.edit_message_text(
+                "Введите количество реакций: например 10 или диапазон 10-20.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"ui:boost_ch:{parts[2]}")]]),
+            )
         elif action == "boost_ch_del" and len(parts) >= 3 and parts[2].isdigit():
             await screen_boost_delete_confirm(query, context, int(parts[2]))
         elif action == "boost_ch_del_ok" and len(parts) >= 3 and parts[2].isdigit():
+            ch = get_tracked_channel(int(parts[2]))
+            if not _boost_channel_access(ch, uid):
+                await query.answer("Канал Boost не найден.", show_alert=True)
+                return
             try:
                 deleted = delete_tracked_channel(int(parts[2]))
             except Exception as e:
