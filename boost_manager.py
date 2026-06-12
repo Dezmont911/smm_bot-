@@ -1727,22 +1727,12 @@ async def handle_boost_channel_post_dry_run(
                     database=database,
                 )
             else:
-                if hasattr(wrapper, "create_auto_reactions_order"):
-                    reaction_result = await wrapper.create_auto_reactions_order(
-                        post_url_result["post_url"] or "",
-                        reaction_spec["quantity_min"],
-                        reaction_spec["quantity_max"],
-                        reaction_service_id,
-                        posts=1,
-                        dry_run=dry_run,
-                    )
-                else:
-                    reaction_result = await wrapper.create_views_order(
-                        post_url_result["post_url"] or "",
-                        reaction_quantity,
-                        reaction_service_id,
-                        dry_run=dry_run,
-                    )
+                reaction_result = await wrapper.create_views_order(
+                    post_url_result["post_url"] or "",
+                    reaction_quantity,
+                    reaction_service_id,
+                    dry_run=dry_run,
+                )
                 reaction_error = reaction_result.get("error")
                 reaction_provider_order_id = reaction_result.get("order") or reaction_result.get("order_id")
                 reaction_status = BOOST_STATUS_DRY_RUN if dry_run else BOOST_STATUS_ORDERED
@@ -1853,41 +1843,6 @@ class TwiBoostClientWrapper:
         qty = int(quantity or getattr(self.config, "BOOST_DEFAULT_QUANTITY", 500) or 500)
         svc = _service_id_int(service_id or self.service_id)
         payload = {"action": "add", "service": svc, "link": post_url, "quantity": qty}
-        configured_for_order = bool(self.api_key and self.api_url and svc > 0)
-
-        if dry_run:
-            return {
-                "dry_run": True,
-                "would_create_order": configured_for_order,
-                "configured": configured_for_order,
-                "request": payload,
-                **({} if configured_for_order else {"error": "twiboost_not_configured"}),
-            }
-        if not configured_for_order:
-            return {"error": "twiboost_not_configured", "configured": False}
-        return await self._request(payload)
-
-    async def create_auto_reactions_order(
-        self,
-        post_url: str,
-        min_quantity: int,
-        max_quantity: int,
-        service_id: int | str | None = None,
-        posts: int = 1,
-        dry_run: bool = True,
-    ) -> dict:
-        svc = _service_id_int(service_id or self.service_id)
-        min_qty = max(1, int(min_quantity or 1))
-        max_qty = max(min_qty, int(max_quantity or min_qty))
-        post_count = max(1, int(posts or 1))
-        payload = {
-            "action": "add",
-            "service": svc,
-            "link": post_url,
-            "posts": post_count,
-            "min": min_qty,
-            "max": max_qty,
-        }
         configured_for_order = bool(self.api_key and self.api_url and svc > 0)
 
         if dry_run:
