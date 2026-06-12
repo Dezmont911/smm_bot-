@@ -19,6 +19,7 @@ REMOTE_BASE = "/opt/smm_bot"
 
 FILES = [
     "check_twiboost.py",
+    "check_boost_runtime.py",
     "bot.py",
     "ai_client.py",       # ВАЖНО: тут async-клиент, детектор мета-ответов, санитизация, стиль
     "config.py",
