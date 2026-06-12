@@ -266,6 +266,20 @@ class ContentGenerator:
                     content_brief=content_brief,
                 )
 
+                pre_validation = validate_generated_post(channel, post, safety, content_brief)
+                logger.info(
+                    f"Output pre-validation [{channel_id}]: decision={pre_validation.get('decision')} "
+                    f"reason={pre_validation.get('reason_code')}"
+                )
+                if not pre_validation.get("allowed"):
+                    skipped += 1
+                    await self._log_error(
+                        channel_id,
+                        "generation_validation",
+                        f"{pre_validation.get('reason_code')}: {pre_validation.get('notes', '')}",
+                    )
+                    continue
+
                 # ── Выбор картинки по image_source ─────────────────────────
                 # image_source в карточке канала — ЕДИНСТВЕННОЕ правило:
                 #   "rss"        — только из RSS-статьи, иначе без картинки

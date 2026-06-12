@@ -169,6 +169,19 @@ _META_TAIL_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+_FRAGMENTED_GENERATION_RE = re.compile(
+    r"^\s*(?:please|sure|okay)[\s.!:,-]+(?:---+\s*)?\d{1,2}\s*/\s*\d{1,2}\s*[\.)]",
+    re.IGNORECASE,
+)
+_NUMBERED_VARIANT_RE = re.compile(r"^\s*\d{1,2}\s*/\s*\d{1,2}\s*[\.)]\s+\S")
+
+
+def _looks_like_fragmented_generation(content: str) -> bool:
+    if not content:
+        return False
+    head = content[:300].strip()
+    return bool(_FRAGMENTED_GENERATION_RE.search(head) or _NUMBERED_VARIANT_RE.search(head))
+
 
 def _clean_post_output(content: str) -> str:
     """Срезает безобидную ведущую преамбулу («Вот пост:», «Конечно!») и обрамляющие
@@ -199,6 +212,8 @@ def _looks_like_refusal(content: str) -> bool:
         return True
     head = content[:500].lower()
     if any(marker in head for marker in _REFUSAL_MARKERS):
+        return True
+    if _looks_like_fragmented_generation(content):
         return True
     full = content.lower()
     if "---" in full and any(s in full for s in (

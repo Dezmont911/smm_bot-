@@ -200,6 +200,26 @@ class ContentSafetyTest(unittest.TestCase):
         self.assertFalse(validation["allowed"])
         self.assertEqual(validation["reason_code"], "meta_or_refusal_output")
 
+    def test_output_validator_rejects_fragmented_numbered_variant(self):
+        channel = {
+            "channel_id": "@cs2skinss2025",
+            "topic": "CS2 skins and esports",
+            "archetype": "gaming_esports",
+            "channel_type": "content",
+        }
+        safety_and_brief = dry_run_topic(
+            channel,
+            "IEM Cologne Major 2026 Pick'Em Challenge Megathread",
+        )
+        validation = validate_generated_post(
+            channel,
+            {"content": "Please\n\n---\n\n3/5. Pick'Em - how to guess favorites and outsiders"},
+            safety_and_brief["safety"],
+            safety_and_brief["content_brief"],
+        )
+        self.assertFalse(validation["allowed"])
+        self.assertEqual(validation["reason_code"], "meta_or_refusal_output")
+
     def test_output_validator_allows_normal_i_cannot_phrase(self):
         safety_and_brief = dry_run_topic(
             ROBO_CHANNEL,

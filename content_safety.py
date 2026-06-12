@@ -298,10 +298,26 @@ def is_kids_education_channel(channel: dict) -> bool:
     return sum(1 for marker in KIDS_EDU_PROFILE_MARKERS if marker in profile) >= 2
 
 
+_FRAGMENTED_GENERATION_RE = re.compile(
+    r"^\s*(?:please|sure|okay)[\s.!:,-]+(?:---+\s*)?\d{1,2}\s*/\s*\d{1,2}\s*[\.)]",
+    re.IGNORECASE,
+)
+_NUMBERED_VARIANT_RE = re.compile(r"^\s*\d{1,2}\s*/\s*\d{1,2}\s*[\.)]\s+\S")
+
+
+def _looks_like_fragmented_generation(text: str) -> bool:
+    if not text:
+        return False
+    head = text[:300].strip()
+    return bool(_FRAGMENTED_GENERATION_RE.search(head) or _NUMBERED_VARIANT_RE.search(head))
+
+
 def _looks_like_refusal(text: str) -> bool:
     low = _low(text)
     head = low[:700].lstrip(" \"'«»“”")
     if any(head.startswith(marker) for marker in REFUSAL_START_MARKERS):
+        return True
+    if _looks_like_fragmented_generation(text):
         return True
     return any(marker in head for marker in META_REFUSAL_MARKERS + REFERENCE_META_OUTPUT_MARKERS)
 

@@ -49,6 +49,14 @@ class AiClientHardeningTest(unittest.IsolatedAsyncioTestCase):
             "Если нужен исходный текст, пришлите ссылку и я перепишу пост."
         ))
 
+    async def test_refusal_markers_reject_fragmented_numbered_variant(self):
+        self.assertTrue(ai_client._looks_like_refusal(
+            "Please\n\n---\n\n3/5. Pick'Em - how to guess favorites and outsiders"
+        ))
+        self.assertTrue(ai_client._looks_like_refusal(
+            "3/5. Pick'Em - how to guess favorites and outsiders"
+        ))
+
     async def test_clean_post_output_strips_tail_explanation(self):
         text = (
             "Полезная находка для дома: органайзер помогает держать вещи под рукой.\n\n"
