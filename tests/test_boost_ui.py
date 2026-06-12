@@ -260,6 +260,75 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(line.count(reason), 1)
         self.assertNotIn("no_public_post_url", line)
 
+    def test_boost_global_readiness_text_explains_blockers(self):
+        settings = {"boost_enabled": False, "default_service_id": None}
+
+        with patch.object(ui.cfg, "BOOST_DRY_RUN", True), \
+                patch.object(ui.cfg, "BOOST_REAL_ORDERS_ENABLED", False), \
+                patch.object(ui, "boost_profile_configured", return_value=False), \
+                patch.object(ui, "_boost_views_service_configured", return_value=False):
+            text = ui._boost_global_readiness_text(settings, 733891104)
+
+        self.assertIn("реальные заказы сейчас не уйдут", text)
+        self.assertIn("глобальный Boost выключен", text)
+        self.assertIn("TwiBoost API не настроен", text)
+        self.assertIn("ID сервиса просмотров не настроен", text)
+
+    def test_boost_channel_readiness_text_says_when_channel_will_work(self):
+        settings = {"boost_enabled": True, "default_service_id": None}
+        channel = {
+            "owner_id": 733891104,
+            "enabled": True,
+            "username": "tester_channel",
+            "service_id": None,
+        }
+
+        with patch.object(ui.cfg, "BOOST_DRY_RUN", False), \
+                patch.object(ui.cfg, "BOOST_REAL_ORDERS_ENABLED", True), \
+                patch.object(ui, "boost_profile_configured", return_value=True), \
+                patch.object(ui, "_boost_views_service_configured", return_value=True), \
+                patch.object(ui, "boost_provider_profile", return_value={"profile": "tester", "views_service_id": 4702}):
+            text = ui._boost_channel_readiness_text(channel, settings)
+
+        self.assertIn("будет работать", text)
+        self.assertIn("Новый публичный пост уйдёт в TwiBoost", text)
+
+    async def test_boost_channel_detail_shows_actionable_readiness(self):
+        captured = {}
+        settings = {"boost_enabled": True, "default_service_id": None}
+        channel = {
+            "id": 7,
+            "owner_id": 733891104,
+            "enabled": True,
+            "username": "tester_channel",
+            "service_id": None,
+            "quantity_display": "500",
+            "reactions_enabled": False,
+            "smm_channel_id": "@tester_channel",
+            "title": "Tester",
+            "last_seen_message_id": None,
+            "last_order_id": None,
+            "last_error": None,
+        }
+
+        async def fake_answer_or_send(qm, text, kb):
+            captured["text"] = text
+
+        with patch.object(ui.accounts, "is_superadmin", return_value=False), \
+                patch.object(ui, "is_boost_tester", return_value=True), \
+                patch.object(ui, "get_tracked_channel", return_value=channel), \
+                patch.object(ui, "get_boost_settings", return_value=settings), \
+                patch.object(ui.cfg, "BOOST_DRY_RUN", False), \
+                patch.object(ui.cfg, "BOOST_REAL_ORDERS_ENABLED", True), \
+                patch.object(ui, "boost_profile_configured", return_value=True), \
+                patch.object(ui, "_boost_views_service_configured", return_value=True), \
+                patch.object(ui, "boost_provider_profile", return_value={"profile": "tester", "views_service_id": 4702, "reactions_service_id": 3303}), \
+                patch.object(ui, "_answer_or_send", side_effect=fake_answer_or_send):
+            await ui.screen_boost_channel_detail(FakeQuery(733891104), SimpleNamespace(user_data={}), 7)
+
+        self.assertIn("Итог по каналу", captured["text"])
+        self.assertIn("будет работать", captured["text"])
+
     async def test_channel_settings_has_no_boost_buttons(self):
         captured = {}
         channel = {

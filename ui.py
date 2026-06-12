@@ -199,6 +199,60 @@ def _boost_real_order_hint(settings: dict, owner_id: int | None = None) -> str:
     )
 
 
+def _boost_global_blockers(settings: dict, owner_id: int | None = None) -> list[str]:
+    blockers = []
+    if not settings.get("boost_enabled"):
+        blockers.append("глобальный Boost выключен")
+    if getattr(cfg, "BOOST_DRY_RUN", True):
+        blockers.append("включён тестовый режим BOOST_DRY_RUN")
+    if not getattr(cfg, "BOOST_REAL_ORDERS_ENABLED", False):
+        blockers.append("реальные заказы запрещены BOOST_REAL_ORDERS_ENABLED")
+    if not boost_profile_configured(owner_id, cfg):
+        blockers.append("TwiBoost API не настроен")
+    if not _boost_views_service_configured(settings, owner_id):
+        blockers.append("ID сервиса просмотров не настроен")
+    return blockers
+
+
+def _boost_channel_blockers(ch: dict, settings: dict) -> list[str]:
+    blockers = _boost_global_blockers(settings, ch.get("owner_id"))
+    profile = boost_provider_profile(ch.get("owner_id"), cfg)
+    if not ch.get("enabled"):
+        blockers.append("канал Boost выключен")
+    if not ch.get("username"):
+        blockers.append("нет публичной ссылки на канал")
+    service_id = ch.get("service_id") or profile.get("views_service_id")
+    if profile.get("profile") != "tester":
+        service_id = service_id or settings.get("default_service_id")
+    if not service_id:
+        blockers.append("ID сервиса просмотров для канала не настроен")
+    return blockers
+
+
+def _boost_blockers_text(blockers: list[str]) -> str:
+    return "\n".join(f"• {html.escape(str(reason))}" for reason in blockers)
+
+
+def _boost_global_readiness_text(settings: dict, owner_id: int | None = None) -> str:
+    blockers = _boost_global_blockers(settings, owner_id)
+    if not blockers:
+        return "✅ <b>Итог:</b> Boost готов. Новые публичные посты во включённых каналах будут уходить в TwiBoost."
+    return (
+        "❌ <b>Итог:</b> реальные заказы сейчас не уйдут.\n"
+        f"{_boost_blockers_text(blockers)}"
+    )
+
+
+def _boost_channel_readiness_text(ch: dict, settings: dict) -> str:
+    blockers = _boost_channel_blockers(ch, settings)
+    if not blockers:
+        return "✅ <b>Итог по каналу:</b> будет работать. Новый публичный пост уйдёт в TwiBoost."
+    return (
+        "❌ <b>Итог по каналу:</b> не будет отправлять новые посты в TwiBoost.\n"
+        f"{_boost_blockers_text(blockers)}"
+    )
+
+
 BOOST_PICKER_PAGE_SIZE = 8
 
 
@@ -4907,6 +4961,7 @@ async def screen_boost_admin(qm, context: ContextTypes.DEFAULT_TYPE):
 
     text = (
         f"{title}\n\n"
+        f"{_boost_global_readiness_text(settings, uid)}\n\n"
         f"Boost: <b>{global_state}</b>\n"
         f"Статус: <b>{_boost_status_label(status_code)}</b>\n"
         f"Режим: <b>{_boost_mode_label(uid)}</b>\n"
@@ -5011,7 +5066,12 @@ async def screen_boost_events(qm, context: ContextTypes.DEFAULT_TYPE, channel_id
     if events:
         body = "\n\n".join(_boost_event_line(event) for event in events)
     else:
-        body = "Событий пока нет."
+        body = (
+            "Событий пока нет.\n\n"
+            "Если глобальный Boost или сам канал выключены, новые посты не обрабатываются и в журнал не пишутся. "
+            "Открой карточку канала и смотри строку «Итог по каналу». "
+            "Если всё включено, здесь появится заказ или понятная причина пропуска: нет публичной ссылки, нет ID сервиса, API не настроен или ошибка провайдера."
+        )
     title = "🧾 <b>Журнал Boost</b>"
     if channel_id is not None:
         title += f" · канал <code>{channel_id}</code>"
@@ -5198,6 +5258,7 @@ async def screen_boost_channel_detail(qm, context: ContextTypes.DEFAULT_TYPE, ch
         await screen_boost_channels(qm, context)
         return
 
+    settings = get_boost_settings()
     linked = _boost_link_label(ch.get("smm_channel_id"))
     profile = boost_provider_profile(ch.get("owner_id"), cfg)
     if profile.get("profile") == "tester":
@@ -5210,6 +5271,7 @@ async def screen_boost_channel_detail(qm, context: ContextTypes.DEFAULT_TYPE, ch
     disabled_hint = "\n\n⚠️ Канал выключен. Новые посты не обрабатываются." if not ch.get("enabled") else ""
     text = (
         f"🚀 <b>Канал Boost</b> <code>{ch['id']}</code>\n\n"
+        f"{_boost_channel_readiness_text(ch, settings)}\n\n"
         f"Канал: <b>{html.escape(_boost_channel_name(ch))}</b>\n"
         f"Связь с smm_bot: <b>{html.escape(str(linked))}</b>\n"
         f"Состояние: <b>{_boost_onoff_label(bool(ch.get('enabled')))}</b>\n"
