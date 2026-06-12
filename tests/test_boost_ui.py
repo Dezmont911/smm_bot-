@@ -39,6 +39,25 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(context.user_data, {"other": "keep"})
 
+    def test_superadmin_boost_visibility_keeps_main_pool_and_hides_tester_pool(self):
+        channels = [
+            {"id": 1, "owner_id": None, "username": "legacy"},
+            {"id": 2, "owner_id": 100, "username": "superadmin"},
+            {"id": 3, "owner_id": 200, "username": "second_admin"},
+            {"id": 4, "owner_id": 733891104, "username": "tester"},
+        ]
+
+        with patch.object(ui.accounts, "is_superadmin", return_value=True), \
+                patch.object(ui, "list_tracked_channels", return_value=channels), \
+                patch.object(ui, "boost_tester_ids", return_value={733891104}):
+            visible = ui._boost_visible_channels(100)
+            second_admin_access = ui._boost_channel_access(channels[2], 100)
+            tester_access = ui._boost_channel_access(channels[3], 100)
+
+        self.assertEqual([ch["id"] for ch in visible], [1, 2, 3])
+        self.assertTrue(second_admin_access)
+        self.assertFalse(tester_access)
+
     async def test_picker_uses_owner_scoped_mine_channels(self):
         captured = {}
 

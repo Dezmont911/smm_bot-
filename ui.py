@@ -82,6 +82,7 @@ from boost_manager import (
     set_tracked_channel_quantity,
     set_tracked_channel_reactions,
     is_boost_tester,
+    boost_tester_ids,
 )
 from views_monitor import (
     DEFAULT_FOLDER as VIEWS_MONITOR_DEFAULT_FOLDER,
@@ -264,11 +265,44 @@ def _boost_include_unowned(uid: int | None) -> bool:
     return bool(uid is not None and accounts.is_superadmin(uid))
 
 
+def _boost_owner_is_tester(owner_id: int | None) -> bool:
+    if owner_id is None:
+        return False
+    try:
+        return int(owner_id) in boost_tester_ids(cfg)
+    except (TypeError, ValueError):
+        return False
+
+
+def _boost_visible_channels(uid: int | None) -> list[dict]:
+    if uid is None:
+        return []
+    if accounts.is_superadmin(uid):
+        return [
+            ch for ch in list_tracked_channels()
+            if not _boost_owner_is_tester(ch.get("owner_id"))
+        ]
+    return list_tracked_channels(owner_id=uid)
+
+
+def _boost_visible_events(uid: int | None, limit: int = 10, channel_id: int | None = None) -> list[dict]:
+    if uid is None:
+        return []
+    if accounts.is_superadmin(uid):
+        events = list_boost_events(limit=max(limit, 100), boost_channel_id=channel_id)
+        visible = [
+            event for event in events
+            if not _boost_owner_is_tester(event.get("owner_id"))
+        ]
+        return visible[:limit]
+    return list_boost_events(limit=limit, boost_channel_id=channel_id, owner_id=uid)
+
+
 def _boost_channel_access(ch: dict | None, uid: int | None) -> bool:
     if not ch or uid is None:
         return False
     if accounts.is_superadmin(uid):
-        return ch.get("owner_id") in (None, uid)
+        return not _boost_owner_is_tester(ch.get("owner_id"))
     return is_boost_tester(uid, cfg) and ch.get("owner_id") == uid
 
 
@@ -4946,7 +4980,7 @@ async def screen_boost_admin(qm, context: ContextTypes.DEFAULT_TYPE):
         return
 
     settings = get_boost_settings()
-    channels = list_tracked_channels(owner_id=uid, include_unowned=_boost_include_unowned(uid))
+    channels = _boost_visible_channels(uid)
     enabled_count = sum(1 for ch in channels if ch.get("enabled"))
     global_state = _boost_onoff_label(bool(settings.get("boost_enabled")))
     profile = boost_provider_profile(uid, cfg)
@@ -4994,7 +5028,7 @@ async def screen_boost_channels(qm, context: ContextTypes.DEFAULT_TYPE):
         await qm.answer("Boost недоступен.", show_alert=True)
         return
 
-    channels = list_tracked_channels(owner_id=uid, include_unowned=_boost_include_unowned(uid))
+    channels = _boost_visible_channels(uid)
     rows = [
         [InlineKeyboardButton(_boost_channel_button_label(ch), callback_data=f"ui:boost_ch:{ch['id']}")]
         for ch in channels[:25]
@@ -5057,12 +5091,7 @@ async def screen_boost_events(qm, context: ContextTypes.DEFAULT_TYPE, channel_id
         await screen_boost_channels(qm, context)
         return
 
-    events = list_boost_events(
-        limit=10,
-        boost_channel_id=channel_id,
-        owner_id=uid,
-        include_unowned=_boost_include_unowned(uid),
-    )
+    events = _boost_visible_events(uid, limit=10, channel_id=channel_id)
     if events:
         body = "\n\n".join(_boost_event_line(event) for event in events)
     else:
