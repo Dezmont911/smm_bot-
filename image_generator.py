@@ -118,7 +118,9 @@ async def _build_image_prompt(
             "You are an expert at writing image generation prompts for FLUX AI model. "
             "Create vivid, specific, visually descriptive prompts in English. "
             "Focus on visual elements: scene, style, lighting, colors, composition. "
-            "Avoid abstract concepts. Keep it under 50 words."
+            "Avoid abstract concepts. For esports or video game posts, depict gaming PCs, "
+            "screens, tournaments, game UI mood, or player setups; never depict real-world "
+            "sports fields, balls, or outdoor athletes. Keep it under 50 words."
         )
 
         # Передаём ВЕСЬ пост, но просим иллюстрировать его ЦЕНТРАЛЬНУЮ тему и
@@ -133,6 +135,7 @@ async def _build_image_prompt(
             f"Requirements:\n"
             f"- Photorealistic or high-quality digital art style\n"
             f"- Depicts the main subject of the post (not the emotional intro)\n"
+            f"- If this is about esports/video games, no real-world sports scene\n"
             f"- No text, logos, watermarks in the image\n"
             f"- Return ONLY the prompt, nothing else"
         )

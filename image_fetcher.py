@@ -39,6 +39,84 @@ from claude_helper import claude_text
 UNSPLASH_SEARCH = "https://api.unsplash.com/search/photos"
 PEXELS_SEARCH   = "https://api.pexels.com/v1/search"
 
+NICHE_GAME_CONTEXTS = {
+    "cs2": "counter strike 2",
+    "counter strike": "counter strike 2",
+    "counter-strike": "counter strike 2",
+    "counterstrike": "counter strike 2",
+    "dota": "dota 2",
+    "minecraft": "minecraft",
+    "roblox": "roblox",
+    "fortnite": "fortnite",
+    "valorant": "valorant",
+    "genshin": "genshin impact",
+}
+
+STOCK_GAMING_TERMS = {
+    "gaming", "gamer", "esports", "e-sports", "counter", "strike", "cs2",
+    "minecraft", "roblox", "fortnite", "valorant", "dota", "steam",
+}
+
+STOCK_SPORT_FALSE_POSITIVES = {
+    "rugby", "football", "soccer", "basketball", "baseball", "tennis",
+    "cricket", "golf", "hockey", "volleyball", "athlete", "stadium",
+    "pitch", "field", "ball", "court",
+}
+
+
+def _detect_niche_game_context(*parts: object) -> str:
+    text = " ".join(str(p or "") for p in parts).lower()
+    text = text.replace("_", " ")
+    for marker, canonical in NICHE_GAME_CONTEXTS.items():
+        if marker in text:
+            return canonical
+    return ""
+
+
+def _should_skip_stock_for_context(
+    topic: str,
+    channel_topic: str = "",
+    channel_name: str = "",
+    image_keywords: list[str] | None = None,
+) -> bool:
+    keywords = " ".join(image_keywords or [])
+    return bool(_detect_niche_game_context(topic, channel_topic, channel_name, keywords))
+
+
+def _query_is_gaming(query: str) -> bool:
+    low = (query or "").lower()
+    return any(term in low for term in STOCK_GAMING_TERMS)
+
+
+def _stock_false_positive(query: str, text: str) -> bool:
+    low = (text or "").lower()
+    return _query_is_gaming(query) and any(term in low for term in STOCK_SPORT_FALSE_POSITIVES)
+
+
+def _stock_score(query: str, text: str) -> int:
+    low = (text or "").lower()
+    terms = [t for t in re.findall(r"[a-z0-9]+", (query or "").lower()) if len(t) > 2]
+    score = sum(3 for term in terms if term in low)
+    if _stock_false_positive(query, low):
+        score -= 100
+    return score
+
+
+def _pick_stock_item(items: list[dict], query: str, text_getter, url_getter) -> dict | None:
+    scored = []
+    for idx, item in enumerate(items or []):
+        text = text_getter(item)
+        url = url_getter(item)
+        if not url:
+            continue
+        if _stock_false_positive(query, text):
+            continue
+        scored.append((_stock_score(query, text), idx, item))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return scored[0][2]
+
 # Стоп-слова русского языка — не несут смысла для поиска картинок
 _RU_STOP = {
     "как", "что", "для", "при", "или", "это", "так", "уже", "все", "всё",
@@ -99,6 +177,11 @@ async def fetch_image_url(
 
     if not cfg.PEXELS_API_KEY and not cfg.UNSPLASH_ACCESS_KEY:
         logger.debug("Нет ключей Pexels/Unsplash — пост без картинки")
+        return None
+
+    if _should_skip_stock_for_context(topic, channel_topic, channel_name, image_keywords):
+        game = _detect_niche_game_context(topic, channel_topic, channel_name, " ".join(image_keywords or []))
+        logger.info(f"Картинка (сток): пропускаю сток для niche gaming '{game}'")
         return None
 
     # 3. Pexels / Unsplash — фоллбэк для универсальных тем
@@ -248,6 +331,7 @@ async def _build_english_query(topic: str, channel_topic: str = "") -> str:
     # Словарь тематик каналов → английские ключевые слова
     CHANNEL_MAP = {
         "майнкрафт": "minecraft", "minecraft": "minecraft",
+        "cs2": "counter strike 2", "counter-strike": "counter strike 2", "counter strike": "counter strike 2",
         "игр": "gaming", "игры": "gaming", "steam": "gaming pc",
         "финансы": "finance money", "инвестиц": "investing",
         "здоровье": "health wellness", "спорт": "sport fitness",
@@ -270,12 +354,17 @@ async def _build_english_query(topic: str, channel_topic: str = "") -> str:
         "get", "got", "new", "big", "top", "best", "more", "about",
     }
 
+    content = (topic or "").strip()
+    niche_game_context = _detect_niche_game_context(content, channel_topic)
+
     # Определяем контекст канала
     channel_context = ""
     for ru_key, en_val in CHANNEL_MAP.items():
         if ru_key in channel_topic.lower():
             channel_context = en_val
             break
+    if niche_game_context:
+        channel_context = niche_game_context
     # Если канал уже на английском
     if not channel_context and channel_topic:
         ch_first = channel_topic.split(",")[0].strip()
@@ -284,7 +373,6 @@ async def _build_english_query(topic: str, channel_topic: str = "") -> str:
 
     # ВЕСЬ текст поста — основа. title (первое предложение) оставляем только
     # для фоллбэка, если Claude недоступен.
-    content = (topic or "").strip()
     title = content.split(".")[0].strip()[:120]
 
     # Определяем язык заголовка
@@ -296,6 +384,14 @@ async def _build_english_query(topic: str, channel_topic: str = "") -> str:
     # не было одной картинки на все посты.
     import random
     GAMING_QUERIES = {
+        "counter strike 2": [
+            "counter strike esports gaming setup",
+            "tactical shooter game monitor",
+            "esports tournament gaming pc",
+            "fps game keyboard mouse",
+            "gaming monitor first person shooter",
+            "esports team at computers",
+        ],
         "minecraft": [
             "minecraft blocks landscape",
             "sandbox game building blocks",
@@ -460,8 +556,16 @@ async def _search_pexels(query: str) -> str | None:
                 photos = data.get("photos", [])
                 if not photos:
                     return None
-                import random
-                return random.choice(photos)["src"]["large"]
+                chosen = _pick_stock_item(
+                    photos,
+                    query,
+                    lambda item: " ".join(str(item.get(k) or "") for k in ("alt", "url", "photographer")),
+                    lambda item: (item.get("src") or {}).get("large"),
+                )
+                if not chosen:
+                    logger.info(f"Pexels: все результаты отсеяны как нерелевантные для '{query}'")
+                    return None
+                return chosen["src"]["large"]
         except urllib.error.HTTPError as e:
             code = e.code
             if code == 401:
@@ -525,8 +629,16 @@ async def _search_unsplash(query: str) -> str | None:
                     logger.debug(f"Unsplash: нет результатов для '{query}'")
                     return None
 
-                import random
-                url = random.choice(results)["urls"]["regular"]
+                chosen = _pick_stock_item(
+                    results,
+                    query,
+                    lambda item: " ".join(str(item.get(k) or "") for k in ("alt_description", "description", "slug")),
+                    lambda item: (item.get("urls") or {}).get("regular"),
+                )
+                if not chosen:
+                    logger.info(f"Unsplash: все результаты отсеяны как нерелевантные для '{query}'")
+                    return None
+                url = chosen["urls"]["regular"]
                 logger.info(f"Unsplash OK | '{query}' → {url[:70]}...")
                 return url
 
