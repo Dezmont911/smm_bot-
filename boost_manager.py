@@ -68,6 +68,14 @@ TESTER_REQUIRED_ENV_VARS = (
 )
 
 
+class BoostChannelOwnershipError(ValueError):
+    """Raised when a physical Telegram channel is already owned by another Boost profile."""
+
+    def __init__(self, existing: dict):
+        self.existing = existing
+        super().__init__("boost_channel_owned_by_another_profile")
+
+
 @contextmanager
 def _connect(database=db):
     conn = database.connect()
@@ -432,6 +440,17 @@ def _owner_match_sql(owner_id: int | None, include_unowned: bool = False) -> tup
     return "owner_id = ?", [int(owner_id)]
 
 
+def _same_boost_owner(left: int | str | None, right: int | str | None) -> bool:
+    if left is None and right is None:
+        return True
+    if left is None or right is None:
+        return False
+    try:
+        return int(left) == int(right)
+    except (TypeError, ValueError):
+        return str(left) == str(right)
+
+
 def _normalize_username_value(value: str | None) -> str | None:
     if not value:
         return None
@@ -676,6 +695,26 @@ def find_tracked_channel_for_input(
     return _row_to_dict(row)
 
 
+def _find_cross_owner_conflict(
+    conn,
+    owner_id: int | None,
+    channel_key: str | None = None,
+    smm_channel_id: str | None = None,
+    tg_chat_id: int | str | None = None,
+    username: str | None = None,
+):
+    row = _find_existing_for_identity(
+        conn,
+        channel_key=channel_key,
+        smm_channel_id=smm_channel_id,
+        tg_chat_id=tg_chat_id,
+        username=username,
+    )
+    if row and not _same_boost_owner(row["owner_id"], owner_id):
+        return row
+    return None
+
+
 def link_tracked_channel_to_smm_channel(
     boost_channel_id: int,
     smm_channel: dict,
@@ -751,6 +790,16 @@ def add_tracked_channel(
             owner_id=owner_id,
             include_unowned=owner_id is None,
         )
+        conflict = None if existing else _find_cross_owner_conflict(
+            conn,
+            owner_id=owner_id,
+            channel_key=normalized["channel_key"],
+            smm_channel_id=smm_channel_id,
+            tg_chat_id=tg_chat_id,
+            username=username,
+        )
+        if conflict:
+            raise BoostChannelOwnershipError(_row_to_dict(conflict))
         if existing:
             conn.execute(
                 """

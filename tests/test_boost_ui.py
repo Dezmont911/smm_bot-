@@ -172,6 +172,31 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(query.answers, [("Уже добавлен в Boost.", False)])
         self.assertEqual(context.user_data, {})
 
+    async def test_duplicate_picker_rejects_channel_owned_by_other_profile(self):
+        query = FakeQuery(733891104)
+        context = SimpleNamespace(user_data={})
+        smm_channel = {
+            "channel_id": "@mine",
+            "name": "Mine",
+            "username": "mine",
+            "owner_id": 733891104,
+            "active": True,
+        }
+        existing_other = {"id": 7, "owner_id": 100, "enabled": True, "username": "mine"}
+
+        with patch.object(ui.accounts, "is_superadmin", return_value=False), \
+                patch.object(ui, "is_boost_tester", return_value=True), \
+                patch.object(ui, "_load_channels", return_value=[smm_channel]), \
+                patch.object(ui, "find_tracked_channel_for_smm_channel", side_effect=[None, existing_other]), \
+                patch.object(ui, "screen_boost_smm_picker", new_callable=AsyncMock) as picker_mock, \
+                patch.object(ui, "screen_boost_channel_detail", new_callable=AsyncMock) as detail_mock:
+            await ui.action_boost_pick_smm_channel(query, context, page=0, index=0)
+
+        self.assertEqual(query.answers, [(ui._boost_owned_by_other_message(), True)])
+        picker_mock.assert_awaited_once_with(query, context, 0)
+        detail_mock.assert_not_awaited()
+        self.assertEqual(context.user_data, {})
+
     def test_boost_label_helpers_hide_machine_codes(self):
         self.assertEqual(ui._boost_status_label("dry_run"), "тестовый заказ")
         self.assertEqual(ui._boost_status_label("ignored"), "пропущено")

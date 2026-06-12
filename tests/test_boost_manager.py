@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from database import Database
 import poster as poster_module
 from boost_manager import (
+    BoostChannelOwnershipError,
     TwiBoostClientWrapper,
     add_tracked_channel,
     add_tracked_channel_from_smm_channel,
@@ -90,18 +91,55 @@ class BoostManagerTests(unittest.TestCase):
         self.assertEqual(channels[0]["username"], "boosted")
         self.assertFalse(bool(channels[0]["enabled"]))
 
-    def test_tester_channels_are_owner_scoped_and_hidden_from_owner_boost(self):
+    def test_tester_cannot_duplicate_owner_boost_channel(self):
         owner_channel = add_tracked_channel("@boosted", owner_id=100, database=self.db, config=self.config)
-        tester_channel = add_tracked_channel("@boosted", owner_id=733891104, database=self.db, config=self.config)
+
+        with self.assertRaises(BoostChannelOwnershipError) as raised:
+            add_tracked_channel("@boosted", owner_id=733891104, database=self.db, config=self.config)
 
         owner_visible = list_tracked_channels(self.db, owner_id=100, include_unowned=True)
         tester_visible = list_tracked_channels(self.db, owner_id=733891104)
 
-        self.assertNotEqual(owner_channel["id"], tester_channel["id"])
+        self.assertEqual(raised.exception.existing["id"], owner_channel["id"])
         self.assertEqual([ch["id"] for ch in owner_visible], [owner_channel["id"]])
-        self.assertEqual([ch["id"] for ch in tester_visible], [tester_channel["id"]])
+        self.assertEqual(tester_visible, [])
         self.assertEqual(owner_channel["channel_key"], "owner:100:user:boosted")
-        self.assertEqual(tester_channel["channel_key"], "owner:733891104:user:boosted")
+
+    def test_tester_cannot_duplicate_owner_smm_boost_channel(self):
+        owner_smm_channel = {
+            "channel_id": "@boosted",
+            "username": "boosted",
+            "name": "Boosted",
+            "owner_id": 100,
+            "chat_id_num": -100123,
+        }
+        tester_smm_channel = {
+            "channel_id": "@boosted",
+            "username": "boosted",
+            "name": "Boosted",
+            "owner_id": 733891104,
+            "chat_id_num": -100123,
+        }
+        owner_channel, created = add_tracked_channel_from_smm_channel(
+            owner_smm_channel,
+            owner_id=100,
+            quantity=500,
+            database=self.db,
+            config=self.config,
+        )
+
+        with self.assertRaises(BoostChannelOwnershipError) as raised:
+            add_tracked_channel_from_smm_channel(
+                tester_smm_channel,
+                owner_id=733891104,
+                quantity=500,
+                database=self.db,
+                config=self.config,
+            )
+
+        self.assertTrue(created)
+        self.assertEqual(raised.exception.existing["id"], owner_channel["id"])
+        self.assertEqual(list_tracked_channels(self.db, owner_id=733891104), [])
 
     def test_tester_provider_profile_uses_tester_twiboost_env(self):
         owner_profile = boost_provider_profile(100, self.config)

@@ -58,6 +58,7 @@ from channel_questionnaire import (
 )
 from channel_dna import channel_dna_compatibility
 from boost_manager import (
+    BoostChannelOwnershipError,
     add_tracked_channel,
     add_tracked_channel_from_smm_channel,
     boost_configured,
@@ -215,6 +216,17 @@ def _boost_channel_access(ch: dict | None, uid: int | None) -> bool:
     if accounts.is_superadmin(uid):
         return ch.get("owner_id") in (None, uid)
     return is_boost_tester(uid, cfg) and ch.get("owner_id") == uid
+
+
+def _boost_channel_owned_by_other(ch: dict | None, uid: int | None) -> bool:
+    return bool(ch and not _boost_channel_access(ch, uid))
+
+
+def _boost_owned_by_other_message() -> str:
+    return (
+        "Канал уже подключён к другому Boost-профилю. "
+        "Дубли запрещены, чтобы один пост не ушёл в накрутку дважды."
+    )
 
 
 def _clear_boost_pending(context: ContextTypes.DEFAULT_TYPE):
@@ -5068,9 +5080,10 @@ def _boost_smm_identity(ch: dict) -> str:
     return "нет id"
 
 
-def _boost_smm_button_label(ch: dict) -> str:
+def _boost_smm_button_label(ch: dict, uid: int | None = None) -> str:
     existing = find_tracked_channel_for_smm_channel(ch, owner_id=ch.get("owner_id"), include_unowned=ch.get("owner_id") is None)
-    state = _boost_smm_state_label(existing)
+    any_existing = existing or find_tracked_channel_for_smm_channel(ch)
+    state = "занят" if _boost_channel_owned_by_other(any_existing, uid) else _boost_smm_state_label(existing)
     label = f"{_boost_smm_name(ch)} | {state}"
     return label[:60]
 
@@ -5099,12 +5112,13 @@ async def screen_boost_smm_picker(qm, context: ContextTypes.DEFAULT_TYPE, page: 
     rows = []
     for idx, ch in enumerate(chunk):
         existing = find_tracked_channel_for_smm_channel(ch, owner_id=ch.get("owner_id"), include_unowned=_boost_include_unowned(uid))
-        status = _boost_smm_state_label(existing)
+        any_existing = existing or find_tracked_channel_for_smm_channel(ch)
+        status = "занят другим Boost-профилем" if _boost_channel_owned_by_other(any_existing, uid) else _boost_smm_state_label(existing)
         lines.append(
             f"{idx + 1}. <b>{html.escape(_boost_smm_name(ch))}</b>\n"
             f"   <code>{html.escape(_boost_smm_identity(ch))}</code> · Boost: <b>{status}</b>"
         )
-        rows.append([InlineKeyboardButton(f"{idx + 1}. {_boost_smm_button_label(ch)}", callback_data=f"ui:boost_pick:{page}:{idx}")])
+        rows.append([InlineKeyboardButton(f"{idx + 1}. {_boost_smm_button_label(ch, uid)}", callback_data=f"ui:boost_pick:{page}:{idx}")])
 
     nav = []
     if page > 0:
@@ -5131,6 +5145,11 @@ async def action_boost_pick_smm_channel(qm, context: ContextTypes.DEFAULT_TYPE, 
 
     ch = channels[offset]
     existing = find_tracked_channel_for_smm_channel(ch, owner_id=ch.get("owner_id"), include_unowned=_boost_include_unowned(uid))
+    any_existing = existing or find_tracked_channel_for_smm_channel(ch)
+    if _boost_channel_owned_by_other(any_existing, uid):
+        await qm.answer(_boost_owned_by_other_message(), show_alert=True)
+        await screen_boost_smm_picker(qm, context, page)
+        return
     if existing:
         linked = link_tracked_channel_to_smm_channel(existing["id"], ch, owner_id=ch.get("owner_id"))
         await qm.answer("Уже добавлен в Boost.")
@@ -5263,24 +5282,34 @@ async def _finish_boost_pending_create(update: Update, context: ContextTypes.DEF
             _clear_boost_pending(context)
             await _answer_or_send(target, "❌ Канал больше не доступен в твоём scope.", None)
             return True
-        ch, created = add_tracked_channel_from_smm_channel(
-            smm_ch,
-            owner_id=smm_ch.get("owner_id"),
-            quantity=views_quantity,
-            reactions_enabled=reactions_enabled,
-            reactions_quantity=reactions_quantity,
-            enabled=False,
-        )
+        try:
+            ch, created = add_tracked_channel_from_smm_channel(
+                smm_ch,
+                owner_id=smm_ch.get("owner_id"),
+                quantity=views_quantity,
+                reactions_enabled=reactions_enabled,
+                reactions_quantity=reactions_quantity,
+                enabled=False,
+            )
+        except BoostChannelOwnershipError:
+            _clear_boost_pending(context)
+            await _answer_or_send(target, f"❌ {_boost_owned_by_other_message()}", None)
+            return True
     elif kind == "external":
         raw_channel = pending.get("raw_channel")
-        ch = add_tracked_channel(
-            raw_channel,
-            owner_id=user.id,
-            quantity=views_quantity,
-            reactions_enabled=reactions_enabled,
-            reactions_quantity=reactions_quantity,
-            enabled=False,
-        )
+        try:
+            ch = add_tracked_channel(
+                raw_channel,
+                owner_id=user.id,
+                quantity=views_quantity,
+                reactions_enabled=reactions_enabled,
+                reactions_quantity=reactions_quantity,
+                enabled=False,
+            )
+        except BoostChannelOwnershipError:
+            _clear_boost_pending(context)
+            await _answer_or_send(target, f"❌ {_boost_owned_by_other_message()}", None)
+            return True
         created = True
     else:
         _clear_boost_pending(context)
@@ -5369,6 +5398,11 @@ async def handle_boost_text_input(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text("❌ Не понял канал. Пришли @username, t.me/channel или numeric chat_id.")
             return True
         existing = find_tracked_channel_for_input(raw, owner_id=user.id, include_unowned=_boost_include_unowned(user.id))
+        any_existing = existing or find_tracked_channel_for_input(raw)
+        if _boost_channel_owned_by_other(any_existing, user.id):
+            _clear_boost_pending(context)
+            await update.message.reply_text(f"❌ {_boost_owned_by_other_message()}")
+            return True
         if existing:
             _clear_boost_pending(context)
             await update.message.reply_text(
