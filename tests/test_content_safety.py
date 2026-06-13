@@ -38,6 +38,13 @@ MARKETPLACE_CHANNEL = {
     "topic": "товары Wildberries, Ozon, AliExpress со ссылками на покупку",
 }
 
+BLOGGER_NEWS_CHANNEL = {
+    "channel_id": "@novosti_bl0gerov",
+    "channel_type": "content",
+    "archetype": "celeb_drama",
+    "topic": "новости о жизни российских блогеров и интернет-персоналий",
+}
+
 
 class ContentSafetyTest(unittest.TestCase):
     def test_kids_education_topic_allowed(self):
@@ -68,6 +75,39 @@ class ContentSafetyTest(unittest.TestCase):
         result = dry_run_topic(channel, "Как вести семейный бюджет")
         self.assertEqual(result["safety"]["decision"], "allowed")
         self.assertEqual(result["safety"]["safe_topic"], "Как вести семейный бюджет")
+
+    def test_celeb_drama_rejects_general_hard_news_topics(self):
+        samples = [
+            "Признание главкома НАТО о России привело в шок Запад",
+            "Россиянина заподозрили в убийстве многодетной матери",
+            "Бесплатное протезирование обернулось для россиянки потерей зубов",
+        ]
+        for sample in samples:
+            with self.subTest(sample=sample):
+                safety = evaluate_topic_candidate(
+                    BLOGGER_NEWS_CHANNEL,
+                    {"topic": sample, "source": "rss"},
+                )
+                self.assertEqual(safety["decision"], "review")
+                self.assertEqual(safety["reason_code"], "celeb_drama_fit_unclear")
+
+    def test_celeb_drama_allows_blogger_or_celebrity_topics(self):
+        safety = evaluate_topic_candidate(
+            BLOGGER_NEWS_CHANNEL,
+            {"topic": "Блогерша сменила образ и получила реакцию подписчиков", "source": "rss"},
+        )
+        self.assertEqual(safety["decision"], "allowed_safe")
+        self.assertEqual(safety["reason_code"], "celeb_drama_fit")
+
+    def test_celeb_drama_output_rejects_offtopic_drift(self):
+        validation = validate_generated_post(
+            BLOGGER_NEWS_CHANNEL,
+            {"format": "инфоповод", "content": "Главком НАТО сделал заявление о России и это изменит повестку."},
+            {"decision": "allowed", "safe_topic": "новость"},
+            {},
+        )
+        self.assertFalse(validation["allowed"])
+        self.assertEqual(validation["reason_code"], "celeb_drama_offtopic_output")
 
     def test_marketplace_with_kids_category_is_not_kids_education(self):
         channel = {

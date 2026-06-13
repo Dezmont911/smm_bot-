@@ -87,6 +87,23 @@ EXPLICIT_NON_KIDS_ARCHETYPES = {
     "wb_product",
 }
 
+CELEB_DRAMA_ARCHETYPES = {"celeb_drama"}
+
+CELEB_DRAMA_PROFILE_MARKERS = (
+    "блогер", "блогерск", "инфлюенсер", "интернет-персон", "селеб", "звезд", "звёзд",
+    "ютуб", "youtube", "тикток", "tiktok", "стример", "стрим", "соцсет", "telegram",
+    "инстаграм", "instagram", "фанат", "подписчик", "роман", "расставан", "скандал",
+    "коллаб", "карьер", "образ", "шоу-бизнес", "пев", "актёр", "актер", "артист",
+)
+
+CELEB_DRAMA_OFFTOPIC_MARKERS = (
+    "нато", "главком", "военн", "армия", "военнослуж", "танк", "ввс", "днр", "лнр",
+    "пригранич", "фронт", "европа", "запад", "совбез", "медведев", "госдум", "сенатор",
+    "депутат", "законопроект", "судейство", "гимнаст", "студотряд", "всм", "самолет",
+    "самолёт", "крушени", "убийств", "заподозри", "силовик", "полици", "маф", "рабств",
+    "протез", "стоматолог", "зуб", "операци", "клиник", "правозащит", "цензур",
+)
+
 KIDS_EDU_PROFILE_MARKERS = (
     "робототех", "программирован", "дет", "ребен", "ребён", "школь",
     "занят", "круж", "секци", "лагер", "логик", "самостоятельн",
@@ -373,6 +390,29 @@ def _fits_kids_education(raw_topic: str) -> bool:
     return any(marker in low for marker in KIDS_EDU_FIT_MARKERS)
 
 
+def _is_celeb_drama_channel(channel: dict) -> bool:
+    archetype = _low(channel.get("archetype"))
+    if archetype in CELEB_DRAMA_ARCHETYPES:
+        return True
+    profile = _low(" ".join([
+        str(channel.get("topic") or ""),
+        str(channel.get("name") or ""),
+    ]))
+    return any(marker in profile for marker in CELEB_DRAMA_PROFILE_MARKERS)
+
+
+def _fits_celeb_drama(raw_topic: str) -> bool:
+    low = _low(raw_topic)
+    if _has_celeb_drama_offtopic(raw_topic):
+        return False
+    return any(marker in low for marker in CELEB_DRAMA_PROFILE_MARKERS)
+
+
+def _has_celeb_drama_offtopic(text: str) -> bool:
+    low = _low(text)
+    return any(marker in low for marker in CELEB_DRAMA_OFFTOPIC_MARKERS)
+
+
 def evaluate_topic_candidate(channel: dict, topic_data: dict) -> dict:
     """Safety Gate + Channel Fit Check for one raw candidate topic."""
     raw_topic = _clean_text(topic_data.get("topic", ""), 700)
@@ -429,6 +469,23 @@ def evaluate_topic_candidate(channel: dict, topic_data: dict) -> dict:
             "safe_angle": "сохранить товарную пользу и реальную ссылку на товар",
             "reason_code": "marketplace_product_fit",
             "notes": f"source={source}; marketplace channel",
+        })
+        return result
+
+    if _is_celeb_drama_channel(channel):
+        if not _fits_celeb_drama(raw_topic):
+            result.update({
+                "decision": "review",
+                "risk_level": "medium",
+                "safe_topic": None,
+                "reason_code": "celeb_drama_fit_unclear",
+                "notes": f"source={source}; unclear fit for blogger/celebrity news channel",
+            })
+            return result
+        result.update({
+            "decision": "allowed_safe",
+            "safe_angle": "оставить только блогерский/селебрити-контекст без политики, криминала, медицины и общих новостей",
+            "reason_code": "celeb_drama_fit",
         })
         return result
 
@@ -777,6 +834,10 @@ def validate_generated_post(channel: dict, post: dict, safety: dict, brief: dict
 
     if _looks_like_import_ad_or_offtopic(content):
         result.update({"allowed": False, "decision": "review", "reason_code": "ad_or_offtopic_output"})
+        return result
+
+    if _is_celeb_drama_channel(channel) and _has_celeb_drama_offtopic(content):
+        result.update({"allowed": False, "decision": "review", "reason_code": "celeb_drama_offtopic_output"})
         return result
 
     if _requires_marketplace_link(channel, post) and not _has_html_link(content):
