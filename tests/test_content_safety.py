@@ -1046,6 +1046,18 @@ class ContentSafetyTest(unittest.TestCase):
         )
         self.assertTrue(validation["allowed"])
 
+    def test_reference_import_rejects_hentai_ad_text(self):
+        validation = validate_imported_post(
+            {"channel_id": "@anime", "topic": "аниме эстетика и арты"},
+            {
+                "format": "reference",
+                "content": "Коллекция хентая, фетиши и нюдесы каждый день.",
+                "media_type": "photo",
+            },
+        )
+        self.assertFalse(validation["allowed"])
+        self.assertEqual(validation["reason_code"], "blocked_imported_content")
+
 
 if __name__ == "__main__":
     unittest.main()

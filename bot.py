@@ -3654,7 +3654,7 @@ async def process_due_ads(bot):
                     await generator.run_for_channel(channel, target_count=1, force=True)
 
             result = await poster.post_now(cid)
-            retryable_reasons = {"wb_image_missing", "wb_image_unavailable"}
+            retryable_reasons = {"wb_image_missing", "wb_image_unavailable", "forbidden_content"}
             attempts = 1
             while (
                 not result.get("success")

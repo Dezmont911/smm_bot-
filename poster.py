@@ -670,7 +670,7 @@ class Poster:
             if _contains_forbidden(content):
                 buffer.mark_skipped(post["id"])
                 logger.warning(f"Пост [{channel_id}] с запретным контентом → skipped, не публикую")
-                return {"success": False, "used_image": False}
+                return {"success": False, "used_image": False, "reason": "forbidden_content"}
         except Exception:
             pass
 
