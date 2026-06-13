@@ -792,5 +792,44 @@ class WbImageDownloadRoutingTest(unittest.TestCase):
         self.assertNotIn("http://", text)
 
 
+class ReferenceUiModeTest(unittest.TestCase):
+    def test_ref_content_mode_defaults_to_text_and_media(self):
+        import ui
+
+        ref = {"handle": "@donor"}
+
+        self.assertEqual(ui._ref_content_mode(ref), "text_media")
+        self.assertEqual(ui._ref_content_mode_label(ref), "текст + медиа")
+
+    def test_ref_content_mode_cycles_through_clear_presets(self):
+        import ui
+
+        ref = {"handle": "@donor", "include_text": True, "take_media": True}
+
+        self.assertEqual(ui._cycle_ref_content_mode(ref), "media_only")
+        self.assertEqual(ref["include_text"], False)
+        self.assertEqual(ref["take_media"], True)
+        self.assertEqual(ref["allow_media_only"], True)
+
+        self.assertEqual(ui._cycle_ref_content_mode(ref), "text_only")
+        self.assertEqual(ref["include_text"], True)
+        self.assertEqual(ref["take_media"], False)
+        self.assertNotIn("allow_media_only", ref)
+
+        self.assertEqual(ui._cycle_ref_content_mode(ref), "text_media")
+        self.assertEqual(ref["include_text"], True)
+        self.assertEqual(ref["take_media"], True)
+
+    def test_ref_content_mode_repairs_invalid_disabled_state(self):
+        import ui
+
+        ref = {"handle": "@donor", "include_text": False, "take_media": False}
+
+        self.assertEqual(ui._ref_content_mode(ref), "disabled")
+        self.assertEqual(ui._cycle_ref_content_mode(ref), "media_only")
+        self.assertEqual(ref["include_text"], False)
+        self.assertEqual(ref["take_media"], True)
+
+
 if __name__ == "__main__":
     unittest.main()

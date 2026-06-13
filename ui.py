@@ -2529,6 +2529,43 @@ async def action_rss_clear(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
 
 # ── Референс-каналы (доноры контента) ─────────────────────────────────────
 
+REF_CONTENT_MODES = ("text_media", "media_only", "text_only")
+
+
+def _ref_content_mode(ref: dict) -> str:
+    include_text = bool(ref.get("include_text", True))
+    take_media = bool(ref.get("take_media", True))
+    if include_text and take_media:
+        return "text_media"
+    if take_media:
+        return "media_only"
+    if include_text:
+        return "text_only"
+    return "disabled"
+
+
+def _ref_content_mode_label(ref: dict) -> str:
+    return {
+        "text_media": "текст + медиа",
+        "media_only": "только медиа",
+        "text_only": "только текст",
+        "disabled": "не настроено",
+    }[_ref_content_mode(ref)]
+
+
+def _cycle_ref_content_mode(ref: dict) -> str:
+    current = _ref_content_mode(ref)
+    if current not in REF_CONTENT_MODES:
+        current = "text_media"
+    next_mode = REF_CONTENT_MODES[(REF_CONTENT_MODES.index(current) + 1) % len(REF_CONTENT_MODES)]
+    ref["include_text"] = next_mode in ("text_media", "text_only")
+    ref["take_media"] = next_mode in ("text_media", "media_only")
+    if next_mode == "media_only":
+        ref["allow_media_only"] = True
+    else:
+        ref.pop("allow_media_only", None)
+    return next_mode
+
 async def screen_references(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
     """Экран управления каналами-донорами (референсами)."""
     ch = _load_channel(handle)
@@ -2539,8 +2576,11 @@ async def screen_references(qm, context: ContextTypes.DEFAULT_TYPE, handle: str)
 
     lines = [f"🔗 <b>Референс-каналы</b>  <code>{cid}</code>\n"]
     if refs:
-        lines.append("Бот раз в день забирает новые посты доноров в очередь "
-                     "(медиа как есть, текст — по настройке).\n")
+        lines.append(
+            "Бот раз в день забирает новые посты доноров в очередь.\n"
+            "Режим донора задает, что брать: текст + медиа, только медиа или только текст.\n"
+            "Только медиа включай только для доверенных доноров.\n"
+        )
     else:
         lines.append("Доноров пока нет.\n\nДобавь канал-донор — бот будет брать его "
                      "свежие посты: медиа как есть, текст можно перефразировать или "
@@ -2549,21 +2589,20 @@ async def screen_references(qm, context: ContextTypes.DEFAULT_TYPE, handle: str)
     rows = []
     for i, r in enumerate(refs):
         rp = "вкл" if r.get("rephrase", True) else "выкл"
-        md = "вкл" if r.get("take_media", True) else "выкл"
-        tx = "вкл" if r.get("include_text", True) else "выкл"
         ad = "вкл" if r.get("skip_ads", True) else "выкл"
-        lines.append(f"\n{i+1}. <code>{r.get('handle')}</code>")
+        mode = _ref_content_mode_label(r)
+        rp = "н/д" if _ref_content_mode(r) == "media_only" else rp
+        lines.append(f"\n{i+1}. <code>{r.get('handle')}</code>\n   Режим: <b>{mode}</b>")
         rows.append([InlineKeyboardButton(f"{i+1}. {r.get('handle')}", callback_data=f"ui:ch_refs:{handle}")])
         rows.append([
+            InlineKeyboardButton(f"🧩 режим: {mode}", callback_data=f"ui:ref_tgl:{handle}:{i}:mode"),
+        ])
+        rows.append([
             InlineKeyboardButton(f"✍️ перефраз: {rp}", callback_data=f"ui:ref_tgl:{handle}:{i}:rp"),
-            InlineKeyboardButton(f"📝 текст: {tx}", callback_data=f"ui:ref_tgl:{handle}:{i}:it"),
-        ])
-        rows.append([
-            InlineKeyboardButton(f"🖼 медиа: {md}", callback_data=f"ui:ref_tgl:{handle}:{i}:tm"),
-            InlineKeyboardButton("🤖 текст по медиа: недоступно", callback_data=f"ui:ref_tgl:{handle}:{i}:gt"),
-        ])
-        rows.append([
             InlineKeyboardButton(f"🚫 фильтр рекламы: {ad}", callback_data=f"ui:ref_tgl:{handle}:{i}:sa"),
+        ])
+        rows.append([
+            InlineKeyboardButton("🤖 текст по медиа: недоступно", callback_data=f"ui:ref_tgl:{handle}:{i}:gt"),
             InlineKeyboardButton("🗑 удалить",              callback_data=f"ui:ref_del:{handle}:{i}"),
         ])
 
@@ -2587,6 +2626,7 @@ async def action_ref_toggle(qm, context, handle: str, idx: int, flag: str):
         "sa": "skip_ads",
         "it": "include_text",
         "gt": "generate_text_from_media",
+        "mode": "content_mode",
         "rephrase": "rephrase",
         "take_media": "take_media",
         "skip_ads": "skip_ads",
@@ -2597,7 +2637,14 @@ async def action_ref_toggle(qm, context, handle: str, idx: int, flag: str):
         await qm.answer("Текст по медиа пока недоступен: нет безопасного vision-пайплайна.", show_alert=True)
         await screen_references(qm, context, handle)
         return
-    if 0 <= idx < len(refs) and flag in ("rephrase", "take_media", "skip_ads", "include_text"):
+    if 0 <= idx < len(refs) and flag == "content_mode":
+        _cycle_ref_content_mode(refs[idx])
+        _save_channel(ch)
+    elif 0 <= idx < len(refs) and flag in ("rephrase", "take_media", "skip_ads", "include_text"):
+        if flag == "rephrase" and _ref_content_mode(refs[idx]) == "media_only":
+            await qm.answer("В режиме «только медиа» перефраз не применяется.", show_alert=True)
+            await screen_references(qm, context, handle)
+            return
         cur = refs[idx].get(flag, True)
         next_ref = dict(refs[idx])
         next_ref[flag] = not cur
