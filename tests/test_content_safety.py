@@ -1013,6 +1013,53 @@ class ContentSafetyTest(unittest.TestCase):
                 self.assertFalse(validation["allowed"])
                 self.assertEqual(validation["reason_code"], "blocked_output_content")
 
+    def test_movie_channel_allows_fictional_war_titles(self):
+        channel = {
+            "channel_id": "@kinoclever",
+            "name": "Киноклевер",
+            "topic": "фильмы, сериалы, обзоры кино и подборки",
+            "channel_type": "content",
+        }
+        samples = [
+            "Война по времени: почему этот фантастический фильм цепляет с первых минут",
+            "Война миров — классика фантастики про столкновение людей с неизвестной угрозой",
+            "Терминатор: чем хорош культовый боевик и почему его всё ещё пересматривают",
+        ]
+        for sample in samples:
+            with self.subTest(sample=sample):
+                safety = evaluate_topic_candidate(channel, {"topic": sample, "source": "rss"})
+                self.assertIn(safety["decision"], {"allowed", "allowed_safe"})
+                validation = validate_generated_post(
+                    channel,
+                    {"format": "разбор", "content": sample},
+                    {"decision": "allowed", "safe_topic": sample},
+                    {},
+                )
+                self.assertTrue(validation["allowed"])
+
+    def test_movie_channel_still_blocks_real_world_war_and_adult_content(self):
+        channel = {
+            "channel_id": "@kinoclever",
+            "name": "Киноклевер",
+            "topic": "фильмы, сериалы, обзоры кино и подборки",
+            "channel_type": "content",
+        }
+        blocked_samples = [
+            "Фильм про войну в Украине и реальные обстрелы",
+            "Эротический фильм с нюдесами и фетишами",
+        ]
+        for sample in blocked_samples:
+            with self.subTest(sample=sample):
+                safety = evaluate_topic_candidate(channel, {"topic": sample, "source": "rss"})
+                self.assertEqual(safety["decision"], "blocked")
+                validation = validate_generated_post(
+                    channel,
+                    {"format": "разбор", "content": sample},
+                    {"decision": "allowed", "safe_topic": sample},
+                    {},
+                )
+                self.assertFalse(validation["allowed"])
+
     def test_generated_ad_or_giveaway_output_rejected(self):
         validation = validate_generated_post(
             {"channel_id": "@plain", "topic": "игровые новости"},

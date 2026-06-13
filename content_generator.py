@@ -164,7 +164,7 @@ class ContentGenerator:
         # жёг бы LLM на гарантированных отказах. Сразу выходим с понятной причиной.
         try:
             from ai_client import _contains_forbidden
-            if _contains_forbidden(f"{channel.get('topic','')} {channel.get('name','')}"):
+            if _contains_forbidden(f"{channel.get('topic','')} {channel.get('name','')}", channel):
                 logger.warning(f"Генерация отклонена [{channel_id}]: тема канала запрещена")
                 return {
                     "channel_id": channel_id, "generated": 0, "skipped": 0,

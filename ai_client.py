@@ -256,10 +256,16 @@ _FORBIDDEN_WORD_RE = re.compile(
 )
 
 
-def _contains_forbidden(content: str) -> bool:
+def _contains_forbidden(content: str, channel: dict | None = None) -> bool:
     """True, если в готовом посте есть запретный контент (война/Украина/дрон/ЛГБТ/18+ и т.п.).
     Однозначные стемы — подстрокой; неоднозначные (секс/анал/оргия) — по границе слова,
     чтобы не зарубить «канал», «анализ», «категория» и т.п."""
+    if channel:
+        try:
+            from content_safety import _blocked_content_for_channel
+            return _blocked_content_for_channel(channel, content)
+        except Exception:
+            pass
     low = (content or "").lower()
     if any(stem in low for stem in _CONTENT_FORBIDDEN_STEMS):
         return True
@@ -737,7 +743,7 @@ async def generate_post(
 
     # Защита: запретный контент мог просочиться в тело поста (война/Украина/дрон/ЛГБТ),
     # даже если тема словами не пахла. Такое не публикуем.
-    if _contains_forbidden(content):
+    if _contains_forbidden(content, channel):
         raise PostGenerationError(
             f"Пост содержит запретный контент — отклонён "
             f"(канал {channel['channel_id']}, тема: {topic[:60]})"

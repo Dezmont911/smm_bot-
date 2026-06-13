@@ -27,6 +27,37 @@ BLOCKED_CONTENT_RE = re.compile(
     r"(?iu)(\bрф\b|\bвс\s+росси[ия]\b|\bмо\s+рф\b|\bсво\b|\bвсу\b)"
 )
 
+NON_RELAXABLE_BLOCKED_TERMS = (
+    "порно", "порнограф", "эроти", "хентай", "hentai", "нюдес", "нюдс",
+    "nude", "nudes", "фетиш", "fetish", "наркотик", "казино", "ставк на спорт",
+    "мошенн", "скам", "террор", "теракт", "экстрем", "лгбт",
+    "украин", "зеленск", "путин", "обстрел", "минобор", "мобилизац",
+    "красноармейск", "покровск", "запорож", "новоселов", "марочко",
+    "госдум", "сенатор", "депутат", "законопроект", "санкц",
+    "правозащит", "цензур",
+)
+
+ENTERTAINMENT_ARCHETYPES = {
+    "gaming", "gaming_casual", "gaming_esports", "anime", "memes",
+    "movie", "movies", "cinema", "film", "films", "serials",
+}
+
+ENTERTAINMENT_PROFILE_MARKERS = (
+    "кино", "фильм", "фильмы", "сериал", "сериалы", "киноклевер", "kinoclever",
+    "movie", "movies", "film", "films", "cinema", "serial", "netflix",
+    "аниме", "тайтл", "игр", "gaming", "steam", "playstation", "xbox",
+)
+
+ENTERTAINMENT_TEXT_MARKERS = (
+    "фильм", "фильме", "фильма", "фильмы", "кино", "кинокартин", "сериал",
+    "сериале", "сериала", "сезон", "серия", "сюжет", "персонаж", "герой",
+    "героин", "сцена", "трейлер", "премьера", "режиссер", "режиссёр",
+    "актер", "актёр", "актрис", "роль", "жанр", "франшиз", "боевик",
+    "триллер", "хоррор", "фантастик", "комед", "драма", "аниме", "тайтл",
+    "игра", "игре", "игры", "геймплей", "steam", "playstation", "xbox",
+    "терминатор", "война миров", "звездные войны", "звёздные войны", "star wars",
+)
+
 REFUSAL_START_MARKERS = (
     "я не могу написать", "я не могу помочь", "я не могу создать",
     "извините, но я не могу", "извини, но я не могу",
@@ -358,9 +389,40 @@ def _blocked_content(text: str) -> bool:
     return any(term in low for term in BLOCKED_TERMS) or bool(BLOCKED_CONTENT_RE.search(low))
 
 
-def _intent_for(text: str) -> str:
+def _is_entertainment_channel(channel: dict) -> bool:
+    archetype = _low(channel.get("archetype"))
+    if archetype in ENTERTAINMENT_ARCHETYPES:
+        return True
+    profile = _low(" ".join([
+        str(channel.get("channel_id") or ""),
+        str(channel.get("name") or ""),
+        str(channel.get("topic") or ""),
+        str(channel.get("tone") or ""),
+    ]))
+    return any(marker in profile for marker in ENTERTAINMENT_PROFILE_MARKERS)
+
+
+def _looks_like_entertainment_context(text: str) -> bool:
     low = _low(text)
-    if _blocked_content(low):
+    return any(marker in low for marker in ENTERTAINMENT_TEXT_MARKERS)
+
+
+def _blocked_content_for_channel(channel: dict, text: str) -> bool:
+    low = _low(text)
+    if not low:
+        return False
+    if any(term in low for term in NON_RELAXABLE_BLOCKED_TERMS) or bool(BLOCKED_CONTENT_RE.search(low)):
+        return True
+    if not any(term in low for term in BLOCKED_TERMS):
+        return False
+    if _is_entertainment_channel(channel) and _looks_like_entertainment_context(low):
+        return False
+    return True
+
+
+def _intent_for(text: str, channel: dict | None = None) -> str:
+    low = _low(text)
+    if _blocked_content_for_channel(channel or {}, low):
         return "illegal_facilitation"
     if any(w in low for w in ("урок", "обуч", "как ", "почему", "развива", "навык")):
         return "education"
@@ -419,7 +481,7 @@ def evaluate_topic_candidate(channel: dict, topic_data: dict) -> dict:
     raw_topic = _clean_text(topic_data.get("topic", ""), 700)
     source = _clean_text(topic_data.get("source", "unknown"), 80)
     normalized = _clean_text(raw_topic, 500)
-    intent = _intent_for(raw_topic)
+    intent = _intent_for(raw_topic, channel)
 
     result = {
         "decision": "allowed",
@@ -454,7 +516,7 @@ def evaluate_topic_candidate(channel: dict, topic_data: dict) -> dict:
         })
         return result
 
-    if _blocked_content(raw_topic):
+    if _blocked_content_for_channel(channel, raw_topic):
         result.update({
             "decision": "blocked",
             "risk_level": "high",
@@ -761,7 +823,7 @@ def validate_imported_post(channel: dict, post: dict) -> dict:
         result.update({"allowed": False, "decision": "blocked", "reason_code": "meta_or_refusal_output"})
         return result
 
-    if content and _blocked_content(content):
+    if content and _blocked_content_for_channel(channel, content):
         result.update({"allowed": False, "decision": "blocked", "reason_code": "blocked_imported_content"})
         return result
 
@@ -829,7 +891,7 @@ def validate_generated_post(channel: dict, post: dict, safety: dict, brief: dict
         result.update({"allowed": False, "decision": "blocked", "reason_code": "meta_or_refusal_output"})
         return result
 
-    if _blocked_content(content):
+    if _blocked_content_for_channel(channel, content):
         result.update({"allowed": False, "decision": "blocked", "reason_code": "blocked_output_content"})
         return result
 
@@ -948,7 +1010,7 @@ def build_safe_channel_profile(analysis: dict) -> dict:
     audience = _clean_text(analysis.get("audience", ""), 220)
     notes = _clean_text(analysis.get("analysis_notes", ""), 400)
 
-    if analysis.get("forbidden") or _blocked_content(topic):
+    if analysis.get("forbidden") or _blocked_content_for_channel(analysis, topic):
         return {
             "safe_topic": None,
             "archetype": archetype,
