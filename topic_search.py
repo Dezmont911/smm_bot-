@@ -214,7 +214,7 @@ async def discover_topics(
                 f"web_search [{channel_id}] ({model}): тем не найдено, "
                 f"{'пробую Sonnet' if model == cfg.CLAUDE_MODEL else 'фолбэк не помог'}"
             )
-        except anthropic.APIError as e:
+        except (anthropic.APIError, anthropic.APIStatusError) as e:
             if _is_anthropic_billing_error(e):
                 topics = await _search_openai_fallback(
                     channel, count, used_topics, allowed_domains

@@ -16,6 +16,14 @@ BLOCKED_TERMS = (
     "порно", "порнограф", "эроти", "наркотик", "казино", "ставк на спорт",
     "мошенн", "скам", "террор", "теракт", "экстрем", "оружие", "дрон",
     "ракета", "обстрел", "война", "украин", "лгбт",
+    "военн", "войск", "всу", "минобор", "мобилизац", "фронт",
+    "штурм", "солдат", "оборон", "красноармейск", "покровск", "запорож",
+    "новоселов", "марочко", "госдум", "сенатор", "депутат", "законопроект",
+    "санкц", "правозащит", "цензур",
+)
+
+BLOCKED_CONTENT_RE = re.compile(
+    r"(?iu)(\bрф\b|\bвс\s+росси[ия]\b|\bмо\s+рф\b|\bсво\b|\bвсу\b)"
 )
 
 REFUSAL_START_MARKERS = (
@@ -142,6 +150,11 @@ IMPORT_AD_MARKERS = (
     "по вопросам рекламы", "erid", "ерид", "#ad", "промокод",
     "партнерский материал", "партнёрский материал", "рекламная интеграция",
     "бесплатная линия", "telegram / whatsapp", "ссылка на чат в whatsapp",
+    "подпишись", "подписывайся", "наш канал", "больше в",
+)
+
+IMPORT_AD_WORD_RE = re.compile(
+    r"(?iu)\b(max|розыгрыш\w*|разыгр\w*|конкурс\w*)\b"
 )
 
 NAV_ONLY_MARKERS = (
@@ -324,7 +337,7 @@ def _looks_like_refusal(text: str) -> bool:
 
 def _blocked_content(text: str) -> bool:
     low = _low(text)
-    return any(term in low for term in BLOCKED_TERMS)
+    return any(term in low for term in BLOCKED_TERMS) or bool(BLOCKED_CONTENT_RE.search(low))
 
 
 def _intent_for(text: str) -> str:
@@ -649,7 +662,7 @@ def _looks_like_marketplace_offtopic(content: str) -> bool:
 
 def _looks_like_import_ad_or_offtopic(content: str) -> bool:
     low = _plain_from_html(content).lower()
-    return any(
+    return bool(IMPORT_AD_WORD_RE.search(low)) or any(
         marker in low
         for marker in IMPORT_AD_MARKERS + MARKETPLACE_OFFTOPIC_MARKERS + MARKETPLACE_SERVICE_AD_MARKERS
     )
@@ -675,6 +688,15 @@ def validate_imported_post(channel: dict, post: dict) -> dict:
 
     if not content and not has_media:
         result.update({"allowed": False, "decision": "blocked", "reason_code": "empty_imported_post"})
+        return result
+
+    if post.get("format") == "reference" and has_media and not content and not post.get("allow_media_only"):
+        result.update({
+            "allowed": False,
+            "decision": "review",
+            "reason_code": "media_only_reference_no_text",
+            "notes": "reference media has no text, so text-only safety cannot classify it",
+        })
         return result
 
     if content and _looks_like_refusal(content):
@@ -751,6 +773,10 @@ def validate_generated_post(channel: dict, post: dict, safety: dict, brief: dict
 
     if _blocked_content(content):
         result.update({"allowed": False, "decision": "blocked", "reason_code": "blocked_output_content"})
+        return result
+
+    if _looks_like_import_ad_or_offtopic(content):
+        result.update({"allowed": False, "decision": "review", "reason_code": "ad_or_offtopic_output"})
         return result
 
     if _requires_marketplace_link(channel, post) and not _has_html_link(content):

@@ -580,6 +580,7 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
     include_text = _ref_flag(ref_config, "include_text", True)
     take_media = _ref_flag(ref_config, "take_media", True)
     generate_text_from_media = _ref_flag(ref_config, "generate_text_from_media", False)
+    allow_media_only = (not include_text) or _ref_flag(ref_config, "allow_media_only", False)
     if not include_text and not take_media:
         logger.warning(
             f"Reference skipped [{channel_id}] {handle}/{p.get('id')}: text_and_media_disabled"
@@ -614,6 +615,7 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
             "format": "reference",
             "topic": topic,
             "media_type": "album" if (take_media and p.get("group_id")) else kind,
+            "allow_media_only": allow_media_only,
         },
     )
     if not import_validation.get("allowed"):
@@ -685,6 +687,11 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
     if content and _looks_like_meta_output(content):
         logger.warning(
             f"Reference skipped [{channel_id}] {handle}/{p.get('id')}: meta_or_refusal_output"
+        )
+        return None
+    if not content and kind and not allow_media_only:
+        logger.warning(
+            f"Reference skipped [{channel_id}] {handle}/{p.get('id')}: media_only_reference_no_text"
         )
         return None
     if not content and not kind:

@@ -865,8 +865,8 @@ class ContentGenerator:
     async def _filter_relevant(self, channel: dict, topics: list[dict], count: int) -> list[dict]:
         """
         Отсев off-topic тем по эмбеддингам (reuse dedup). evergreen/fallback не трогаем.
-        In-scope fallback: не оставляем меньше floor — добираем лучших из отсеянных,
-        чтобы гейт никогда не приводил к пустому буферу. Порядок тем сохраняем.
+        Если тема не прошла порог, не возвращаем её в пул: пустой буфер лучше,
+        чем публикация чужой политики, спорта или военных новостей в нишевом канале.
         """
         if not topics or dedup.backend() != "embedding":
             return topics  # без эмбеддингов гейт не работает — пропускаем как есть
@@ -906,12 +906,6 @@ class ContentGenerator:
                 results.append(t)
             else:
                 dropped.append((sim, t))
-
-        # Гарантируем минимум кандидатов: добираем лучших из отсеянных
-        floor = max(3, count // 2)
-        if len(results) < floor and dropped:
-            dropped.sort(key=lambda x: x[0], reverse=True)
-            results += [t for _, t in dropped[:floor - len(results)]]
 
         if dropped:
             ex = "; ".join(f"{sim:.2f} {t.get('topic','')[:35]}" for sim, t in dropped[:3])

@@ -876,7 +876,7 @@ class ContentSafetyTest(unittest.TestCase):
             {},
         )
         self.assertFalse(validation["allowed"])
-        self.assertEqual(validation["reason_code"], "missing_marketplace_product_link")
+        self.assertEqual(validation["reason_code"], "ad_or_offtopic_output")
 
     def test_marketplace_reference_advisory_post_is_rejected(self):
         validation = validate_generated_post(
@@ -893,7 +893,7 @@ class ContentSafetyTest(unittest.TestCase):
             {},
         )
         self.assertFalse(validation["allowed"])
-        self.assertEqual(validation["reason_code"], "missing_marketplace_link")
+        self.assertEqual(validation["reason_code"], "ad_or_offtopic_output")
 
     def test_import_guard_rejects_navigation_only_text(self):
         validation = validate_imported_post(
@@ -951,6 +951,60 @@ class ContentSafetyTest(unittest.TestCase):
         )
         self.assertFalse(validation["allowed"])
         self.assertEqual(validation["reason_code"], "missing_marketplace_link")
+
+    def test_war_and_politics_variants_are_blocked(self):
+        channel = {"channel_id": "@travel", "topic": "путешествия, маршруты и красивые места"}
+        samples = [
+            "Военные РФ подошли вплотную к запорожской Новоселовке",
+            "Названа главная задача ВС России для продвижения у Красноармейска",
+            "Узнать свои права при онлайн-цензуре",
+            "Сенатор предложил новый законопроект",
+        ]
+        for sample in samples:
+            with self.subTest(sample=sample):
+                safety = evaluate_topic_candidate(channel, {"topic": sample, "source": "rss"})
+                self.assertEqual(safety["decision"], "blocked")
+                validation = validate_generated_post(
+                    channel,
+                    {"format": "инфоповод", "content": sample},
+                    {"decision": "allowed", "safe_topic": sample},
+                    {},
+                )
+                self.assertFalse(validation["allowed"])
+                self.assertEqual(validation["reason_code"], "blocked_output_content")
+
+    def test_generated_ad_or_giveaway_output_rejected(self):
+        validation = validate_generated_post(
+            {"channel_id": "@plain", "topic": "игровые новости"},
+            {
+                "format": "reference",
+                "content": "Розыгрыш в MAX: подпишись на наш канал и забери промокод.",
+            },
+            {"decision": "allowed", "safe_topic": "reference"},
+            {},
+        )
+        self.assertFalse(validation["allowed"])
+        self.assertEqual(validation["reason_code"], "ad_or_offtopic_output")
+
+    def test_reference_media_only_without_explicit_allow_rejected(self):
+        validation = validate_imported_post(
+            {"channel_id": "@plain", "topic": "новости"},
+            {"format": "reference", "content": "", "media_type": "photo"},
+        )
+        self.assertFalse(validation["allowed"])
+        self.assertEqual(validation["reason_code"], "media_only_reference_no_text")
+
+    def test_reference_media_only_explicit_allow_is_allowed(self):
+        validation = validate_imported_post(
+            {"channel_id": "@plain", "topic": "новости"},
+            {
+                "format": "reference",
+                "content": "",
+                "media_type": "photo",
+                "allow_media_only": True,
+            },
+        )
+        self.assertTrue(validation["allowed"])
 
 
 if __name__ == "__main__":

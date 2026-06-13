@@ -532,22 +532,21 @@ class ReferenceTextMediaModesTest(unittest.TestCase):
         self.assertIsNone(result)
         add_mock.assert_not_called()
 
-    def test_empty_and_emoji_caption_do_not_call_llm(self):
+    def test_empty_and_emoji_caption_do_not_call_llm_or_save_default_media_only(self):
         for idx, text in enumerate(("", "🔥🔥🔥"), start=5):
-            captured, fake_add = self._capture_add()
             p = {"id": idx, "text": text, "media_kind": "photo"}
 
             async def fake_rephrase(_text, _channel):
                 raise AssertionError("LLM must not be called for non-meaningful captions")
 
             with mock.patch("ai_client.rephrase_text", new=fake_rephrase), \
-                 mock.patch.object(ri.buffer, "add", side_effect=fake_add):
+                 mock.patch.object(ri.buffer, "add") as add_mock:
                 result = asyncio.run(ri._store_reference_post(
                     self.channel, "@plain", "@donor", p, do_rephrase=True,
                     ref_config={"include_text": True, "take_media": True},
                 ))
-            self.assertEqual(result, [idx])
-            self.assertEqual(captured["content"], "")
+            self.assertIsNone(result)
+            add_mock.assert_not_called()
 
     def test_marketplace_text_off_preserves_product_link(self):
         captured, fake_add = self._capture_add()
@@ -596,16 +595,15 @@ class ReferenceTextMediaModesTest(unittest.TestCase):
         self.assertIn("Useful caption", captured["content"])
         self.assertNotIn("пришли текст", captured["content"].lower())
 
-    def test_generate_text_from_media_unavailable_is_media_only(self):
-        captured, fake_add = self._capture_add()
+    def test_generate_text_from_media_unavailable_is_rejected_without_explicit_allow(self):
         p = {"id": 10, "text": "", "media_kind": "photo"}
-        with mock.patch.object(ri.buffer, "add", side_effect=fake_add):
+        with mock.patch.object(ri.buffer, "add") as add_mock:
             result = asyncio.run(ri._store_reference_post(
                 self.channel, "@plain", "@donor", p, do_rephrase=True,
                 ref_config={"include_text": True, "take_media": True, "generate_text_from_media": True},
             ))
-        self.assertEqual(result, [10])
-        self.assertEqual(captured["content"], "")
+        self.assertIsNone(result)
+        add_mock.assert_not_called()
 
 
 class PosterCaptionClippingTest(unittest.TestCase):
