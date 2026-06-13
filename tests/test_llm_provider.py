@@ -178,6 +178,7 @@ class LLMProviderTests(unittest.TestCase):
             claude_helper.aclient = original_anthropic_client
 
     def test_topic_search_anthropic_credit_error_uses_openai_fallback(self):
+        original_provider = claude_helper.cfg.LLM_PROVIDER
         original_openai_key = claude_helper.cfg.OPENAI_API_KEY
         original_openai_client = claude_helper.openai_client
         original_topic_client = topic_search.aclient
@@ -190,6 +191,7 @@ class LLMProviderTests(unittest.TestCase):
             return '["свежая тема 1", "свежая тема 2"]'
 
         try:
+            claude_helper.cfg.LLM_PROVIDER = "anthropic"
             claude_helper.cfg.OPENAI_API_KEY = "test-key"
             claude_helper.openai_client = _FakeOpenAIClient()
             topic_search.aclient = _FakeAnthropicClient()
@@ -210,6 +212,54 @@ class LLMProviderTests(unittest.TestCase):
             self.assertEqual(captured["allowed_domains"], ["example.com"])
             self.assertEqual(captured["purpose"], "topic_search_openai_web_search_fallback")
         finally:
+            claude_helper.cfg.LLM_PROVIDER = original_provider
+            claude_helper.cfg.OPENAI_API_KEY = original_openai_key
+            claude_helper.openai_client = original_openai_client
+            topic_search.aclient = original_topic_client
+            topic_search.openai_web_search_text = original_fallback
+
+    def test_topic_search_openai_provider_uses_openai_first(self):
+        original_provider = claude_helper.cfg.LLM_PROVIDER
+        original_openai_key = claude_helper.cfg.OPENAI_API_KEY
+        original_openai_client = claude_helper.openai_client
+        original_topic_client = topic_search.aclient
+        original_fallback = topic_search.openai_web_search_text
+
+        captured = {}
+
+        class _FailIfAnthropicCalled:
+            class messages:
+                @staticmethod
+                async def create(**kwargs):
+                    raise AssertionError("Anthropic should not be called when LLM_PROVIDER=openai")
+
+        async def fake_openai_web_search(**kwargs):
+            captured.update(kwargs)
+            return '["openai topic 1", "openai topic 2"]'
+
+        try:
+            claude_helper.cfg.LLM_PROVIDER = "openai"
+            claude_helper.cfg.OPENAI_API_KEY = "test-key"
+            claude_helper.openai_client = _FakeOpenAIClient()
+            topic_search.aclient = _FailIfAnthropicCalled()
+            topic_search.openai_web_search_text = fake_openai_web_search
+            topics = __import__("asyncio").run(
+                topic_search.discover_topics(
+                    {
+                        "channel_id": "@test",
+                        "name": "Test",
+                        "topic": "test topic",
+                        "search_domains": ["example.com"],
+                    },
+                    count=2,
+                    used_topics=[],
+                )
+            )
+            self.assertEqual(topics, ["openai topic 1", "openai topic 2"])
+            self.assertEqual(captured["allowed_domains"], ["example.com"])
+            self.assertEqual(captured["purpose"], "topic_search_openai_web_search_primary")
+        finally:
+            claude_helper.cfg.LLM_PROVIDER = original_provider
             claude_helper.cfg.OPENAI_API_KEY = original_openai_key
             claude_helper.openai_client = original_openai_client
             topic_search.aclient = original_topic_client

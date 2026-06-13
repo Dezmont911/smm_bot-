@@ -132,6 +132,8 @@ async def _search_openai_fallback(
     count: int,
     used_topics: list[str],
     allowed_domains: list[str] | None = None,
+    purpose: str = "topic_search_openai_web_search_fallback",
+    reason: str = "Anthropic недоступен",
 ) -> list[str]:
     if not _openai_available():
         return []
@@ -147,13 +149,13 @@ async def _search_openai_fallback(
             ),
             temperature=0.5,
             retries=1,
-            purpose="topic_search_openai_web_search_fallback",
+            purpose=purpose,
             allowed_domains=allowed_domains,
         )
         topics = _parse_topics(text)
         if topics:
             logger.info(
-                f"web_search [{channel_id}]: Anthropic недоступен, "
+                f"web_search [{channel_id}]: {reason}, "
                 f"OpenAI web_search fallback дал {len(topics)} тем"
             )
             return topics[:count]
@@ -183,6 +185,21 @@ async def discover_topics(
     used_topics = used_topics or []
     allowed_domains = channel.get("search_domains") or None
     prompt = _build_prompt(channel, count, used_topics)
+
+    if (cfg.LLM_PROVIDER or "").strip().lower() == "openai":
+        topics = await _search_openai_fallback(
+            channel,
+            count,
+            used_topics,
+            allowed_domains,
+            purpose="topic_search_openai_web_search_primary",
+            reason="LLM_PROVIDER=openai",
+        )
+        if topics:
+            return topics
+        logger.warning(
+            f"web_search [{channel_id}]: OpenAI primary returned no topics, trying Anthropic"
+        )
 
     for model in (cfg.CLAUDE_MODEL, SEARCH_FALLBACK_MODEL):
         try:
