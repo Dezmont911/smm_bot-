@@ -123,6 +123,45 @@ MENU_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 ADMIN_SETTINGS_PATH = Path(__file__).parent / "admin_settings.json"
+UI_CALLBACK_COOLDOWN_SEC = 0.8
+_UI_CALLBACK_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
+_UI_CALLBACK_LAST_DONE: dict[tuple[int, int], float] = {}
+
+
+def _ui_callback_key(query) -> tuple[int, int]:
+    user = getattr(query, "from_user", None)
+    message = getattr(query, "message", None)
+    user_id = int(getattr(user, "id", 0) or 0)
+    chat_id = int(getattr(message, "chat_id", 0) or user_id)
+    return chat_id, user_id
+
+
+async def _enter_ui_callback(query) -> tuple[bool, asyncio.Lock | None, str | None]:
+    key = _ui_callback_key(query)
+    lock = _UI_CALLBACK_LOCKS.setdefault(key, asyncio.Lock())
+    if lock.locked():
+        return False, None, "Подожди, предыдущее действие ещё выполняется."
+
+    last_done = _UI_CALLBACK_LAST_DONE.get(key, 0.0)
+    if time.monotonic() - last_done < UI_CALLBACK_COOLDOWN_SEC:
+        return False, None, "Слишком быстро. Подожди секунду."
+
+    await lock.acquire()
+    return True, lock, None
+
+
+def _finish_ui_callback(query, lock: asyncio.Lock | None):
+    if lock is None:
+        return
+    key = _ui_callback_key(query)
+    _UI_CALLBACK_LAST_DONE[key] = time.monotonic()
+    lock.release()
+    if len(_UI_CALLBACK_LAST_DONE) > 5000:
+        cutoff = time.monotonic() - 3600
+        for old_key, ts in list(_UI_CALLBACK_LAST_DONE.items()):
+            if ts < cutoff:
+                _UI_CALLBACK_LAST_DONE.pop(old_key, None)
+                _UI_CALLBACK_LOCKS.pop(old_key, None)
 
 
 def _load_admin_settings() -> dict:
@@ -6156,6 +6195,18 @@ async def action_admin_pro(qm, context, uid: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def ui_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    allowed, lock, message = await _enter_ui_callback(query)
+    if not allowed:
+        await query.answer(message or "Подожди секунду.")
+        return
+    try:
+        await _ui_router_impl(update, context)
+    finally:
+        _finish_ui_callback(query, lock)
+
+
+async def _ui_router_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Центральный обработчик всех callback_data начинающихся с 'ui:'.
     Парсит callback_data и вызывает нужный экран/действие.
