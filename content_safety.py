@@ -130,6 +130,10 @@ CELEB_DRAMA_PROFILE_MARKERS = (
 )
 
 CELEB_DRAMA_CHANNEL_MARKERS = (
+    # Strong channel-identity markers only.
+    # Weak event/profile words like "образ", "роман", "фанат" belong to
+    # CELEB_DRAMA_PROFILE_MARKERS. If they are added here, unrelated channels
+    # such as wallpaper/media channels can be misclassified as blogger news.
     "блогер", "блогерск", "инфлюенсер", "интернет-персон", "селеб", "звезд", "звёзд",
     "ютуб", "youtube", "тикток", "tiktok", "стример", "соцсет",
     "инстаграм", "instagram", "facebook", "фейсбук", "вконтакте",

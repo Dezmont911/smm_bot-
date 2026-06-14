@@ -9,6 +9,7 @@ from content_safety import (
     build_safe_channel_profile,
     dry_run_topic,
     evaluate_topic_candidate,
+    is_celeb_drama_channel,
     is_kids_education_channel,
     validate_generated_post,
     validate_imported_post,
@@ -1265,6 +1266,90 @@ class ContentSafetyTest(unittest.TestCase):
         )
         self.assertFalse(validation["allowed"])
         self.assertEqual(validation["reason_code"], "blocked_imported_content")
+
+
+class ChannelSafetyIsolationTest(unittest.TestCase):
+    def test_blogger_news_policy_does_not_classify_wallpaper_channels(self):
+        wallpaper_channel = {
+            "channel_id": "@wallgramava",
+            "name": "Worldgram",
+            "channel_type": "content",
+            "topic": "обои, заставки, аватарки и красивые изображения для телефона",
+        }
+
+        self.assertFalse(is_celeb_drama_channel(wallpaper_channel))
+
+        imported = validate_imported_post(
+            wallpaper_channel,
+            {
+                "format": "reference",
+                "content": "",
+                "media_type": "photo",
+                "allow_media_only": True,
+            },
+        )
+        self.assertTrue(imported["allowed"])
+
+    def test_blogger_news_allows_platform_context_but_blocks_generic_promos(self):
+        platform_topic = evaluate_topic_candidate(
+            BLOGGER_NEWS_CHANNEL,
+            {
+                "topic": "MrBeast запустил новый формат коротких видео в Instagram и YouTube",
+                "source": "search",
+            },
+        )
+        self.assertEqual(platform_topic["decision"], "allowed_safe")
+
+        imported_promo = validate_imported_post(
+            {"channel_id": "@plain", "topic": "игровые новости"},
+            {
+                "format": "reference",
+                "content": "Мы в Max: подпишись на наш канал и забери промокод.",
+            },
+        )
+        self.assertFalse(imported_promo["allowed"])
+        self.assertEqual(imported_promo["reason_code"], "import_ad_or_offtopic")
+
+    def test_robotop_policy_does_not_override_marketplace_or_movie_channels(self):
+        kids_topic = evaluate_topic_candidate(
+            ROBO_CHANNEL,
+            {"topic": "Как робототехника помогает ребенку развивать логику", "source": "manual"},
+        )
+        self.assertEqual(kids_topic["reason_code"], "kids_education_fit")
+
+        marketplace_topic = evaluate_topic_candidate(
+            MARKETPLACE_CHANNEL,
+            {"topic": "Подборка недорогих товаров Wildberries для кухни", "source": "manual"},
+        )
+        self.assertEqual(marketplace_topic["reason_code"], "marketplace_product_fit")
+
+        movie_channel = {
+            "channel_id": "@kinoclever",
+            "name": "Киноклевер",
+            "topic": "фильмы, сериалы, обзоры кино и подборки",
+            "channel_type": "content",
+        }
+        movie_topic = "Война миров: почему этот фантастический фильм до сих пор работает"
+        movie_safety = evaluate_topic_candidate(movie_channel, {"topic": movie_topic, "source": "rss"})
+        self.assertIn(movie_safety["decision"], {"allowed", "allowed_safe"})
+
+    def test_hard_news_stays_blocked_outside_movie_context(self):
+        travel_channel = {
+            "channel_id": "@just_the_view",
+            "topic": "путешествия, маршруты, красивые места и советы туристам",
+        }
+        war_topic = "Названа главная задача ВС России для продвижения у Красноармейска"
+        safety = evaluate_topic_candidate(travel_channel, {"topic": war_topic, "source": "rss"})
+        self.assertEqual(safety["decision"], "blocked")
+
+        validation = validate_generated_post(
+            travel_channel,
+            {"format": "разбор", "content": war_topic},
+            {"decision": "allowed", "safe_topic": war_topic},
+            {},
+        )
+        self.assertFalse(validation["allowed"])
+        self.assertEqual(validation["reason_code"], "blocked_output_content")
 
 
 if __name__ == "__main__":
