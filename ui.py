@@ -2811,6 +2811,17 @@ _MANUAL_DEDUP_STATUSES = ("draft", "ready", "pending_review", "awaiting_media", 
 _DRAFT_MARKETPLACE_FORMATS = {"manual", "reference", "marketplace", "wb_product"}
 
 
+def _is_draft_batch_mode(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    return bool(context.user_data.get("draft_compose_batch"))
+
+
+def _finish_single_draft_compose(context: ContextTypes.DEFAULT_TYPE, handle: str):
+    if context.user_data.get("draft_compose") != handle or _is_draft_batch_mode(context):
+        return
+    context.user_data.pop("draft_compose", None)
+    context.user_data.pop("draft_compose_batch", None)
+
+
 def _draft_type_label(d: dict) -> str:
     """Тип черновика для списка: '📸 Фото + текст', '🎬 Видео', '📝 Текст' и т.п."""
     mt = d.get("media_type")
@@ -3304,6 +3315,7 @@ def _draft_created_kb(d: dict, batch_count: int = 0) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("📤 В очередь", callback_data=f"ui:draft_q:{d['id']}")],
         [InlineKeyboardButton("🤖 Улучшить текст", callback_data=f"ui:draft_ai:{d['id']}")],
+        [InlineKeyboardButton("➕ Ещё пост", callback_data=f"ui:draft_new:{handle}")],
     ]
     if batch_count > 1:
         rows.append([
@@ -3634,13 +3646,30 @@ async def action_draft_clear_ok(qm, context: ContextTypes.DEFAULT_TYPE, handle: 
     await screen_drafts(qm, context, handle)
 
 
-async def action_draft_new(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
-    """Включает режим приёма следующего сообщения как черновика."""
+async def action_draft_new(qm, context: ContextTypes.DEFAULT_TYPE, handle: str, *, batch: bool = False):
+    """Включает режим приёма сообщения как черновика.
+
+    По умолчанию режим одноразовый: один входящий пост -> превью -> режим выключен.
+    Массовый импорт включается отдельной кнопкой, чтобы не перехватывать следующие сообщения случайно.
+    """
     if not _load_channel(handle):
         return
     context.user_data["draft_compose"] = handle
+    if batch:
+        context.user_data["draft_compose_batch"] = True
+    else:
+        context.user_data.pop("draft_compose_batch", None)
     _draft_batch_state(context, handle, reset=True)
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data=f"ui:ch_create:{handle}")]])
+    rows = []
+    if not batch:
+        rows.append([InlineKeyboardButton("📦 Принять пачкой", callback_data=f"ui:draft_new_batch:{handle}")])
+    rows.append([InlineKeyboardButton("◀️ Отмена", callback_data=f"ui:ch_create:{handle}")])
+    kb = InlineKeyboardMarkup(rows)
+    mode_hint = (
+        f"Можно переслать пачкой до <b>{DRAFT_BATCH_LIMIT}</b> постов. Когда закончишь, нажми кнопку в сводке.\n\n"
+        if batch
+        else "Режим одноразовый: после первого поста я сразу покажу превью и выключу приём черновика.\n\n"
+    )
     await _answer_or_send(
         qm,
         "✍️ <b>Создать пост вручную</b>\n\n"
@@ -3648,7 +3677,7 @@ async def action_draft_new(qm, context: ContextTypes.DEFAULT_TYPE, handle: str):
         "• <b>текст</b> — будет текстовый пост\n"
         "• <b>фото</b> (можно с подписью) — фото-пост\n"
         "• <b>видео</b> (можно с подписью) — видео-пост\n"
-        f"• можно переслать пачкой до <b>{DRAFT_BATCH_LIMIT}</b> постов\n\n"
+        f"{mode_hint}"
         "Я покажу превью. Если ничего не выбрать, пост останется в черновике.",
         kb,
     )
@@ -3730,17 +3759,23 @@ async def _flush_album_draft(context, gid: str, reply_msg):
                 rejected=True,
                 reason=_manual_import_rejection_message(validation),
             )
+            _finish_single_draft_compose(context, handle)
             await _delete_message_silent(reply_msg)
             return
     duplicate = _manual_post_duplicate(handle, post["content"], post["media_type"], post["tg_file_id"])
     if duplicate:
         _draft_batch_note(context, handle, reply_msg, duplicate=True)
+        _finish_single_draft_compose(context, handle)
         await _delete_message_silent(reply_msg)
         return
     post_id = buffer.add(post)
     post["id"] = post_id
     _draft_batch_add(context, handle, post_id)
-    _draft_batch_note(context, handle, reply_msg, post_id=post_id)
+    if _is_draft_batch_mode(context):
+        _draft_batch_note(context, handle, reply_msg, post_id=post_id)
+    else:
+        _finish_single_draft_compose(context, handle)
+        await _reply_draft_card(reply_msg, post, "👀 Превью", created=True, batch_count=1, context=context)
     seen = set()
     for album_msg in slot.get("messages", []) or [reply_msg]:
         key = (getattr(album_msg, "chat_id", None), getattr(album_msg, "message_id", None))
@@ -3824,18 +3859,25 @@ async def create_draft_from_message(update: Update, context: ContextTypes.DEFAUL
                 rejected=True,
                 reason=_manual_import_rejection_message(validation),
             )
+            _finish_single_draft_compose(context, handle)
             await _delete_message_silent(msg)
             return True
     duplicate = _manual_post_duplicate(handle, post["content"], post.get("media_type"), post.get("tg_file_id"))
     if duplicate:
         _draft_batch_note(context, handle, msg, duplicate=True)
+        _finish_single_draft_compose(context, handle)
         await _delete_message_silent(msg)
         return True
     post_id = buffer.add(post)
     post["id"] = post_id
     _draft_batch_add(context, handle, post_id)
-    _draft_batch_note(context, handle, msg, post_id=post_id)
-    await _delete_message_silent(msg)
+    if _is_draft_batch_mode(context):
+        _draft_batch_note(context, handle, msg, post_id=post_id)
+        await _delete_message_silent(msg)
+    else:
+        _finish_single_draft_compose(context, handle)
+        await _reply_draft_card(msg, post, "👀 Превью", created=True, batch_count=1, context=context)
+        await _delete_message_silent(msg)
     return True
 
 
@@ -6424,7 +6466,7 @@ async def _ui_router_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ch_history", "ch_set", "ch_set_img", "ch_folder", "ch_setfold",
         "ch_diag", "ch_data", "ch_data_edit",
         "cfmenu", "cfask", "cfset",
-        "ch_newfold", "ch_deleted_card", "ch_restore", "ch_purge", "ch_purge_ok", "ch_draft", "draft_new", "draft_qlast",
+        "ch_newfold", "ch_deleted_card", "ch_restore", "ch_purge", "ch_purge_ok", "ch_draft", "draft_new", "draft_new_batch", "draft_qlast",
         "draft_qall", "draft_qbatch", "draft_preview_batch", "draft_clear", "draft_clearok", "rsy_toggle",
         "ch_archetype", "ch_set_arche", "ch_source_toggle", "ch_src_mode",
         "ch_refs", "ref_tgl", "ref_del", "ref_add", "ref_take", "ref_go",
@@ -6446,7 +6488,7 @@ async def _ui_router_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # (правка черновика/настроек/поиск). Нужный режим экран-обработчик ниже поставит
     # заново (он выполняется ПОСЛЕ этой очистки). Иначе старый режим перехватывал
     # чужой ввод (длина поста, добавление референса) — баги #7/#10/#11.
-    for _k in ("draft_compose", "draft_edit", "draft_media", "channel_search", "editing"):
+    for _k in ("draft_compose", "draft_compose_batch", "draft_edit", "draft_media", "channel_search", "editing"):
         context.user_data.pop(_k, None)
 
     if action == "main":
@@ -6603,6 +6645,9 @@ async def _ui_router_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "draft_new" and len(parts) >= 3:
         await action_draft_new(query, context, parts[2])
+
+    elif action == "draft_new_batch" and len(parts) >= 3:
+        await action_draft_new(query, context, parts[2], batch=True)
 
     elif action == "draft_q" and len(parts) >= 3:
         await action_draft_queue(query, context, parts[2])
