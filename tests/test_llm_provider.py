@@ -302,7 +302,7 @@ class LLMProviderTests(unittest.TestCase):
         self.assertIn("конкретные новости о конкретных блогерах", prompt)
         self.assertIn("имя/ник/проект + конкретное событие", prompt)
         self.assertIn("мягкие creator-news", prompt)
-        self.assertIn("иноагентов, Минюст, суды, колонии", prompt)
+        self.assertIn("иноагентов, Минюст, суды, штрафы, колонии", prompt)
         self.assertIn("Максим Лутчак", prompt)
         self.assertIn("НЕ предлагай", prompt)
 
@@ -324,6 +324,62 @@ class LLMProviderTests(unittest.TestCase):
             topics,
             ["Александра Митрошина объявила о запуске нового марафона в соцсетях"],
         )
+
+    def test_celeb_drama_get_topics_retries_when_search_is_too_dirty(self):
+        original_discover = topic_search.discover_topics
+        original_cache_get = topic_search._cache_get_unused
+        original_cache_store = topic_search._cache_store
+        original_cache_mark = topic_search._cache_mark_used
+        calls = []
+        stored = []
+
+        async def fake_discover(channel, count=10, used_topics=None, max_uses=5):
+            calls.append(channel.get("topic", ""))
+            if len(calls) == 1:
+                return [
+                    "Блогер Хилми Форкс остался в колонии после отказа в УДО",
+                    "Ольга Бузова и Ида Галич потеряли доступ к аккаунтам после взлома",
+                ]
+            return [
+                "Александра Митрошина объявила о запуске нового марафона",
+                "Максим Лутчак попал в Forbes 30 до 30 после роста аудитории",
+            ]
+
+        try:
+            topic_search.discover_topics = fake_discover
+            topic_search._cache_get_unused = lambda channel_id, ttl_hours: []
+            topic_search._cache_store = lambda channel_id, topics: stored.extend(topics)
+            topic_search._cache_mark_used = lambda ids: None
+
+            topics = __import__("asyncio").run(
+                topic_search.get_topics(
+                    {
+                        "channel_id": "@novosti_bl0gerov",
+                        "name": "НОВОСТИ О БЛОГЕРАХ",
+                        "archetype": "celeb_drama",
+                        "topic": "новости о жизни российских блогеров и интернет-персоналий",
+                    },
+                    count=3,
+                    used_topics=[],
+                )
+            )
+
+            self.assertEqual(
+                topics,
+                [
+                    "Ольга Бузова и Ида Галич потеряли доступ к аккаунтам после взлома",
+                    "Александра Митрошина объявила о запуске нового марафона",
+                    "Максим Лутчак попал в Forbes 30 до 30 после роста аудитории",
+                ],
+            )
+            self.assertEqual(len(calls), 2)
+            self.assertIn("Дополнительный поисковый фокус", calls[1])
+            self.assertEqual(stored, [])
+        finally:
+            topic_search.discover_topics = original_discover
+            topic_search._cache_get_unused = original_cache_get
+            topic_search._cache_store = original_cache_store
+            topic_search._cache_mark_used = original_cache_mark
 
 
 if __name__ == "__main__":
