@@ -130,11 +130,25 @@ class ContentSafetyTest(unittest.TestCase):
                 self.assertEqual(safety["decision"], "allowed_safe")
                 self.assertEqual(safety["reason_code"], "celeb_drama_fit")
 
-    def test_celeb_drama_search_channel_does_not_fallback_to_rss_or_synthetic_topics(self):
+    def test_celeb_drama_search_channel_can_use_concrete_rss_when_search_is_empty(self):
         original_get_topics = content_generator_module.get_topics
+        original_rss = content_generator_module.rss
+        original_web_scraper = content_generator_module.web_scraper
 
         async def fake_get_topics(*args, **kwargs):
             return []
+
+        class FakeRss:
+            async def fetch_for_channel(self, *args, **kwargs):
+                return [{
+                    "title": "Фешн-блогер Игор Синяк рассказал об ограблении в Париже",
+                    "summary": "Инцидент обсуждают подписчики и другие инфлюенсеры.",
+                    "image_url": None,
+                }]
+
+        class FakeWebScraper:
+            async def scrape_for_channel(self, *args, **kwargs):
+                return []
 
         generator = ContentGenerator()
         generator._get_used_topics = lambda *args, **kwargs: []
@@ -146,11 +160,56 @@ class ContentSafetyTest(unittest.TestCase):
 
         try:
             content_generator_module.get_topics = fake_get_topics
-            topics, sources = asyncio.run(generator._collect_topics(channel, 5))
-            self.assertEqual(topics, [])
-            self.assertEqual(sources, [])
+            content_generator_module.rss = FakeRss()
+            content_generator_module.web_scraper = FakeWebScraper()
+            topics, sources = asyncio.run(generator._collect_topics(channel, 1))
+            self.assertEqual(len(topics), 1)
+            self.assertEqual(topics[0]["source"], "rss")
+            self.assertIn("Игор Синяк", topics[0]["topic"])
+            self.assertIn("rss", sources)
         finally:
             content_generator_module.get_topics = original_get_topics
+            content_generator_module.rss = original_rss
+            content_generator_module.web_scraper = original_web_scraper
+
+    def test_celeb_drama_search_channel_does_not_use_synthetic_channel_description_fallback(self):
+        original_get_topics = content_generator_module.get_topics
+        original_rss = content_generator_module.rss
+        original_web_scraper = content_generator_module.web_scraper
+        original_get_evergreen_topic = content_generator_module.buffer.get_evergreen_topic
+
+        async def fake_get_topics(*args, **kwargs):
+            return []
+
+        class EmptyRss:
+            async def fetch_for_channel(self, *args, **kwargs):
+                return []
+
+        class EmptyWebScraper:
+            async def scrape_for_channel(self, *args, **kwargs):
+                return []
+
+        generator = ContentGenerator()
+        generator._get_used_topics = lambda *args, **kwargs: []
+        channel = {
+            **BLOGGER_NEWS_CHANNEL,
+            "topic_source": "search",
+            "rss_sources": [],
+        }
+
+        try:
+            content_generator_module.get_topics = fake_get_topics
+            content_generator_module.rss = EmptyRss()
+            content_generator_module.web_scraper = EmptyWebScraper()
+            content_generator_module.buffer.get_evergreen_topic = lambda *args, **kwargs: None
+            topics, sources = asyncio.run(generator._collect_topics(channel, 5))
+            self.assertEqual(topics, [])
+            self.assertNotIn("fallback", sources)
+        finally:
+            content_generator_module.get_topics = original_get_topics
+            content_generator_module.rss = original_rss
+            content_generator_module.web_scraper = original_web_scraper
+            content_generator_module.buffer.get_evergreen_topic = original_get_evergreen_topic
 
     def test_celeb_drama_output_rejects_offtopic_drift(self):
         validation = validate_generated_post(

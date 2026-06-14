@@ -725,26 +725,13 @@ class ContentGenerator:
                     logger.info(f"Тем из веб-поиска [{channel_id}]: {len(found)}")
                 else:
                     fallback_note = (
-                        "RSS/резерв для блогерского канала отключены"
+                        "пробую RSS/web, синтетический резерв для блогерского канала отключён"
                         if is_celeb_drama_channel(channel)
                         else "откат на RSS/вечнозелёные"
                     )
                     logger.warning(f"Веб-поиск не дал тем [{channel_id}] — {fallback_note}")
             except Exception as e:
                 logger.warning(f"Веб-поиск недоступен [{channel_id}]: {e}")
-
-            if is_celeb_drama_channel(channel):
-                if topics:
-                    logger.info(
-                        f"Темы для блогерского канала [{channel_id}]: "
-                        f"беру только веб-поиск, без RSS/резерва ({len(topics)})"
-                    )
-                else:
-                    logger.warning(
-                        f"Нет конкретных тем из веб-поиска для блогерского канала [{channel_id}] — "
-                        "RSS/вечнозелёный резерв отключены, чтобы не генерировать абстрактный мусор"
-                    )
-                return topics[:count], sources_used
 
             # Если поиск дал достаточно — RSS/web не дёргаем
             if len(topics) >= count:
@@ -821,6 +808,21 @@ class ContentGenerator:
         # вечнозелёных в карточке). Гарантирует, что буфер не останется пустым:
         # лучше пост по теме канала, чем ничего. Темы из живого тона выйдут норм.
         if len(topics) < count:
+            if is_celeb_drama_channel(channel):
+                logger.warning(
+                    f"Синтетический резерв отключён для блогерского канала [{channel_id}] — "
+                    "нужен конкретный инфоповод, а не пересказ описания канала"
+                )
+                logger.debug(
+                    f"Тем собрано: {len(topics)} "
+                    f"(search: {sum(1 for t in topics if t['source']=='search')}, "
+                    f"RSS: {sum(1 for t in topics if t['source']=='rss')}, "
+                    f"web: {sum(1 for t in topics if t['source']=='web')}, "
+                    f"вечнозелёных: {sum(1 for t in topics if t['source']=='evergreen')}, "
+                    f"резерв: {sum(1 for t in topics if t['source']=='fallback')})"
+                )
+                return topics, sources_used
+
             base = _meaningful_base(channel.get("topic", ""))
             if base:
                 ANGLES = [
