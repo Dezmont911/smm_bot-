@@ -43,6 +43,7 @@ from content_router import resolve, pick_format, pick_hook
 from content_safety import (
     build_content_brief,
     evaluate_topic_candidate,
+    is_celeb_drama_channel,
     validate_generated_post,
 )
 import dedup
@@ -723,11 +724,28 @@ class ContentGenerator:
                     sources_used.append("search")
                     logger.info(f"Тем из веб-поиска [{channel_id}]: {len(found)}")
                 else:
-                    logger.warning(
-                        f"Веб-поиск не дал тем [{channel_id}] — откат на RSS/вечнозелёные"
+                    fallback_note = (
+                        "RSS/резерв для блогерского канала отключены"
+                        if is_celeb_drama_channel(channel)
+                        else "откат на RSS/вечнозелёные"
                     )
+                    logger.warning(f"Веб-поиск не дал тем [{channel_id}] — {fallback_note}")
             except Exception as e:
                 logger.warning(f"Веб-поиск недоступен [{channel_id}]: {e}")
+
+            if is_celeb_drama_channel(channel):
+                if topics:
+                    logger.info(
+                        f"Темы для блогерского канала [{channel_id}]: "
+                        f"беру только веб-поиск, без RSS/резерва ({len(topics)})"
+                    )
+                else:
+                    logger.warning(
+                        f"Нет конкретных тем из веб-поиска для блогерского канала [{channel_id}] — "
+                        "RSS/вечнозелёный резерв отключены, чтобы не генерировать абстрактный мусор"
+                    )
+                return topics[:count], sources_used
+
             # Если поиск дал достаточно — RSS/web не дёргаем
             if len(topics) >= count:
                 return topics[:count], sources_used

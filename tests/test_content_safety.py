@@ -1,5 +1,7 @@
 import unittest
+import asyncio
 
+import content_generator as content_generator_module
 from channel_dna import attach_channel_dna, build_channel_dna, channel_dna_compatibility, get_effective_channel_dna
 from content_generator import ContentGenerator
 from content_safety import (
@@ -98,6 +100,57 @@ class ContentSafetyTest(unittest.TestCase):
         )
         self.assertEqual(safety["decision"], "allowed_safe")
         self.assertEqual(safety["reason_code"], "celeb_drama_fit")
+
+    def test_celeb_drama_rejects_generic_channel_description_topics(self):
+        samples = [
+            "Канал публикует новости о жизни российских блогеров и интернет-персоналий: мифы и правда",
+            "Личная жизнь блогеров и инфлюенсеров: стоит ли им быть честными в соцсетях",
+            "Сюрприз: блогеры тоже люди — правда ли, что все их жизни похожи на сторис",
+        ]
+        for sample in samples:
+            with self.subTest(sample=sample):
+                safety = evaluate_topic_candidate(
+                    BLOGGER_NEWS_CHANNEL,
+                    {"topic": sample, "source": "fallback"},
+                )
+                self.assertEqual(safety["decision"], "review")
+                self.assertEqual(safety["reason_code"], "celeb_drama_fit_unclear")
+
+    def test_celeb_drama_allows_specific_person_event_topics(self):
+        samples = [
+            "Максим Лутчак попал в Forbes 30 до 30 после роста аудитории",
+            "Фешн-блогер Игор Синяк рассказал об ограблении в Париже",
+        ]
+        for sample in samples:
+            with self.subTest(sample=sample):
+                safety = evaluate_topic_candidate(
+                    BLOGGER_NEWS_CHANNEL,
+                    {"topic": sample, "source": "search"},
+                )
+                self.assertEqual(safety["decision"], "allowed_safe")
+                self.assertEqual(safety["reason_code"], "celeb_drama_fit")
+
+    def test_celeb_drama_search_channel_does_not_fallback_to_rss_or_synthetic_topics(self):
+        original_get_topics = content_generator_module.get_topics
+
+        async def fake_get_topics(*args, **kwargs):
+            return []
+
+        generator = ContentGenerator()
+        generator._get_used_topics = lambda *args, **kwargs: []
+        channel = {
+            **BLOGGER_NEWS_CHANNEL,
+            "topic_source": "search",
+            "rss_sources": ["https://lenta.ru/rss/"],
+        }
+
+        try:
+            content_generator_module.get_topics = fake_get_topics
+            topics, sources = asyncio.run(generator._collect_topics(channel, 5))
+            self.assertEqual(topics, [])
+            self.assertEqual(sources, [])
+        finally:
+            content_generator_module.get_topics = original_get_topics
 
     def test_celeb_drama_output_rejects_offtopic_drift(self):
         validation = validate_generated_post(

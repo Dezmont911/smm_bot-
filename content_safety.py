@@ -136,6 +136,33 @@ CELEB_DRAMA_OFFTOPIC_MARKERS = (
     "протез", "стоматолог", "зуб", "операци", "клиник", "правозащит", "цензур",
 )
 
+CELEB_DRAMA_GENERIC_TOPIC_MARKERS = (
+    "канал публикует",
+    "новости о жизни российских блогеров",
+    "новости о жизни блогеров",
+    "личная жизнь блогеров",
+    "личной жизни инфлюенсеров",
+    "мифы вокруг",
+    "блогеры тоже люди",
+    "все блогеры",
+    "жизнь инфлюенсеров",
+    "инфлюенсеры в соцсетях",
+    "контент-крейторы",
+    "стоит ли блогерам",
+    "как блогерам",
+    "почему блогеры",
+    "личное должно оставаться приватным",
+)
+
+CELEB_DRAMA_EVENT_MARKERS = (
+    "попал", "попала", "прошёл", "прошла", "вошёл", "вошла", "forbes", "рейтинг",
+    "ограб", "расстал", "рассталась", "развод", "роман", "свад", "отношени",
+    "сменил", "сменила", "образ", "запустил", "запустила", "выпустил", "выпустила",
+    "объявил", "объявила", "показал", "показала", "переехал", "переехала",
+    "скандал", "конфликт", "обвинил", "обвинила", "извинил", "извинилась",
+    "интервью", "шоу", "клип", "проект", "коллаб", "реакци", "фанат", "подписчик",
+)
+
 KIDS_EDU_PROFILE_MARKERS = (
     "робототех", "программирован", "дет", "ребен", "ребён", "школь",
     "занят", "круж", "секци", "лагер", "логик", "самостоятельн",
@@ -464,11 +491,41 @@ def _is_celeb_drama_channel(channel: dict) -> bool:
     return any(marker in profile for marker in CELEB_DRAMA_PROFILE_MARKERS)
 
 
+def is_celeb_drama_channel(channel: dict) -> bool:
+    """Public helper for source-routing decisions outside the safety module."""
+    return _is_celeb_drama_channel(channel)
+
+
+def _has_person_like_mention(text: str) -> bool:
+    raw = _clean_text(text, 700)
+    if re.search(r"@[a-zA-Z0-9_]{4,}", raw):
+        return True
+    return bool(re.search(r"\b[А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ][а-яё]{2,}\b", raw))
+
+
+def _is_generic_celeb_drama_topic(raw_topic: str) -> bool:
+    low = _low(raw_topic)
+    return any(marker in low for marker in CELEB_DRAMA_GENERIC_TOPIC_MARKERS)
+
+
 def _fits_celeb_drama(raw_topic: str) -> bool:
     low = _low(raw_topic)
     if _has_celeb_drama_offtopic(raw_topic):
         return False
-    return any(marker in low for marker in CELEB_DRAMA_PROFILE_MARKERS)
+    if _is_generic_celeb_drama_topic(raw_topic):
+        return False
+
+    has_profile_marker = any(marker in low for marker in CELEB_DRAMA_PROFILE_MARKERS)
+    has_event_marker = any(marker in low for marker in CELEB_DRAMA_EVENT_MARKERS)
+    has_person = _has_person_like_mention(raw_topic)
+
+    # Для новостей блогеров нужна конкретика: персонаж/ник + событие.
+    # Иначе генератор превращает тему в абстрактный пост "про блогеров вообще".
+    if has_profile_marker and (has_event_marker or has_person):
+        return True
+    if has_person and has_event_marker:
+        return True
+    return False
 
 
 def _has_celeb_drama_offtopic(text: str) -> bool:

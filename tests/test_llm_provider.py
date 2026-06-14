@@ -265,6 +265,22 @@ class LLMProviderTests(unittest.TestCase):
             topic_search.aclient = original_topic_client
             topic_search.openai_web_search_text = original_fallback
 
+    def test_celeb_drama_search_prompt_requires_specific_person_event(self):
+        prompt = topic_search._build_prompt(
+            {
+                "channel_id": "@novosti_bl0gerov",
+                "name": "НОВОСТИ О БЛОГЕРАХ",
+                "archetype": "celeb_drama",
+                "topic": "новости о жизни российских блогеров и интернет-персоналий",
+            },
+            count=3,
+            used_topics=[],
+        )
+        self.assertIn("конкретные новости о конкретных блогерах", prompt)
+        self.assertIn("имя/ник/проект + конкретное событие", prompt)
+        self.assertIn("Максим Лутчак", prompt)
+        self.assertIn("НЕ предлагай", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
