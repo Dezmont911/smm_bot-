@@ -301,6 +301,8 @@ class LLMProviderTests(unittest.TestCase):
         )
         self.assertIn("конкретные новости о конкретных блогерах", prompt)
         self.assertIn("имя/ник/проект + конкретное событие", prompt)
+        self.assertIn("мягкие creator-news", prompt)
+        self.assertIn("иноагентов, Минюст, суды, колонии", prompt)
         self.assertIn("Максим Лутчак", prompt)
         self.assertIn("НЕ предлагай", prompt)
 
