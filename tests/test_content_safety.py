@@ -356,6 +356,21 @@ class ContentSafetyTest(unittest.TestCase):
         finally:
             content_generator_module.pick_format = original_pick_format
 
+    def test_broad_fact_fallback_angles_are_not_household_advice(self):
+        channel = {
+            "channel_id": "@history_loopa",
+            "name": "История под лупой",
+            "topic": "Любопытные факты о природе, животных, науке, истории и человеческом поведении.",
+            "channel_type": "content",
+        }
+
+        angles = content_generator_module._fallback_angles_for_channel(channel)
+        joined = " ".join(angles).lower()
+
+        self.assertNotIn("практический совет", joined)
+        self.assertNotIn("частая ошибка", joined)
+        self.assertIn("исторический факт", joined)
+
     def test_celeb_drama_output_rejects_offtopic_drift(self):
         validation = validate_generated_post(
             BLOGGER_NEWS_CHANNEL,
