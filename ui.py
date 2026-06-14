@@ -3254,7 +3254,7 @@ async def _flush_draft_batch_summary(context: ContextTypes.DEFAULT_TYPE, handle:
                         )
                         sent = await context.bot.send_message(
                             chat_id,
-                            "🎛 <b>Действия для альбома выше</b>",
+                            "🎛 <b>Управление этим альбомом</b>",
                             parse_mode=ParseMode.HTML,
                             reply_markup=kb,
                         )
@@ -3444,7 +3444,7 @@ async def _reply_draft_card(
                     media=_album_preview_media_group(items, cap, ParseMode.HTML)
                 )
                 sent = await msg_obj.reply_text(
-                    "🎛 <b>Действия для альбома выше</b>",
+                    "🎛 <b>Управление этим альбомом</b>",
                     parse_mode=ParseMode.HTML,
                     reply_markup=kb,
                 )

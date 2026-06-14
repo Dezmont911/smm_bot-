@@ -607,6 +607,58 @@ class ReferenceTextMediaModesTest(unittest.TestCase):
         self.assertIsNone(result)
         add_mock.assert_not_called()
 
+    def test_reference_vpn_promo_after_rephrase_is_rejected(self):
+        p = {
+            "id": 33,
+            "text": "A small personal tool recommendation with enough neutral words for import.",
+            "media_kind": None,
+        }
+
+        async def fake_rephrase(_text, _channel):
+            return "🔒 Мой любимый VPN (личная рекомендация)"
+
+        patches = self._allow_safety()
+        with mock.patch("ai_client.rephrase_text", new=fake_rephrase), \
+             patches[0], patches[1], patches[2], \
+             mock.patch.object(ri.buffer, "add") as add_mock:
+            result = asyncio.run(ri._store_reference_post(
+                self.channel, "@plain", "@donor", p, do_rephrase=True,
+            ))
+        self.assertIsNone(result)
+        add_mock.assert_not_called()
+
+    def test_reference_our_channels_promo_is_rejected(self):
+        p = {
+            "id": 34,
+            "text": "📢 Новые обои для телефона\n⚡️ Наши каналы ⚡️",
+            "media_kind": "photo",
+        }
+        with mock.patch.object(ri.buffer, "add") as add_mock:
+            result = asyncio.run(ri._store_reference_post(
+                self.channel, "@plain", "@donor", p, do_rephrase=False,
+            ))
+        self.assertIsNone(result)
+        add_mock.assert_not_called()
+
+    def test_reference_ai_service_promo_is_rejected(self):
+        p = {
+            "id": 35,
+            "text": (
+                "🔥 НЕЙРОСЕТЬ, КОТОРАЯ ПОРАЖАЕТ\n"
+                "🚀 Более 3000 моделей генерации\n"
+                "🎬 Рендер до 20 секунд\n"
+                "🎧 Создаёт видео с звуком\n"
+                "🏆 Качество — до 720p"
+            ),
+            "media_kind": "animation",
+        }
+        with mock.patch.object(ri.buffer, "add") as add_mock:
+            result = asyncio.run(ri._store_reference_post(
+                self.channel, "@plain", "@donor", p, do_rephrase=False,
+            ))
+        self.assertIsNone(result)
+        add_mock.assert_not_called()
+
     def test_reference_max_relocation_promo_is_rejected(self):
         p = {
             "id": 32,

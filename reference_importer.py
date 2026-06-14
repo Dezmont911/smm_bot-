@@ -76,6 +76,9 @@ REFERENCE_PROMO_MARKERS = (
     "переехали сюда",
     "переехали в max",
     "наш канал в max",
+    "наши каналы",
+    "наши проекты",
+    "все наши каналы",
     "мы в max",
 )
 
@@ -99,7 +102,20 @@ def _looks_like_reference_service_ad(text: str) -> bool:
         return True
     if any(marker in raw for marker in REFERENCE_PROMO_MARKERS):
         return True
-    if "vpn" in raw and (_word_count(raw) <= 10 or "lumixvpn" in raw):
+    if "vpn" in raw and (
+        _word_count(raw) <= 18
+        or "lumixvpn" in raw
+        or "личн" in raw
+        or "рекомендац" in raw
+        or "подключ" in raw
+        or "обход блокиров" in raw
+        or "безлимит" in raw
+    ):
+        return True
+    if ("нейросет" in raw or "ai" in raw) and (
+        "модел" in raw
+        and ("рендер" in raw or "созда" in raw or "720p" in raw or "поддержк" in raw)
+    ):
         return True
     if raw.count("clck.ru/") >= 2 or raw.count("tagio.pro/") >= 1:
         return True
@@ -175,7 +191,9 @@ _MARKETPLACE_CTA_VERBS = (
     "купить", "заказать", "смотреть", "посмотреть", "найти", "перейти", "забрать", "открыть",
 )
 _FOOTER_LINE_MARKERS = (
-    "подпишись", "подписывайся", "наш канал", "больше тут", "больше здесь",
+    "подпишись", "подписывайся", "наш канал", "наши каналы",
+    "наши проекты", "все наши каналы", "другие наши каналы",
+    "больше тут", "больше здесь",
     "больше новостей", "читать в канале", "по вопросам рекламы", "реклама",
     "рекламодател", "прайс", "промокод", "партнерский материал",
     "партнёрский материал", "erid", "ерид",
@@ -747,6 +765,12 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
     if content and _looks_like_meta_output(content):
         logger.warning(
             f"Reference skipped [{channel_id}] {handle}/{p.get('id')}: meta_or_refusal_output"
+        )
+        return None
+    if _ref_flag(ref_config, "skip_ads", True) and content and _is_ad(content):
+        logger.warning(
+            f"Reference skipped [{channel_id}] {handle}/{p.get('id')}: "
+            f"reference_ad_or_service_promo_after_cleanup"
         )
         return None
     if not content and kind and not allow_media_only:

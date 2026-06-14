@@ -2035,7 +2035,7 @@ async def _send_review_post_media(message, post: dict, caption: str, keyboard) -
                 media=_album_preview_media_group(items, cap, ParseMode.HTML)
             )
             await message.reply_text(
-                "🎛 <b>Действия для альбома выше</b>",
+                "🎛 <b>Управление этим альбомом</b>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=keyboard,
             )
