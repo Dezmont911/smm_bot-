@@ -223,6 +223,62 @@ class ContentSafetyTest(unittest.TestCase):
             content_generator_module.web_scraper = original_web_scraper
             content_generator_module.buffer.get_evergreen_topic = original_get_evergreen_topic
 
+    def test_broad_fact_rss_channel_uses_web_search_reserve_after_relevance_drop(self):
+        original_get_topics = content_generator_module.get_topics
+        original_rss = content_generator_module.rss
+        original_web_scraper = content_generator_module.web_scraper
+        original_get_evergreen_topic = content_generator_module.buffer.get_evergreen_topic
+
+        async def fake_get_topics(*args, **kwargs):
+            return ["Почему у осьминогов три сердца и как это помогает им выживать"]
+
+        class FakeRss:
+            async def fetch_for_channel(self, *args, **kwargs):
+                return [{
+                    "title": "A dying star could create a new universe",
+                    "summary": "Off-topic astronomy headline.",
+                    "image_url": None,
+                }]
+
+        class EmptyWebScraper:
+            async def scrape_for_channel(self, *args, **kwargs):
+                return []
+
+        generator = ContentGenerator()
+        calls = {"n": 0}
+
+        async def fake_filter_relevant(channel, topics, count):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return []
+            return topics
+
+        generator._filter_relevant = fake_filter_relevant
+        generator._get_used_topics = lambda *args, **kwargs: []
+        channel = {
+            "channel_id": "@facts",
+            "name": "Хочу все знать",
+            "topic": "Канал публикует удивительные и малоизвестные факты о природе, животных, науке и организме.",
+            "channel_type": "content",
+            "topic_source": "rss",
+            "rss_sources": ["https://example.com/rss"],
+        }
+
+        try:
+            content_generator_module.get_topics = fake_get_topics
+            content_generator_module.rss = FakeRss()
+            content_generator_module.web_scraper = EmptyWebScraper()
+            content_generator_module.buffer.get_evergreen_topic = lambda *args, **kwargs: None
+            topics, sources = asyncio.run(generator._collect_topics(channel, 1))
+            self.assertIn("search", sources)
+            self.assertEqual(topics[0]["source"], "search")
+            self.assertIn("осьминогов", topics[0]["topic"])
+        finally:
+            content_generator_module.get_topics = original_get_topics
+            content_generator_module.rss = original_rss
+            content_generator_module.web_scraper = original_web_scraper
+            content_generator_module.buffer.get_evergreen_topic = original_get_evergreen_topic
+
     def test_celeb_drama_output_rejects_offtopic_drift(self):
         validation = validate_generated_post(
             BLOGGER_NEWS_CHANNEL,

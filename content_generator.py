@@ -65,6 +65,23 @@ def _meaningful_base(*parts: str) -> str:
     return ""
 
 
+def _is_broad_fact_channel(channel: dict) -> bool:
+    """True для широких познавательных каналов, где web-search лучше RSS-only."""
+    if channel.get("channel_type", "content") != "content":
+        return False
+    text = " ".join(
+        str(channel.get(k, "") or "")
+        for k in ("channel_id", "name", "topic", "archetype")
+    ).lower()
+    if any(x in text for x in ("блогер", "инфлюенсер", "маркетплейс", "wildberries", "wb", "ozon")):
+        return False
+    fact_markers = (
+        "факт", "факты", "интересн", "малоизвест", "познаватель",
+        "кругозор", "природ", "животн", "наук", "истори", "организм",
+    )
+    return sum(1 for marker in fact_markers if marker in text) >= 2
+
+
 class ContentGenerator:
     """Генерирует посты для каналов и пополняет буфер."""
 
@@ -807,6 +824,46 @@ class ContentGenerator:
         # оставил мало — Источник 4 ниже доберёт резервом по теме канала.
         topics = await self._filter_relevant(channel, topics, count)
 
+        # Для широких факт-каналов RSS часто слишком шумный: научные ленты дают
+        # узкие заголовки, которые профильный гейт справедливо режет. В таком
+        # случае пробуем web-search как живой резерв до синтетических тем.
+        if (
+            len(topics) < count
+            and channel.get("topic_source") != "search"
+            and _is_broad_fact_channel(channel)
+        ):
+            try:
+                used = self._get_used_topics(channel_id, limit=20)
+                found = await get_topics(
+                    channel,
+                    count=max(count - len(topics), count),
+                    used_topics=used,
+                )
+                if found:
+                    search_topics = [
+                        {"topic": t, "image_url": None, "source": "search"}
+                        for t in found
+                    ]
+                    before = len(search_topics)
+                    search_topics = self._drop_forbidden_topics(channel_id, search_topics)
+                    try:
+                        from ai_client import is_valid_topic
+                        search_topics = [
+                            t for t in search_topics if is_valid_topic(t.get("topic", ""))
+                        ]
+                    except Exception:
+                        pass
+                    search_topics = await self._filter_relevant(channel, search_topics, count)
+                    topics.extend(search_topics)
+                    if search_topics and "search" not in sources_used:
+                        sources_used.append("search")
+                    logger.info(
+                        f"Web-search резерв [{channel_id}]: найдено={len(found)}, "
+                        f"после фильтров={len(search_topics)} из {before}"
+                    )
+            except Exception as e:
+                logger.warning(f"Web-search резерв недоступен [{channel_id}]: {e}")
+
         # --- Источник 4: АБСОЛЮТНЫЙ резерв — углы по теме самого канала ---
         # Срабатывает, только если все источники выше пусты (нет ни новостей, ни
         # вечнозелёных в карточке). Гарантирует, что буфер не останется пустым:
@@ -861,8 +918,9 @@ class ContentGenerator:
                     "познавательный разбор для широкой аудитории",
                     "короткая заметка для расширения кругозора",
                 ]
+                fallback_target = max(count, len(ANGLES))
                 for a in ANGLES:
-                    if len(topics) >= count:
+                    if len(topics) >= fallback_target:
                         break
                     topics.append({
                         "topic": f"{base}: {a}",
