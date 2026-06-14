@@ -70,6 +70,24 @@ class AiClientHardeningTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Пояснение", cleaned)
         self.assertNotIn("я оставил", cleaned)
 
+    async def test_clean_post_output_strips_leading_format_label(self):
+        cleaned = ai_client._clean_post_output(
+            "Факт: структура кудрей определяется формой волосяного фолликула."
+        )
+        self.assertEqual(
+            cleaned,
+            "структура кудрей определяется формой волосяного фолликула.",
+        )
+
+    async def test_clean_post_output_strips_markdown_format_label(self):
+        cleaned = ai_client._clean_post_output(
+            "**Разбор:** почему одна и та же тема может работать по-разному."
+        )
+        self.assertEqual(
+            cleaned,
+            "почему одна и та же тема может работать по-разному.",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
