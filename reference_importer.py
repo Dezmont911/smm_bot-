@@ -66,6 +66,12 @@ BLOCKED_REFERENCE_HOSTS = {
     "www.clck.ru",
     "tagio.pro",
     "www.tagio.pro",
+    "lvlx.click",
+    "www.lvlx.click",
+    "lvlx.cc",
+    "www.lvlx.cc",
+    "levelx.top",
+    "www.levelx.top",
 }
 
 REFERENCE_PROMO_MARKERS = (
@@ -80,6 +86,47 @@ REFERENCE_PROMO_MARKERS = (
     "наши проекты",
     "все наши каналы",
     "мы в max",
+)
+
+GAMBLING_PROMO_MARKERS = (
+    "getx",
+    "jetton",
+    "1win",
+    "1вин",
+    "1xbet",
+    "1хбет",
+    "pin-up",
+    "pinup",
+    "winline",
+    "fonbet",
+    "фрибет",
+    "фриспин",
+    "free spin",
+    "депозит",
+    "к депозиту",
+    "ставк",
+    "букмекер",
+    "казино",
+    "casino",
+    "слот",
+    "джекпот",
+    "jackpot",
+    "rtp",
+)
+
+GAMBLING_CONTEXT_MARKERS = (
+    "выигрыш",
+    "выигрыши",
+    "кешбек",
+    "кэшбек",
+    "новому игрок",
+    "каждому новому игрок",
+    "фриспин",
+    "депозит",
+    "ставка",
+    "ставки",
+    "промокод",
+    "бонус",
 )
 
 
@@ -122,10 +169,29 @@ def _looks_like_reference_service_ad(text: str) -> bool:
     return False
 
 
+def _looks_like_gambling_ad(text: str) -> bool:
+    raw = (text or "").lower()
+    if not raw:
+        return False
+    if any(marker in raw for marker in GAMBLING_PROMO_MARKERS):
+        return True
+    has_money_or_cta = bool(
+        re.search(
+            r"\d+\s*[₽$€]|\d+\s*[xх]|[+]\s*\d+\s*%|👉|🤑|💰|забирай|получи|заходи|ткни|регистр",
+            raw,
+        )
+    )
+    return has_money_or_cta and any(marker in raw for marker in GAMBLING_CONTEXT_MARKERS)
+
+
 def _is_ad(text: str) -> bool:
     raw = (text or "").lower()
     t = re.sub(r"https?://\S+", " ", raw)
-    return any(m in t for m in AD_MARKERS) or _looks_like_reference_service_ad(raw)
+    return (
+        any(m in t for m in AD_MARKERS)
+        or _looks_like_reference_service_ad(raw)
+        or _looks_like_gambling_ad(raw)
+    )
 
 
 # Слова-фильтры: предложение, где встречается такое слово (целиком, регистронезависимо),
@@ -841,8 +907,8 @@ async def import_for_channel(channel: dict, count: int = DEFAULT_TAKE) -> dict:
     вперемешку, а не блоками).
 
     Дедуп — по РЕАЛЬНОМУ наличию: берём только то, чего у нас ещё нет
-    (buffer.source_exists). Опубликованные/в очереди — пропускаем; удалённые
-    и очищенные — снова доступны. Никаких меток-окон.
+    (buffer.source_exists). Опубликованные, в очереди и вручную отклонённые
+    reference-topic пропускаем, чтобы удалённая рекламная шелуха не возвращалась.
 
     Возвращает статистику: added / skipped_dups / skipped_limits / refs.
     """

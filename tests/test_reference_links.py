@@ -659,6 +659,36 @@ class ReferenceTextMediaModesTest(unittest.TestCase):
         self.assertIsNone(result)
         add_mock.assert_not_called()
 
+    def test_reference_getx_gambling_promo_is_rejected(self):
+        p = {
+            "id": 36,
+            "text": (
+                "АКТРИСА ПРЕВРАТИЛА 1000₽ В 969.000₽ НА GETX⚡️\n"
+                "Новому игроку дают 250 фриспинов и +350% к депозиту"
+            ),
+            "text_html": '<a href="https://lvlx.click/t1dxq8vwg">GETX</a>',
+            "media_kind": "video",
+        }
+        with mock.patch.object(ri.buffer, "add") as add_mock:
+            result = asyncio.run(ri._store_reference_post(
+                self.channel, "@plain", "@donor", p, do_rephrase=False,
+            ))
+        self.assertIsNone(result)
+        add_mock.assert_not_called()
+
+    def test_reference_jetton_short_gambling_promo_is_rejected(self):
+        p = {
+            "id": 37,
+            "text": "🏆 8517х можно словить прямо в JetTon — заходи, ткни 👉",
+            "media_kind": "photo",
+        }
+        with mock.patch.object(ri.buffer, "add") as add_mock:
+            result = asyncio.run(ri._store_reference_post(
+                self.channel, "@plain", "@donor", p, do_rephrase=False,
+            ))
+        self.assertIsNone(result)
+        add_mock.assert_not_called()
+
     def test_reference_max_relocation_promo_is_rejected(self):
         p = {
             "id": 32,
@@ -681,6 +711,7 @@ class ReferenceTextMediaModesTest(unittest.TestCase):
         self.assertFalse(ri._link_allowed("https://max.ru/oboi_wallpaper_kpop", "MAX", "@donor", self.channel))
         self.assertFalse(ri._link_allowed("https://clck.ru/3QWPaD", "Admin", "@donor", self.channel))
         self.assertFalse(ri._link_allowed("https://tagio.pro/channel/5072/pricing", "Ads", "@donor", self.channel))
+        self.assertFalse(ri._link_allowed("https://lvlx.click/t1dxq8vwg", "GETX", "@donor", self.channel))
         self.assertTrue(ri._link_allowed("https://www.twitch.tv/directory/category/minecraft", "Twitch", "@donor", self.channel))
 
     def test_meta_rephrase_falls_back_to_clean_original(self):
@@ -706,6 +737,35 @@ class ReferenceTextMediaModesTest(unittest.TestCase):
             ))
         self.assertIsNone(result)
         add_mock.assert_not_called()
+
+
+class ReferenceDedupTest(unittest.TestCase):
+    def test_source_exists_treats_skipped_reference_as_taken(self):
+        from buffer_manager import BufferManager
+
+        captured = {}
+
+        class Cursor:
+            def fetchone(self):
+                return {"exists": 1}
+
+        class Conn:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def execute(self, query, params):
+                captured["query"] = query
+                captured["params"] = params
+                return Cursor()
+
+        with mock.patch("buffer_manager.db.connect", return_value=Conn()):
+            self.assertTrue(BufferManager().source_exists("@wallgramava", "ref:donor:1"))
+
+        self.assertIn("'skipped'", captured["query"])
+        self.assertEqual(captured["params"], ("@wallgramava", "ref:donor:1"))
 
 
 class PosterCaptionClippingTest(unittest.TestCase):

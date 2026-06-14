@@ -2877,6 +2877,10 @@ def _album_preview_media_group(items: list[dict], caption: str | None, parse_mod
     return media
 
 
+def _album_controls_text() -> str:
+    return "🎛 <b>Этот альбом</b>\nВыберите действие ниже."
+
+
 def _manual_dedup_text(content: str | None) -> str:
     text = html.unescape(content or "")
     text = re.sub(r"<a\b[^>]*>(.*?)</a>", r"\1", text, flags=re.I | re.S)
@@ -3254,7 +3258,7 @@ async def _flush_draft_batch_summary(context: ContextTypes.DEFAULT_TYPE, handle:
                         )
                         sent = await context.bot.send_message(
                             chat_id,
-                            "🎛 <b>Управление этим альбомом</b>",
+                            _album_controls_text(),
                             parse_mode=ParseMode.HTML,
                             reply_markup=kb,
                         )
@@ -3444,7 +3448,7 @@ async def _reply_draft_card(
                     media=_album_preview_media_group(items, cap, ParseMode.HTML)
                 )
                 sent = await msg_obj.reply_text(
-                    "🎛 <b>Управление этим альбомом</b>",
+                    _album_controls_text(),
                     parse_mode=ParseMode.HTML,
                     reply_markup=kb,
                 )

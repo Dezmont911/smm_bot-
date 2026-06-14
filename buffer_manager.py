@@ -321,14 +321,14 @@ class BufferManager:
         Есть ли у нас этот исходный пост СЕЙЧАС (в очереди или уже опубликован)?
 
         topic — однозначный ключ исходного сообщения (ref:донор:msg_id).
-        Считаем «взятым» только активные/опубликованные статусы. Статус 'skipped'
-        (удалён через /review) и удалённые строки (очистка буфера) НЕ блокируют —
-        такие посты можно взять заново (по факту они не публиковались).
+        Считаем «взятым» активные, опубликованные и вручную отклонённые статусы.
+        Для референсов это важно: если админ уже выкинул рекламную шелуху через
+        /review, тот же donor+message_id не должен возвращаться следующим импортом.
         """
         with db.connect() as conn:
             row = conn.execute(
                 "SELECT 1 FROM posts WHERE channel_id = ? AND topic = ? "
-                "AND status IN ('ready', 'awaiting_media', 'pending_review', 'published') "
+                "AND status IN ('ready', 'awaiting_media', 'pending_review', 'published', 'skipped') "
                 "LIMIT 1",
                 (channel_id, topic),
             ).fetchone()

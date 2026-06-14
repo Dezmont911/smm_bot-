@@ -302,6 +302,10 @@ def _album_preview_media_group(items: list[dict], caption: str | None, parse_mod
     return media
 
 
+def _album_controls_text() -> str:
+    return "🎛 <b>Этот альбом</b>\nВыберите действие ниже."
+
+
 # ============================================================
 # Управление каналами — сохранение/удаление
 # ============================================================
@@ -2035,7 +2039,7 @@ async def _send_review_post_media(message, post: dict, caption: str, keyboard) -
                 media=_album_preview_media_group(items, cap, ParseMode.HTML)
             )
             await message.reply_text(
-                "🎛 <b>Управление этим альбомом</b>",
+                _album_controls_text(),
                 parse_mode=ParseMode.HTML,
                 reply_markup=keyboard,
             )
