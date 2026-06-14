@@ -456,6 +456,78 @@ def _looks_like_entertainment_context(text: str) -> bool:
     return any(marker in low for marker in ENTERTAINMENT_TEXT_MARKERS)
 
 
+COUNTER_STRIKE_CHANNEL_MARKERS = (
+    "cs2",
+    "cs go 2",
+    "cs go",
+    "csgo",
+    "cs:go",
+    "counter strike",
+    "counter-strike",
+    "counterstrike",
+    "counter strike 2",
+    "\u043a\u04412",
+    "\u043a\u0441 2",
+    "\u043a\u043e\u043d\u0442\u0440\u0430",
+)
+
+COUNTER_STRIKE_REAL_SPORT_MARKERS = (
+    "badminton",
+    "shuttlecock",
+    "shuttlecocks",
+    "victor shuttle",
+    "yonex",
+    "racquet",
+    "racquets",
+    "racket",
+    "rackets",
+    "tennis",
+    "rugby",
+    "soccer",
+    "football",
+    "basketball",
+    "baseball",
+    "volleyball",
+    "cricket",
+    "golf",
+    "hockey",
+    "athlete",
+    "stadium",
+    "pitch",
+    "court",
+    "\u0431\u0430\u0434\u043c\u0438\u043d\u0442\u043e\u043d",
+    "\u0432\u043e\u043b\u0430\u043d",
+    "\u0432\u043e\u043b\u0430\u043d\u044b",
+    "\u0440\u0430\u043a\u0435\u0442\u043a\u0430",
+    "\u0440\u0430\u043a\u0435\u0442\u043a\u0438",
+    "\u0442\u0435\u043d\u043d\u0438\u0441",
+    "\u0444\u0443\u0442\u0431\u043e\u043b",
+    "\u0431\u0430\u0441\u043a\u0435\u0442\u0431\u043e\u043b",
+    "\u0431\u0435\u0439\u0441\u0431\u043e\u043b",
+    "\u0432\u043e\u043b\u0435\u0439\u0431\u043e\u043b",
+    "\u0445\u043e\u043a\u043a\u0435\u0439",
+    "\u0433\u043e\u043b\u044c\u0444",
+    "\u043a\u0440\u0438\u043a\u0435\u0442",
+    "\u0441\u0442\u0430\u0434\u0438\u043e\u043d",
+    "\u043a\u043e\u0440\u0442",
+)
+
+
+def _is_counter_strike_channel(channel: dict) -> bool:
+    profile = _low(" ".join([
+        str(channel.get("channel_id") or ""),
+        str(channel.get("name") or ""),
+        str(channel.get("topic") or ""),
+        str(channel.get("archetype") or ""),
+    ]))
+    return any(marker in profile for marker in COUNTER_STRIKE_CHANNEL_MARKERS)
+
+
+def _has_counter_strike_real_sport_drift(text: str) -> bool:
+    low = _low(text)
+    return any(marker in low for marker in COUNTER_STRIKE_REAL_SPORT_MARKERS)
+
+
 def _blocked_content_for_channel(channel: dict, text: str) -> bool:
     low = _low(text)
     if not low:
@@ -602,6 +674,16 @@ def evaluate_topic_candidate(channel: dict, topic_data: dict) -> dict:
             "safe_topic": None,
             "reason_code": "blocked_content",
             "notes": f"source={source}; candidate contains restricted content",
+        })
+        return result
+
+    if _is_counter_strike_channel(channel) and _has_counter_strike_real_sport_drift(raw_topic):
+        result.update({
+            "decision": "blocked",
+            "risk_level": "medium",
+            "safe_topic": None,
+            "reason_code": "counter_strike_real_sport_drift",
+            "notes": f"source={source}; real sport topic does not fit Counter-Strike channel",
         })
         return result
 
@@ -972,6 +1054,15 @@ def validate_generated_post(channel: dict, post: dict, safety: dict, brief: dict
 
     if _blocked_content_for_channel(channel, content):
         result.update({"allowed": False, "decision": "blocked", "reason_code": "blocked_output_content"})
+        return result
+
+    if _is_counter_strike_channel(channel) and _has_counter_strike_real_sport_drift(content):
+        result.update({
+            "allowed": False,
+            "decision": "blocked",
+            "reason_code": "counter_strike_real_sport_drift",
+            "notes": "real sport content does not fit Counter-Strike channel",
+        })
         return result
 
     if _looks_like_import_ad_or_offtopic(content):

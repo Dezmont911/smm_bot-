@@ -1269,6 +1269,34 @@ class ContentSafetyTest(unittest.TestCase):
 
 
 class ChannelSafetyIsolationTest(unittest.TestCase):
+    def test_counter_strike_channel_rejects_real_sport_drift(self):
+        channel = {
+            "channel_id": "@csgo_only_facts",
+            "name": "CS GO 2 | Only facts",
+            "topic": "CS2 esports, Counter-Strike tactics, matches and skins",
+            "channel_type": "content",
+        }
+        topic = "Victor Shuttlecocks: why badminton stability matters for a good racquet"
+
+        safety = evaluate_topic_candidate(channel, {"topic": topic, "source": "rss"})
+        self.assertEqual(safety["decision"], "blocked")
+        self.assertEqual(safety["reason_code"], "counter_strike_real_sport_drift")
+
+        validation = validate_generated_post(
+            channel,
+            {
+                "format": "fact",
+                "content": (
+                    "Victor Shuttlecocks показывают ровную траекторию, "
+                    "а стабильный слайд помогает контролировать темп раунда."
+                ),
+            },
+            {"decision": "allowed", "safe_topic": topic},
+            {},
+        )
+        self.assertFalse(validation["allowed"])
+        self.assertEqual(validation["reason_code"], "counter_strike_real_sport_drift")
+
     def test_blogger_news_policy_does_not_classify_wallpaper_channels(self):
         wallpaper_channel = {
             "channel_id": "@wallgramava",

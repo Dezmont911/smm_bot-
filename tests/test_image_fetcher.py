@@ -12,6 +12,14 @@ class ImageFetcherPolicyTest(unittest.IsolatedAsyncioTestCase):
             ["cs2", "skins"],
         ))
 
+    def test_csgo_context_skips_stock(self):
+        self.assertTrue(image_fetcher._should_skip_stock_for_context(
+            "IEM Cologne Major Pick'Em Challenge",
+            "CS GO 2 | Only facts",
+            "@csgo_only_facts",
+            [],
+        ))
+
     def test_generic_context_does_not_skip_stock(self):
         self.assertFalse(image_fetcher._should_skip_stock_for_context(
             "Как не забывать пить воду летом",
@@ -25,6 +33,10 @@ class ImageFetcherPolicyTest(unittest.IsolatedAsyncioTestCase):
             {
                 "alt": "Rugby player running with a ball on green field",
                 "src": {"large": "https://example.test/rugby.jpg"},
+            },
+            {
+                "alt": "Badminton shuttlecock and racquet on blue background",
+                "src": {"large": "https://example.test/badminton.jpg"},
             },
             {
                 "alt": "Gamer playing on computer with keyboard and monitor",

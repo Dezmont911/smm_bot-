@@ -41,6 +41,10 @@ PEXELS_SEARCH   = "https://api.pexels.com/v1/search"
 
 NICHE_GAME_CONTEXTS = {
     "cs2": "counter strike 2",
+    "cs go 2": "counter strike 2",
+    "cs go": "counter strike 2",
+    "csgo": "counter strike 2",
+    "cs:go": "counter strike 2",
     "counter strike": "counter strike 2",
     "counter-strike": "counter strike 2",
     "counterstrike": "counter strike 2",
@@ -53,14 +57,15 @@ NICHE_GAME_CONTEXTS = {
 }
 
 STOCK_GAMING_TERMS = {
-    "gaming", "gamer", "esports", "e-sports", "counter", "strike", "cs2",
+    "gaming", "gamer", "esports", "e-sports", "counter", "strike", "cs2", "csgo",
     "minecraft", "roblox", "fortnite", "valorant", "dota", "steam",
 }
 
 STOCK_SPORT_FALSE_POSITIVES = {
     "rugby", "football", "soccer", "basketball", "baseball", "tennis",
     "cricket", "golf", "hockey", "volleyball", "athlete", "stadium",
-    "pitch", "field", "ball", "court",
+    "pitch", "field", "ball", "court", "badminton", "shuttlecock",
+    "shuttlecocks", "racket", "rackets", "racquet", "racquets", "yonex",
 }
 
 
@@ -331,7 +336,8 @@ async def _build_english_query(topic: str, channel_topic: str = "") -> str:
     # Словарь тематик каналов → английские ключевые слова
     CHANNEL_MAP = {
         "майнкрафт": "minecraft", "minecraft": "minecraft",
-        "cs2": "counter strike 2", "counter-strike": "counter strike 2", "counter strike": "counter strike 2",
+        "cs2": "counter strike 2", "cs go": "counter strike 2", "csgo": "counter strike 2",
+        "cs:go": "counter strike 2", "counter-strike": "counter strike 2", "counter strike": "counter strike 2",
         "игр": "gaming", "игры": "gaming", "steam": "gaming pc",
         "финансы": "finance money", "инвестиц": "investing",
         "здоровье": "health wellness", "спорт": "sport fitness",
