@@ -815,6 +815,27 @@ class ContentSafetyTest(unittest.TestCase):
             )
         )
 
+    def test_generator_fallback_topic_dedup_can_reuse_common_channel_base(self):
+        gen = ContentGenerator()
+        used = [
+            "Канал публикует удивительные и малоизвестные факты о природе: интересный неочевидный факт"
+        ]
+
+        self.assertFalse(
+            gen._topic_already_used(
+                "Канал публикует удивительные и малоизвестные факты о природе: разбор для новичка",
+                used,
+                fuzzy=False,
+            )
+        )
+        self.assertTrue(
+            gen._topic_already_used(
+                "Канал публикует удивительные и малоизвестные факты о природе: интересный неочевидный факт",
+                used,
+                fuzzy=False,
+            )
+        )
+
     def test_output_validator_allows_known_age_groups(self):
         channel = {
             **ROBO_CHANNEL,
