@@ -391,8 +391,13 @@ class ContentSafetyTest(unittest.TestCase):
         angles = content_generator_module._fallback_angles_for_channel(channel)
         joined = " ".join(angles).lower()
 
+        self.assertNotIn("совет", joined)
         self.assertNotIn("практический совет", joined)
+        self.assertNotIn("практическая польза", joined)
         self.assertNotIn("частая ошибка", joined)
+        self.assertNotIn("разбор для новичка", joined)
+        self.assertNotIn("топ-подборка", joined)
+        self.assertNotIn("история из практики", joined)
         self.assertIn("исторический факт", joined)
 
     def test_celeb_drama_output_rejects_offtopic_drift(self):
@@ -633,6 +638,50 @@ class ContentSafetyTest(unittest.TestCase):
         )
         self.assertFalse(validation["allowed"])
         self.assertEqual(validation["reason_code"], "broad_fact_advice_drift")
+
+    def test_broad_fact_output_rejects_garden_and_lab_advice_drift(self):
+        channel = {
+            "channel_id": "@history_loopa",
+            "name": "История под лупой",
+            "topic": (
+                "Любопытные факты о природе, животных, науке, истории и человеческом поведении."
+            ),
+            "channel_type": "content",
+        }
+        safety_and_brief = dry_run_topic(
+            channel,
+            "Ancient landslides reveal how landscapes changed over centuries.",
+        )
+
+        garden = validate_generated_post(
+            channel,
+            {
+                "format": "факт",
+                "content": (
+                    "Укрепи сад у дома, чтобы уменьшить оползни вокруг. "
+                    "1) Посади корнеобразующие растения. 2) Сделай террасы и подпорные стенки."
+                ),
+            },
+            safety_and_brief["safety"],
+            safety_and_brief["content_brief"],
+        )
+        self.assertFalse(garden["allowed"])
+        self.assertEqual(garden["reason_code"], "broad_fact_advice_drift")
+
+        lab = validate_generated_post(
+            channel,
+            {
+                "format": "разбор",
+                "content": (
+                    "Используй фазовый контраст с лазером — он помогает видеть мелкие белки. "
+                    "1) Обсуди с лабораторией установку лазерной системы. 2) Проверь на контрольных образцах."
+                ),
+            },
+            safety_and_brief["safety"],
+            safety_and_brief["content_brief"],
+        )
+        self.assertFalse(lab["allowed"])
+        self.assertEqual(lab["reason_code"], "broad_fact_advice_drift")
 
     def test_broad_fact_output_allows_clean_fact_note(self):
         channel = {
