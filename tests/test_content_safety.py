@@ -1098,6 +1098,26 @@ class ContentSafetyTest(unittest.TestCase):
         self.assertEqual(topic_safety["decision"], "allowed_safe")
         self.assertEqual(topic_safety["reason_code"], "celeb_drama_fit")
 
+    def test_wallpaper_channel_is_not_misclassified_as_celeb_drama(self):
+        channel = {
+            "channel_id": "@wallgramava",
+            "name": "Wallgram | Аватарки и обои",
+            "topic": (
+                "Канал публикует разнообразные обои и фоновые изображения для "
+                "мобильных устройств: пейзажи, фантазийные сцены, автомобили, самураи."
+            ),
+            "channel_type": "content",
+            "archetype": "default",
+        }
+
+        topic_safety = evaluate_topic_candidate(
+            channel,
+            {"topic": "Самурайские обои для телефона", "source": "reference"},
+        )
+
+        self.assertEqual(topic_safety["decision"], "allowed")
+        self.assertNotEqual(topic_safety.get("reason_code"), "celeb_drama_fit_unclear")
+
     def test_import_guard_rejects_marketplace_advisory_offtopic(self):
         validation = validate_imported_post(
             MARKETPLACE_CHANNEL,

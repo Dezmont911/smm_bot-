@@ -129,6 +129,13 @@ CELEB_DRAMA_PROFILE_MARKERS = (
     "коллаб", "карьер", "образ", "шоу-бизнес", "пев", "актёр", "актер", "артист",
 )
 
+CELEB_DRAMA_CHANNEL_MARKERS = (
+    "блогер", "блогерск", "инфлюенсер", "интернет-персон", "селеб", "звезд", "звёзд",
+    "ютуб", "youtube", "тикток", "tiktok", "стример", "соцсет",
+    "инстаграм", "instagram", "facebook", "фейсбук", "вконтакте",
+    "шоу-бизнес",
+)
+
 CELEB_DRAMA_OFFTOPIC_MARKERS = (
     "нато", "главком", "военн", "армия", "военнослуж", "танк", "ввс", "днр", "лнр",
     "пригранич", "фронт", "европа", "запад", "совбез", "медведев", "госдум", "сенатор",
@@ -499,7 +506,7 @@ def _is_celeb_drama_channel(channel: dict) -> bool:
         str(channel.get("topic") or ""),
         str(channel.get("name") or ""),
     ]))
-    return any(marker in profile for marker in CELEB_DRAMA_PROFILE_MARKERS)
+    return any(marker in profile for marker in CELEB_DRAMA_CHANNEL_MARKERS)
 
 
 def is_celeb_drama_channel(channel: dict) -> bool:
