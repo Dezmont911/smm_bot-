@@ -127,6 +127,10 @@ class ContentSafetyTest(unittest.TestCase):
             "Фешн-блогер Игор Синяк рассказал об ограблении в Париже",
             "Ольга Бузова, Оксана Самойлова и Ида Галич потеряли доступ к аккаунтам после взлома",
             "Александра Митрошина объявила о запуске нового марафона в соцсетях",
+            "MrBeast запустил канал в Max и набрал миллион подписчиков",
+            "Блогер Иван Петров перезапустил страницу в Instagram после взлома",
+            "Инфлюенсер Анна Смирнова вернулась во ВКонтакте с новым проектом",
+            "Стример Алексей Орлов открыл страницу в Facebook для зарубежной аудитории",
         ]
         for sample in samples:
             with self.subTest(sample=sample):
@@ -1075,6 +1079,24 @@ class ContentSafetyTest(unittest.TestCase):
         )
         self.assertFalse(validation["allowed"])
         self.assertEqual(validation["reason_code"], "import_ad_or_offtopic")
+
+    def test_import_guard_rejects_max_channel_promo_without_blocking_platform_news(self):
+        imported = validate_imported_post(
+            {"channel_id": "@plain", "topic": "новости"},
+            {
+                "format": "reference",
+                "content": "Мы в Max: подпишись и читай наш канал там.",
+            },
+        )
+        self.assertFalse(imported["allowed"])
+        self.assertEqual(imported["reason_code"], "import_ad_or_offtopic")
+
+        topic_safety = evaluate_topic_candidate(
+            BLOGGER_NEWS_CHANNEL,
+            {"topic": "MrBeast запустил канал в Max и набрал миллион подписчиков", "source": "search"},
+        )
+        self.assertEqual(topic_safety["decision"], "allowed_safe")
+        self.assertEqual(topic_safety["reason_code"], "celeb_drama_fit")
 
     def test_import_guard_rejects_marketplace_advisory_offtopic(self):
         validation = validate_imported_post(
