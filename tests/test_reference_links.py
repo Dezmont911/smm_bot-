@@ -581,6 +581,56 @@ class ReferenceTextMediaModesTest(unittest.TestCase):
         self.assertIsNone(result)
         add_mock.assert_not_called()
 
+    def test_reference_short_vpn_promo_is_rejected(self):
+        p = {
+            "id": 30,
+            "text": "My top VPN personally tested",
+            "media_kind": None,
+        }
+        with mock.patch.object(ri.buffer, "add") as add_mock:
+            result = asyncio.run(ri._store_reference_post(
+                self.channel, "@plain", "@donor", p, do_rephrase=False,
+            ))
+        self.assertIsNone(result)
+        add_mock.assert_not_called()
+
+    def test_reference_vpn_photo_promo_is_rejected(self):
+        p = {
+            "id": 31,
+            "text": "LumixVPN: unlimited traffic, many locations, connect here.",
+            "media_kind": "photo",
+        }
+        with mock.patch.object(ri.buffer, "add") as add_mock:
+            result = asyncio.run(ri._store_reference_post(
+                self.channel, "@plain", "@donor", p, do_rephrase=False,
+            ))
+        self.assertIsNone(result)
+        add_mock.assert_not_called()
+
+    def test_reference_max_relocation_promo_is_rejected(self):
+        p = {
+            "id": 32,
+            "text": (
+                "Moved here - https://max.ru/oboi_wallpaper_kpop\n"
+                "Admin - https://clck.ru/3QWPaD\n"
+                "Manager - https://clck.ru/3R5Lx9"
+            ),
+            "text_html": '<a href="https://max.ru/oboi_wallpaper_kpop">MAX</a>',
+            "media_kind": None,
+        }
+        with mock.patch.object(ri.buffer, "add") as add_mock:
+            result = asyncio.run(ri._store_reference_post(
+                self.channel, "@plain", "@donor", p, do_rephrase=False,
+            ))
+        self.assertIsNone(result)
+        add_mock.assert_not_called()
+
+    def test_blocked_reference_hosts_are_not_restored(self):
+        self.assertFalse(ri._link_allowed("https://max.ru/oboi_wallpaper_kpop", "MAX", "@donor", self.channel))
+        self.assertFalse(ri._link_allowed("https://clck.ru/3QWPaD", "Admin", "@donor", self.channel))
+        self.assertFalse(ri._link_allowed("https://tagio.pro/channel/5072/pricing", "Ads", "@donor", self.channel))
+        self.assertTrue(ri._link_allowed("https://www.twitch.tv/directory/category/minecraft", "Twitch", "@donor", self.channel))
+
     def test_meta_rephrase_falls_back_to_clean_original(self):
         captured, fake_add = self._capture_add()
         p = {"id": 9, "text": "Useful caption with several real words.", "media_kind": None}

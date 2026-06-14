@@ -59,11 +59,57 @@ AD_MARKERS = (
     "ссылка на чат в whatsapp", "telegram / whatsapp",
 )
 
+BLOCKED_REFERENCE_HOSTS = {
+    "max.ru",
+    "www.max.ru",
+    "clck.ru",
+    "www.clck.ru",
+    "tagio.pro",
+    "www.tagio.pro",
+}
+
+REFERENCE_PROMO_MARKERS = (
+    "lumixvpn",
+    "купить рекламу",
+    "по рекламе",
+    "смотри в био",
+    "переехали сюда",
+    "переехали в max",
+    "наш канал в max",
+    "мы в max",
+)
+
+
+def _word_count(text: str) -> int:
+    return len(re.findall(r"[0-9a-zа-яё]+", text.lower(), re.IGNORECASE))
+
+
+def _has_blocked_reference_url(text: str) -> bool:
+    for url in _URL_RE.findall(text or ""):
+        if _url_host(url) in BLOCKED_REFERENCE_HOSTS:
+            return True
+    return False
+
+
+def _looks_like_reference_service_ad(text: str) -> bool:
+    raw = (text or "").lower()
+    if not raw:
+        return False
+    if _has_blocked_reference_url(raw):
+        return True
+    if any(marker in raw for marker in REFERENCE_PROMO_MARKERS):
+        return True
+    if "vpn" in raw and (_word_count(raw) <= 10 or "lumixvpn" in raw):
+        return True
+    if raw.count("clck.ru/") >= 2 or raw.count("tagio.pro/") >= 1:
+        return True
+    return False
+
 
 def _is_ad(text: str) -> bool:
-    t = (text or "").lower()
-    t = re.sub(r"https?://\S+", " ", t)
-    return any(m in t for m in AD_MARKERS)
+    raw = (text or "").lower()
+    t = re.sub(r"https?://\S+", " ", raw)
+    return any(m in t for m in AD_MARKERS) or _looks_like_reference_service_ad(raw)
 
 
 # Слова-фильтры: предложение, где встречается такое слово (целиком, регистронезависимо),
@@ -83,6 +129,8 @@ def _strip_filtered_sentences(text: str) -> str:
         return text
     out_lines = []
     for line in text.split("\n"):
+        if _has_blocked_reference_url(line):
+            continue
         if "<a " in line.lower() or "href=" in line.lower() or re.search(r"https?://", line, re.IGNORECASE):
             out_lines.append(line.strip())
             continue
@@ -183,6 +231,10 @@ def _is_marketplace_product_url(url: str) -> bool:
     return any(marker in low for marker in MARKETPLACE_PRODUCT_LINK_MARKERS)
 
 
+def _is_blocked_reference_url(url: str) -> bool:
+    return _url_host(url) in BLOCKED_REFERENCE_HOSTS
+
+
 def _reference_link_label(url: str, label: str | None = None) -> str:
     label = re.sub(r"<[^>]+>", "", label or "").strip()
     label = html_lib.unescape(label)
@@ -267,6 +319,8 @@ def _link_allowed(url: str, label: str, source_handle: str | None, channel: dict
     if _is_source_channel_link(url, label, source_handle):
         return False
     if _is_telegram_url(url):
+        return False
+    if _is_blocked_reference_url(url):
         return False
     if _is_marketplace_channel(channel):
         return _is_marketplace_product_url(url)
@@ -589,6 +643,12 @@ async def _store_reference_post(channel: dict, channel_id: str, handle: str,
 
     topic = ref_topic(p.get("match_user") or handle, p.get("match_id") or p["id"])
     raw = p.get("text", "")
+    link_text = "\n".join(str(item.get("url", "")) for item in (p.get("links") or []) if isinstance(item, dict))
+    if _ref_flag(ref_config, "skip_ads", True) and _is_ad(
+        f"{raw}\n{p.get('text_html') or ''}\n{link_text}"
+    ):
+        logger.debug(f"Reference skipped [{channel_id}] {handle}/{p.get('id')}: reference_ad_or_service_promo")
+        return None
     raw_clean = cleanup_reference_text_before_rephrase(raw, handle, channel)
     html_clean = cleanup_reference_text_before_rephrase(p.get("text_html") or "", handle, channel)
     raw_for_safety = raw_clean or re.sub(r"<[^>]+>", " ", html_clean or "")
