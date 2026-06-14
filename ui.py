@@ -2790,7 +2790,8 @@ async def action_ref_import(qm, context, handle: str, count: int = 10):
             notes += f"\n📏 Пропущено по лимиту видео/размера: <b>{lim}</b>"
         msg = (
             f"✅ Собрано: добавлено <b>{res['added']}</b> постов из {res['refs']} донор(ов).{notes}\n\n"
-            f"<i>Медиа-посты подтянутся в очередь по мере пересылки файлов ботом.</i>"
+            f"<i>Медиа-посты подтянутся в очередь по мере пересылки файлов ботом.</i>\n\n"
+            f"Дальше можно открыть очередь и проверить, что именно попало в буфер."
         )
         if res['added'] == 0 and not dups and not lim:
             msg = "ℹ️ Новых постов нет, и архив на этом уровне исчерпан."
@@ -2799,7 +2800,11 @@ async def action_ref_import(qm, context, handle: str, count: int = 10):
         msg = f"❌ Ошибка импорта: {e}"
     await _answer_or_send(
         qm, msg,
-        InlineKeyboardMarkup([[InlineKeyboardButton("🔗 К референсам", callback_data=f"ui:ch_refs:{handle}")]]),
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton("📝 Посмотреть посты", callback_data=f"ui:ch_review:{handle}")],
+            [InlineKeyboardButton("🔗 К референсам", callback_data=f"ui:ch_refs:{handle}")],
+            [InlineKeyboardButton("◀️ К каналу", callback_data=f"ui:ch:{handle}")],
+        ]),
     )
 
 
