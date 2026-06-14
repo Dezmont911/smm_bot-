@@ -35,6 +35,8 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
 )
 from telegram.ext import (
     Application,
@@ -263,6 +265,41 @@ def review_keyboard(post_id: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("📤 Опубликовать сейчас", callback_data=f"postnow:{post_id}"),
         ],
     ])
+
+
+def _album_preview_items(album_json: str) -> list[dict]:
+    try:
+        data = json.loads(album_json or "{}")
+    except Exception:
+        return []
+    members = data.get("members") or []
+    items = data.get("items") or {}
+    result = []
+    for member_id in members[:10]:
+        item = items.get(str(member_id)) or {}
+        file_id = item.get("file_id")
+        if not file_id:
+            continue
+        media_type = item.get("type") or "photo"
+        if media_type not in ("photo", "video"):
+            media_type = "photo"
+        result.append({"file_id": file_id, "type": media_type})
+    return result
+
+
+def _album_preview_media_group(items: list[dict], caption: str | None, parse_mode=None) -> list:
+    media = []
+    for item in items:
+        media_caption = caption if not media else None
+        kwargs = {"media": item["file_id"]}
+        if media_caption:
+            kwargs["caption"] = media_caption
+            kwargs["parse_mode"] = parse_mode
+        if item.get("type") == "video":
+            media.append(InputMediaVideo(**kwargs))
+        else:
+            media.append(InputMediaPhoto(**kwargs))
+    return media
 
 
 # ============================================================
@@ -1986,13 +2023,22 @@ async def _send_review_post_media(message, post: dict, caption: str, keyboard) -
     fid = post.get("tg_file_id")
     try:
         if mt == "album" and fid:
-            data = json.loads(fid or "{}")
-            members, items = data.get("members", []), data.get("items", {})
-            first = items.get(str(members[0])) if members else None
-            if not first:
+            items = _album_preview_items(fid)
+            if not items:
                 return False
-            send = message.reply_video if first.get("type") == "video" else message.reply_photo
-            await send(first["file_id"], caption=cap, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            if len(items) == 1:
+                first = items[0]
+                send = message.reply_video if first.get("type") == "video" else message.reply_photo
+                await send(first["file_id"], caption=cap, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                return True
+            await message.reply_media_group(
+                media=_album_preview_media_group(items, cap, ParseMode.HTML)
+            )
+            await message.reply_text(
+                "🎛 <b>Действия для альбома выше</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
             return True
         if fid:
             if mt == "video":

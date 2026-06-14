@@ -34,6 +34,8 @@ from zoneinfo import ZoneInfo
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
     ReplyKeyboardMarkup,
     KeyboardButton,
     Update,
@@ -2835,6 +2837,41 @@ def _draft_type_label(d: dict) -> str:
     return f"{base} + текст" if has_text else base
 
 
+def _album_preview_items(album_json: str) -> list[dict]:
+    try:
+        data = json.loads(album_json or "{}")
+    except Exception:
+        return []
+    members = data.get("members") or []
+    items = data.get("items") or {}
+    result = []
+    for member_id in members[:10]:
+        item = items.get(str(member_id)) or {}
+        file_id = item.get("file_id")
+        if not file_id:
+            continue
+        media_type = item.get("type") or "photo"
+        if media_type not in ("photo", "video"):
+            media_type = "photo"
+        result.append({"file_id": file_id, "type": media_type})
+    return result
+
+
+def _album_preview_media_group(items: list[dict], caption: str | None, parse_mode=None) -> list:
+    media = []
+    for item in items:
+        media_caption = caption if not media else None
+        kwargs = {"media": item["file_id"]}
+        if media_caption:
+            kwargs["caption"] = media_caption
+            kwargs["parse_mode"] = parse_mode
+        if item.get("type") == "video":
+            media.append(InputMediaVideo(**kwargs))
+        else:
+            media.append(InputMediaPhoto(**kwargs))
+    return media
+
+
 def _manual_dedup_text(content: str | None) -> str:
     text = html.unescape(content or "")
     text = re.sub(r"<a\b[^>]*>(.*?)</a>", r"\1", text, flags=re.I | re.S)
@@ -3204,10 +3241,20 @@ async def _flush_draft_batch_summary(context: ContextTypes.DEFAULT_TYPE, handle:
             mt, fid = draft.get("media_type"), draft.get("tg_file_id")
             try:
                 if mt == "album" and fid:
-                    data = json.loads(fid or "{}")
-                    members, items = data.get("members", []), data.get("items", {})
-                    first = items.get(str(members[0])) if members else None
-                    if first:
+                    items = _album_preview_items(fid)
+                    if len(items) >= 2:
+                        await context.bot.send_media_group(
+                            chat_id=chat_id,
+                            media=_album_preview_media_group(items, cap, ParseMode.HTML),
+                        )
+                        sent = await context.bot.send_message(
+                            chat_id,
+                            "🎛 <b>Действия для альбома выше</b>",
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=kb,
+                        )
+                    elif items:
+                        first = items[0]
                         if first.get("type") == "video":
                             sent = await context.bot.send_video(chat_id, first["file_id"], caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb)
                         else:
@@ -3386,10 +3433,20 @@ async def _reply_draft_card(
     sent = None
     try:
         if mt == "album" and fid:
-            data = json.loads(fid or "{}")
-            members, items = data.get("members", []), data.get("items", {})
-            first = items.get(str(members[0])) if members else None
-            if first:
+            items = _album_preview_items(fid)
+            if len(items) >= 2:
+                await msg_obj.reply_media_group(
+                    media=_album_preview_media_group(items, cap, ParseMode.HTML)
+                )
+                sent = await msg_obj.reply_text(
+                    "🎛 <b>Действия для альбома выше</b>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb,
+                )
+                _track_draft_card_message(context, d["channel_id"], sent)
+                return
+            if items:
+                first = items[0]
                 send = msg_obj.reply_video if first.get("type") == "video" else msg_obj.reply_photo
                 sent = await send(first["file_id"], caption=cap, parse_mode=ParseMode.HTML, reply_markup=kb)
                 _track_draft_card_message(context, d["channel_id"], sent)
@@ -4132,7 +4189,23 @@ async def action_draft_view(qm, context: ContextTypes.DEFAULT_TYPE, post_id: str
     parse_mode = d.get("parse_mode")
     fid, mt = d.get("tg_file_id"), d.get("media_type")
     try:
-        if mt == "photo":
+        if mt == "album" and fid:
+            items = _album_preview_items(fid)
+            media_cap = cap if not cap or len(cap) <= 1024 else cap[:1020] + "…"
+            if len(items) >= 2:
+                await context.bot.send_media_group(
+                    chat_id=chat_id,
+                    media=_album_preview_media_group(items, media_cap, parse_mode),
+                )
+            elif items:
+                first = items[0]
+                if first.get("type") == "video":
+                    await context.bot.send_video(chat_id, first["file_id"], caption=media_cap, parse_mode=parse_mode)
+                else:
+                    await context.bot.send_photo(chat_id, first["file_id"], caption=media_cap, parse_mode=parse_mode)
+            else:
+                await context.bot.send_message(chat_id, cap or "(пустой пост)", parse_mode=parse_mode)
+        elif mt == "photo":
             await context.bot.send_photo(chat_id, fid, caption=cap, parse_mode=parse_mode)
         elif mt == "video":
             await context.bot.send_video(chat_id, fid, caption=cap, parse_mode=parse_mode)
