@@ -65,6 +65,35 @@ def _parse_topics(text: str) -> list[str]:
     return clean_topics(lines)
 
 
+def _filter_topics_for_channel(channel: dict, topics: list[str], source: str) -> list[str]:
+    """Отсекает темы, которые уже на этапе поиска не подходят узкому профилю канала."""
+    if not topics:
+        return []
+    try:
+        from content_safety import evaluate_topic_candidate, is_celeb_drama_channel
+    except Exception:
+        return topics
+    if not is_celeb_drama_channel(channel):
+        return topics
+
+    kept: list[str] = []
+    dropped: list[tuple[str, str]] = []
+    for topic in topics:
+        safety = evaluate_topic_candidate(channel, {"topic": topic, "source": source})
+        if safety.get("decision") in {"allowed", "allowed_safe", "reframe"} and safety.get("safe_topic"):
+            kept.append(topic)
+        else:
+            dropped.append((safety.get("reason_code", "unknown"), topic))
+
+    if dropped:
+        channel_id = channel.get("channel_id", "?")
+        examples = "; ".join(f"{reason}: {topic[:70]}" for reason, topic in dropped[:3])
+        logger.info(
+            f"web_search [{channel_id}]: отсеяно неподходящих celeb-тем {len(dropped)} | {examples}"
+        )
+    return kept
+
+
 def _build_prompt(channel: dict, count: int, used_topics: list[str]) -> str:
     """Промпт для поиска свежих тем."""
     name = channel.get("name", "")
@@ -337,8 +366,11 @@ async def get_topics(channel: dict, count: int, used_topics: list[str] | None = 
     for cid, topic in cached:
         if len(picked) >= count:
             break
-        picked_ids.append(cid)
-        picked.append(topic)
+        if _filter_topics_for_channel(channel, [topic], "topic_cache"):
+            picked_ids.append(cid)
+            picked.append(topic)
+        else:
+            picked_ids.append(cid)
 
     if len(picked) >= count:
         _cache_mark_used(picked_ids)
@@ -352,6 +384,7 @@ async def get_topics(channel: dict, count: int, used_topics: list[str] | None = 
     fresh = await discover_topics(
         channel, count=batch, used_topics=used_topics + picked
     )
+    fresh = _filter_topics_for_channel(channel, fresh, "search")
 
     if fresh:
         take = fresh[:need]
@@ -366,6 +399,6 @@ async def get_topics(channel: dict, count: int, used_topics: list[str] | None = 
         return result[:count]
 
     # поиск ничего не дал — возвращаем что есть из кэша
-    if picked:
+    if picked_ids:
         _cache_mark_used(picked_ids)
     return picked[:count]

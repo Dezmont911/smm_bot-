@@ -306,6 +306,25 @@ class LLMProviderTests(unittest.TestCase):
         self.assertIn("Максим Лутчак", prompt)
         self.assertIn("НЕ предлагай", prompt)
 
+    def test_celeb_drama_topic_search_filters_unsafe_topics_before_cache(self):
+        topics = topic_search._filter_topics_for_channel(
+            {
+                "channel_id": "@novosti_bl0gerov",
+                "archetype": "celeb_drama",
+                "topic": "новости о жизни российских блогеров и интернет-персоналий",
+            },
+            [
+                "Блогер Хилми Форкс остался в колонии после отказа в УДО",
+                "ВПШ — российское интернет-издание, публикующее новости о блогерах",
+                "Александра Митрошина объявила о запуске нового марафона в соцсетях",
+            ],
+            "search",
+        )
+        self.assertEqual(
+            topics,
+            ["Александра Митрошина объявила о запуске нового марафона в соцсетях"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
