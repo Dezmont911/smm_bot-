@@ -969,6 +969,7 @@ class ContentGenerator:
 
     # Порог косинуса: тема считается «в теме канала», если близость к профилю ≥ порога.
     RELEVANCE_MIN = 0.28
+    BROAD_FACT_RELEVANCE_MIN = 0.14
 
     async def _filter_relevant(self, channel: dict, topics: list[dict], count: int) -> list[dict]:
         """
@@ -1000,6 +1001,7 @@ class ContentGenerator:
         if prof_vec is None:
             return topics
 
+        threshold = self.BROAD_FACT_RELEVANCE_MIN if _is_broad_fact_channel(channel) else self.RELEVANCE_MIN
         results, dropped = [], []
         for t in topics:
             if t.get("source") in ("evergreen", "fallback"):
@@ -1010,7 +1012,7 @@ class ContentGenerator:
                 results.append(t)
                 continue
             sim = dedup.cosine(prof_vec, vec)
-            if sim >= self.RELEVANCE_MIN:
+            if sim >= threshold:
                 results.append(t)
             else:
                 dropped.append((sim, t))
@@ -1019,7 +1021,7 @@ class ContentGenerator:
             ex = "; ".join(f"{sim:.2f} {t.get('topic','')[:35]}" for sim, t in dropped[:3])
             logger.info(
                 f"Гейт релевантности [{channel_id}]: отсеяно off-topic {len(dropped)} "
-                f"(порог {self.RELEVANCE_MIN}), оставлено {len(results)} | примеры: {ex}"
+                f"(порог {threshold}), оставлено {len(results)} | примеры: {ex}"
             )
         return results
 

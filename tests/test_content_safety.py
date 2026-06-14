@@ -279,6 +279,41 @@ class ContentSafetyTest(unittest.TestCase):
             content_generator_module.web_scraper = original_web_scraper
             content_generator_module.buffer.get_evergreen_topic = original_get_evergreen_topic
 
+    def test_broad_fact_channel_uses_softer_relevance_threshold(self):
+        original_backend = content_generator_module.dedup.backend
+        original_aembed = content_generator_module.dedup.aembed
+        original_cosine = content_generator_module.dedup.cosine
+
+        async def fake_aembed(text):
+            return [1.0]
+
+        try:
+            content_generator_module.dedup.backend = lambda: "embedding"
+            content_generator_module.dedup.aembed = fake_aembed
+            content_generator_module.dedup.cosine = lambda *_args, **_kwargs: 0.20
+
+            generator = ContentGenerator()
+            topics = [{"topic": "Ученые обнаружили редкое поведение осьминогов", "source": "rss"}]
+            broad_fact = {
+                "channel_id": "@facts",
+                "name": "Хочу все знать",
+                "topic": "Удивительные малоизвестные факты о природе, животных, науке и организме.",
+                "channel_type": "content",
+            }
+            narrow = {
+                "channel_id": "@cs2",
+                "name": "CS2 facts",
+                "topic": "Канал про матчи и тактики Counter-Strike 2.",
+                "channel_type": "content",
+            }
+
+            self.assertEqual(asyncio.run(generator._filter_relevant(broad_fact, topics, 1)), topics)
+            self.assertEqual(asyncio.run(generator._filter_relevant(narrow, topics, 1)), [])
+        finally:
+            content_generator_module.dedup.backend = original_backend
+            content_generator_module.dedup.aembed = original_aembed
+            content_generator_module.dedup.cosine = original_cosine
+
     def test_celeb_drama_output_rejects_offtopic_drift(self):
         validation = validate_generated_post(
             BLOGGER_NEWS_CHANNEL,
