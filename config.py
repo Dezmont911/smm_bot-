@@ -96,6 +96,9 @@ class Config:
     OPENAI_MODEL: str = field(
         default_factory=lambda: _optional("OPENAI_MODEL", "gpt-5-mini")
     )
+    OPENAI_WEB_SEARCH_MODEL: str = field(
+        default_factory=lambda: _optional("OPENAI_WEB_SEARCH_MODEL", "gpt-4.1-mini")
+    )
 
     # --- База данных ---
     # Необязательная пока — нужна для Слоя 3 (буфер постов)

@@ -65,6 +65,21 @@ class LLMProviderTests(unittest.TestCase):
             "gpt-5.1",
         )
 
+    def test_openai_web_search_uses_dedicated_model_by_default(self):
+        original = getattr(claude_helper.cfg, "OPENAI_WEB_SEARCH_MODEL", "")
+        try:
+            claude_helper.cfg.OPENAI_WEB_SEARCH_MODEL = "gpt-4.1-mini"
+            self.assertEqual(
+                claude_helper._openai_web_search_model_for(None),
+                "gpt-4.1-mini",
+            )
+            self.assertEqual(
+                claude_helper._openai_web_search_model_for("gpt-5-mini"),
+                "gpt-5-mini",
+            )
+        finally:
+            claude_helper.cfg.OPENAI_WEB_SEARCH_MODEL = original
+
     def test_anthropic_provider_replaces_gpt_model_override(self):
         original = claude_helper.cfg.CLAUDE_MODEL
         try:
@@ -141,14 +156,22 @@ class LLMProviderTests(unittest.TestCase):
 
     def test_openai_web_search_payload_forces_tool(self):
         kwargs = __import__("asyncio").run(
+            self._run_openai_web_search_payload("")
+        )
+        self.assertEqual(kwargs["model"], claude_helper.cfg.OPENAI_WEB_SEARCH_MODEL)
+        self.assertEqual(kwargs["tool_choice"], "required")
+        self.assertEqual(kwargs["tools"][0]["type"], "web_search")
+        self.assertEqual(kwargs["tools"][0]["search_context_size"], "medium")
+        self.assertEqual(kwargs["tools"][0]["filters"]["allowed_domains"], ["example.com"])
+        self.assertNotIn("reasoning", kwargs)
+
+    def test_openai_web_search_gpt5_uses_low_reasoning(self):
+        kwargs = __import__("asyncio").run(
             self._run_openai_web_search_payload("gpt-5-mini")
         )
         self.assertEqual(kwargs["model"], "gpt-5-mini")
-        self.assertEqual(kwargs["tool_choice"], "required")
-        self.assertEqual(kwargs["tools"][0]["type"], "web_search")
-        self.assertEqual(kwargs["tools"][0]["search_context_size"], "low")
-        self.assertEqual(kwargs["tools"][0]["filters"]["allowed_domains"], ["example.com"])
-        self.assertNotIn("reasoning", kwargs)
+        self.assertEqual(kwargs["reasoning"], {"effort": "low"})
+        self.assertNotIn("temperature", kwargs)
 
     def test_anthropic_credit_error_falls_back_to_openai(self):
         original_provider = claude_helper.cfg.LLM_PROVIDER

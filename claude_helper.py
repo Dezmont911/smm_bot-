@@ -51,6 +51,14 @@ def _openai_model_for(requested: str | None) -> str:
     return model
 
 
+def _openai_web_search_model_for(requested: str | None) -> str:
+    model = (requested or "").strip()
+    if model and not model.startswith("claude-"):
+        return model
+    configured = (getattr(cfg, "OPENAI_WEB_SEARCH_MODEL", "") or "").strip()
+    return configured or "gpt-4.1-mini"
+
+
 def _anthropic_model_for(requested: str | None) -> str:
     model = (requested or "").strip()
     if not model or model.startswith("gpt-") or model.startswith("o"):
@@ -64,6 +72,11 @@ def _openai_uses_reasoning_params(model: str) -> bool:
 
 def _openai_supports_temperature(model: str) -> bool:
     return not _openai_uses_reasoning_params(model)
+
+
+def _openai_web_search_context_size(value: str | None) -> str:
+    size = (value or "medium").strip().lower()
+    return size if size in {"low", "medium", "high"} else "medium"
 
 
 def _openai_available() -> bool:
@@ -209,17 +222,17 @@ async def openai_web_search_text(
     retries: int = 1,
     purpose: str = "",
     allowed_domains: list[str] | None = None,
-    search_context_size: str = "low",
+    search_context_size: str = "medium",
 ) -> str:
     if not cfg.OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is not configured")
     if openai_client is None:
         raise RuntimeError("OpenAI SDK is not installed; deploy/install requirements first")
 
-    selected_model = _openai_model_for(model)
+    selected_model = _openai_web_search_model_for(model)
     tool: dict = {
         "type": "web_search",
-        "search_context_size": search_context_size,
+        "search_context_size": _openai_web_search_context_size(search_context_size),
     }
     if allowed_domains:
         tool["filters"] = {"allowed_domains": allowed_domains}
@@ -231,6 +244,8 @@ async def openai_web_search_text(
         "tools": [tool],
         "tool_choice": "required",
     }
+    if _openai_uses_reasoning_params(selected_model):
+        kwargs["reasoning"] = {"effort": "low"}
     if system is not None:
         kwargs["instructions"] = system
     if temperature is not None and _openai_supports_temperature(selected_model):
@@ -251,7 +266,21 @@ async def openai_web_search_text(
                 )
             except Exception:
                 pass
-            return _extract_openai_text(response)
+            text = _extract_openai_text(response)
+            if not text:
+                usage = getattr(response, "usage", None)
+                output_tokens = getattr(usage, "output_tokens", 0) if usage else 0
+                output_details = getattr(usage, "output_tokens_details", None) if usage else None
+                reasoning_tokens = (
+                    getattr(output_details, "reasoning_tokens", 0)
+                    if output_details is not None else 0
+                )
+                logger.warning(
+                    "OpenAI web_search вернул пустой текст: "
+                    f"model={selected_model} status={getattr(response, 'status', None)} "
+                    f"output_tokens={output_tokens} reasoning_tokens={reasoning_tokens}"
+                )
+            return text
         except Exception as e:
             last_err = e
             if attempt < retries:

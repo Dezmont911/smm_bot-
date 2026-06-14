@@ -165,7 +165,7 @@ async def _search_openai_fallback(
     try:
         text = await openai_web_search_text(
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=900,
+            max_tokens=1200,
             system=(
                 "Ты помогаешь редактору Telegram-канала искать свежие темы. "
                 "Обязательно используй веб-поиск. Верни только JSON-массив строк."
