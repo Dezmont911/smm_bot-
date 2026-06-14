@@ -528,6 +528,50 @@ def _has_counter_strike_real_sport_drift(text: str) -> bool:
     return any(marker in low for marker in COUNTER_STRIKE_REAL_SPORT_MARKERS)
 
 
+def _is_broad_fact_channel(channel: dict) -> bool:
+    if channel.get("channel_type", "content") != "content":
+        return False
+
+    profile = _low(" ".join([
+        str(channel.get("channel_id") or ""),
+        str(channel.get("name") or ""),
+        str(channel.get("topic") or ""),
+        str(channel.get("archetype") or ""),
+    ]))
+    if any(marker in profile for marker in (
+        "блогер", "инфлюенсер", "маркетплейс", "wildberries", "wb", "ozon",
+    )):
+        return False
+
+    markers = (
+        "факт", "интересн", "малоизвест", "познавател", "кругозор",
+        "природ", "животн", "наук", "истори", "организм",
+    )
+    return sum(1 for marker in markers if marker in profile) >= 2
+
+
+def _has_broad_fact_advice_drift(text: str) -> bool:
+    low = _low(text)
+    if not low:
+        return False
+
+    if re.search(
+        r"(?iu)(^|\n)\s*(узнай,\s*как|используй|применяй|попробуй|сделай|найди|"
+        r"обсуди|тестируй|сравни|записывай|фотографируй|собери|посади|наблюдай)\b",
+        low,
+    ):
+        return True
+
+    if re.search(
+        r"(?iu)(^|\n|\s)1\)\s*(обсуди|тестируй|сравни|найди|сделай|собери|посади|наблюдай|"
+        r"записывай|фотографируй)\b",
+        low,
+    ):
+        return True
+
+    return False
+
+
 def _blocked_content_for_channel(channel: dict, text: str) -> bool:
     low = _low(text)
     if not low:
@@ -1055,6 +1099,24 @@ def validate_generated_post(channel: dict, post: dict, safety: dict, brief: dict
     if _blocked_content_for_channel(channel, content):
         result.update({"allowed": False, "decision": "blocked", "reason_code": "blocked_output_content"})
         return result
+
+    if _is_broad_fact_channel(channel):
+        if _low(post.get("format")) == "совет":
+            result.update({
+                "allowed": False,
+                "decision": "review",
+                "reason_code": "broad_fact_advice_format",
+                "notes": "broad fact channel should explain facts, not publish advice format",
+            })
+            return result
+        if _has_broad_fact_advice_drift(content):
+            result.update({
+                "allowed": False,
+                "decision": "review",
+                "reason_code": "broad_fact_advice_drift",
+                "notes": "broad fact post looks like practical instruction instead of a fact note",
+            })
+            return result
 
     if _is_counter_strike_channel(channel) and _has_counter_strike_real_sport_drift(content):
         result.update({

@@ -347,12 +347,36 @@ class ContentSafetyTest(unittest.TestCase):
                 "topic": "Удивительные факты о природе, животных, науке и организме.",
                 "channel_type": "content",
                 "post_formats": ["совет"],
+                "allow_advice_format": True,
             }
             strategy = {"format_bias": {"совет": 1, "факт": 1}}
             topic_data = {"source": "rss", "topic": "Полезные свойства растения."}
 
             fmt = content_generator_module._pick_generation_format(channel, strategy, None, topic_data)
             self.assertEqual(fmt, "совет")
+        finally:
+            content_generator_module.pick_format = original_pick_format
+
+    def test_broad_fact_legacy_post_formats_do_not_allow_advice(self):
+        original_pick_format = content_generator_module.pick_format
+
+        try:
+            content_generator_module.pick_format = lambda *_args, **_kwargs: "совет"
+            channel = {
+                "channel_id": "@sm1leplease",
+                "name": "Хочу ВСЕ знать",
+                "topic": (
+                    "Канал публикует удивительные и малоизвестные факты о природе, животных, "
+                    "науке, истории и человеческом организме."
+                ),
+                "channel_type": "content",
+                "post_formats": ["совет дня", "факт/статистика", "мини-разбор"],
+            }
+            strategy = {"format_bias": {"совет": 1, "факт": 1, "разбор": 1}}
+            topic_data = {"source": "rss", "topic": "Scientists discover parrots may use names."}
+
+            fmt = content_generator_module._pick_generation_format(channel, strategy, None, topic_data)
+            self.assertEqual(fmt, "факт")
         finally:
             content_generator_module.pick_format = original_pick_format
 
@@ -546,6 +570,92 @@ class ContentSafetyTest(unittest.TestCase):
                     "и постепенно учатся доводить проект до результата. Напишите нам, "
                     "чтобы записаться на пробное занятие."
                 )
+            },
+            safety_and_brief["safety"],
+            safety_and_brief["content_brief"],
+        )
+        self.assertTrue(validation["allowed"])
+
+    def test_broad_fact_output_rejects_advice_format(self):
+        channel = {
+            "channel_id": "@sm1leplease",
+            "name": "Хочу ВСЕ знать",
+            "topic": (
+                "Канал публикует удивительные и малоизвестные факты о природе, животных, "
+                "науке, истории и человеческом организме."
+            ),
+            "channel_type": "content",
+        }
+        safety_and_brief = dry_run_topic(
+            channel,
+            "Физики усовершенствовали электронный микроскоп, чтобы биологи могли видеть белки.",
+        )
+        validation = validate_generated_post(
+            channel,
+            {
+                "format": "совет",
+                "content": (
+                    "Используй фазовый контраст с лазером — он помогает видеть мелкие белки. "
+                    "1) Обсуди с лабораторией установку лазерной системы."
+                ),
+            },
+            safety_and_brief["safety"],
+            safety_and_brief["content_brief"],
+        )
+        self.assertFalse(validation["allowed"])
+        self.assertEqual(validation["reason_code"], "broad_fact_advice_format")
+
+    def test_broad_fact_output_rejects_instruction_drift(self):
+        channel = {
+            "channel_id": "@sm1leplease",
+            "name": "Хочу ВСЕ знать",
+            "topic": (
+                "Канал публикует удивительные и малоизвестные факты о природе, животных, "
+                "науке, истории и человеческом организме."
+            ),
+            "channel_type": "content",
+        }
+        safety_and_brief = dry_run_topic(
+            channel,
+            "Millipedes beat vertebrates to land by 80 million years.",
+        )
+        validation = validate_generated_post(
+            channel,
+            {
+                "format": "факт",
+                "content": (
+                    "Узнай, как использовать открытие о многоножках в домашних исследованиях. "
+                    "1) Найди в парке сухие листья. 2) Наблюдай ночью с фонариком."
+                ),
+            },
+            safety_and_brief["safety"],
+            safety_and_brief["content_brief"],
+        )
+        self.assertFalse(validation["allowed"])
+        self.assertEqual(validation["reason_code"], "broad_fact_advice_drift")
+
+    def test_broad_fact_output_allows_clean_fact_note(self):
+        channel = {
+            "channel_id": "@sm1leplease",
+            "name": "Хочу ВСЕ знать",
+            "topic": (
+                "Канал публикует удивительные и малоизвестные факты о природе, животных, "
+                "науке, истории и человеческом организме."
+            ),
+            "channel_type": "content",
+        }
+        safety_and_brief = dry_run_topic(
+            channel,
+            "Ancient Denisovan DNA still shapes human immunity today.",
+        )
+        validation = validate_generated_post(
+            channel,
+            {
+                "format": "факт",
+                "content": (
+                    "ДНК денисовцев все еще влияет на иммунитет некоторых современных популяций. "
+                    "Унаследованные участки помогают лучше реагировать на местные инфекции."
+                ),
             },
             safety_and_brief["safety"],
             safety_and_brief["content_brief"],

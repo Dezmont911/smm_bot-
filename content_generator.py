@@ -86,8 +86,7 @@ def _should_avoid_advice_format(channel: dict, topic_data: dict) -> bool:
     """Broad fact channels should explain facts, not turn news into household advice."""
     if not _is_broad_fact_channel(channel):
         return False
-    explicit_formats = channel.get("post_formats")
-    if explicit_formats and "совет" in explicit_formats:
+    if channel.get("allow_advice_format") is True:
         return False
     return topic_data.get("source") in {"rss", "search", "web", "fallback", "evergreen"}
 
