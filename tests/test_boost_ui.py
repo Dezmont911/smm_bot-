@@ -872,6 +872,39 @@ class BoostUiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Из референсов добавлено: <b>2</b>", captured["text"])
         self.assertIn("Сгенерировано: <b>4</b>", captured["text"])
 
+    async def test_ref_count_text_input_deletes_stale_prompt_and_imports(self):
+        class FakeBot:
+            def __init__(self):
+                self.deleted = []
+
+            async def delete_message(self, chat_id, message_id):
+                self.deleted.append((chat_id, message_id))
+
+        context = SimpleNamespace(
+            bot=FakeBot(),
+            user_data={
+                "editing": {"handle": "@wallgramava", "field": "ref_count"},
+                ui.REF_COUNT_PROMPT_KEY: {
+                    "handle": "@wallgramava",
+                    "chat_id": 10,
+                    "message_id": 20,
+                },
+            },
+        )
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=100),
+            message=SimpleNamespace(text="10"),
+        )
+        channel = {"channel_id": "@wallgramava", "reference_channels": [{"handle": "@donor"}]}
+
+        with patch.object(ui, "_load_channel", return_value=channel), \
+                patch.object(ui, "action_ref_import", new_callable=AsyncMock) as import_mock:
+            handled = await ui.handle_settings_text_input(update, context)
+
+        self.assertTrue(handled)
+        self.assertEqual(context.bot.deleted, [(10, 20)])
+        import_mock.assert_awaited_once_with(update.message, context, "@wallgramava", 10)
+
     def test_permanent_delete_channel_removes_database_rows_and_json(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)

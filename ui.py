@@ -734,9 +734,15 @@ async def _answer_or_send(query_or_message, text: str, reply_markup, parse_mode=
             await query_or_message.edit_message_text(
                 text, reply_markup=reply_markup, parse_mode=parse_mode
             )
-        except Exception:
-            # Текст не изменился — игнорируем ошибку
-            pass
+        except Exception as e:
+            # Если Telegram не дал отредактировать старую карточку, пользователь
+            # всё равно должен увидеть итог действия.
+            if "message is not modified" in str(e).lower():
+                return
+            try:
+                await msg.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+            except Exception:
+                logger.warning(f"_answer_or_send fallback failed: {e}")
     else:
         await query_or_message.reply_text(
             text, reply_markup=reply_markup, parse_mode=parse_mode
@@ -2730,16 +2736,48 @@ async def action_ref_add(qm, context, handle: str):
 
 
 REF_TAKE_MAX = 50  # потолок: больше не берём за раз (защита от «500»)
+REF_COUNT_PROMPT_KEY = "_ref_count_prompt"
+
+
+def _clear_ref_count_state(context: ContextTypes.DEFAULT_TYPE, handle: str | None = None) -> None:
+    editing = context.user_data.get("editing")
+    if editing and editing.get("field") == "ref_count":
+        if handle is None or editing.get("handle") == handle:
+            context.user_data.pop("editing", None)
+    prompt = context.user_data.get(REF_COUNT_PROMPT_KEY)
+    if prompt and (handle is None or prompt.get("handle") == handle):
+        context.user_data.pop(REF_COUNT_PROMPT_KEY, None)
+
+
+async def _delete_ref_count_prompt(context: ContextTypes.DEFAULT_TYPE, handle: str) -> None:
+    prompt = context.user_data.pop(REF_COUNT_PROMPT_KEY, None)
+    if not prompt or prompt.get("handle") != handle:
+        return
+    bot = getattr(context, "bot", None)
+    if not bot:
+        return
+    try:
+        await bot.delete_message(prompt["chat_id"], prompt["message_id"])
+    except Exception as e:
+        logger.debug(f"ref_count prompt cleanup skipped: {e}")
 
 
 async def screen_ref_take_count(qm, context, handle: str):
     """Спрашивает, сколько постов взять: кнопки 5/10/20/50 или ввод числа (макс 50)."""
+    from telegram import CallbackQuery
+
     ch = _load_channel(handle)
     if not ch or not ch.get("reference_channels"):
         await qm.answer("Нет референсов")
         return
     # Готовим приём числа текстом (если пользователь напишет цифру)
     context.user_data["editing"] = {"handle": handle, "field": "ref_count"}
+    if isinstance(qm, CallbackQuery) and qm.message is not None:
+        context.user_data[REF_COUNT_PROMPT_KEY] = {
+            "handle": handle,
+            "chat_id": qm.message.chat_id,
+            "message_id": qm.message.message_id,
+        }
     kb = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("5",  callback_data=f"ui:ref_go:{handle}:5"),
@@ -2766,7 +2804,7 @@ async def action_ref_import(qm, context, handle: str, count: int = 10):
     медиа-посты появятся в очереди как только подтянется file_id.
     """
     from telegram import CallbackQuery
-    context.user_data.pop("editing", None)  # ввод числа больше не ждём
+    _clear_ref_count_state(context, handle)  # ввод числа больше не ждём
     count = max(1, min(int(count), REF_TAKE_MAX))  # кап: 1..50
 
     ch = _load_channel(handle)
@@ -4654,6 +4692,7 @@ async def handle_settings_text_input(update: Update, context: ContextTypes.DEFAU
             )
             return True
         n = max(1, min(int(digits), REF_TAKE_MAX))
+        await _delete_ref_count_prompt(context, handle)
         await action_ref_import(update.message, context, handle, n)
         return True
 
@@ -7032,6 +7071,7 @@ async def _ui_router_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await screen_rss_manager(query, context, handle)
 
     elif action == "ch_refs" and len(parts) >= 3:
+        _clear_ref_count_state(context, parts[2])
         await screen_references(query, context, parts[2])
 
     elif action == "ref_tgl" and len(parts) >= 5:
