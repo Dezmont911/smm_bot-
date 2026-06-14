@@ -82,6 +82,28 @@ def _is_broad_fact_channel(channel: dict) -> bool:
     return sum(1 for marker in fact_markers if marker in text) >= 2
 
 
+def _should_avoid_advice_format(channel: dict, topic_data: dict) -> bool:
+    """Broad fact channels should explain facts, not turn news into household advice."""
+    if not _is_broad_fact_channel(channel):
+        return False
+    explicit_formats = channel.get("post_formats")
+    if explicit_formats and "совет" in explicit_formats:
+        return False
+    return topic_data.get("source") in {"rss", "search", "web", "fallback", "evergreen"}
+
+
+def _pick_generation_format(channel: dict, strategy: dict, last_format: str | None, topic_data: dict) -> str:
+    format_name = pick_format(strategy, last_format)
+    if format_name != "совет" or not _should_avoid_advice_format(channel, topic_data):
+        return format_name
+
+    bias = strategy.get("format_bias") or {}
+    for candidate in ("факт", "разбор", "инфоповод", "вопрос"):
+        if candidate != last_format and bias.get(candidate, 1) > 0:
+            return candidate
+    return "факт"
+
+
 class ContentGenerator:
     """Генерирует посты для каналов и пополняет буфер."""
 
@@ -273,7 +295,7 @@ class ContentGenerator:
                     continue
 
                 # Формат — по весам архетипа (не повторяя предыдущий), хук — ротация структуры
-                format_name = pick_format(strategy, last_format)
+                format_name = _pick_generation_format(channel, strategy, last_format, topic_data)
                 hook = pick_hook(strategy)
                 content_brief = build_content_brief(channel, safety, format_name)
                 logger.debug(

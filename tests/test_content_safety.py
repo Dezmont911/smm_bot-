@@ -314,6 +314,48 @@ class ContentSafetyTest(unittest.TestCase):
             content_generator_module.dedup.aembed = original_aembed
             content_generator_module.dedup.cosine = original_cosine
 
+    def test_broad_fact_rss_topic_does_not_use_advice_format_by_default(self):
+        original_pick_format = content_generator_module.pick_format
+
+        try:
+            content_generator_module.pick_format = lambda *_args, **_kwargs: "совет"
+            channel = {
+                "channel_id": "@history_loopa",
+                "name": "История под лупой",
+                "topic": "Любопытные факты о природе, животных, науке, истории и человеческом поведении.",
+                "channel_type": "content",
+            }
+            strategy = {"format_bias": {"совет": 1, "факт": 1, "разбор": 1}}
+            topic_data = {
+                "source": "rss",
+                "topic": "Rare great ape population was damaged by landslides after extreme rain.",
+            }
+
+            fmt = content_generator_module._pick_generation_format(channel, strategy, None, topic_data)
+            self.assertEqual(fmt, "факт")
+        finally:
+            content_generator_module.pick_format = original_pick_format
+
+    def test_explicit_advice_format_is_respected_for_broad_fact_channel(self):
+        original_pick_format = content_generator_module.pick_format
+
+        try:
+            content_generator_module.pick_format = lambda *_args, **_kwargs: "совет"
+            channel = {
+                "channel_id": "@facts",
+                "name": "Хочу все знать",
+                "topic": "Удивительные факты о природе, животных, науке и организме.",
+                "channel_type": "content",
+                "post_formats": ["совет"],
+            }
+            strategy = {"format_bias": {"совет": 1, "факт": 1}}
+            topic_data = {"source": "rss", "topic": "Полезные свойства растения."}
+
+            fmt = content_generator_module._pick_generation_format(channel, strategy, None, topic_data)
+            self.assertEqual(fmt, "совет")
+        finally:
+            content_generator_module.pick_format = original_pick_format
+
     def test_celeb_drama_output_rejects_offtopic_drift(self):
         validation = validate_generated_post(
             BLOGGER_NEWS_CHANNEL,
